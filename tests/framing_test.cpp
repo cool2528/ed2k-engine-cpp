@@ -3,6 +3,8 @@
 #include <algorithm>
 #include "ed2k/net/framing.hpp"
 #include "ed2k/util/error.hpp"
+#include "net/inflate.hpp"
+#include <zlib.h>
 using namespace ed2k; using namespace ed2k::net;
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
   std::vector<std::byte> v; for(int x:xs) v.push_back(std::byte(x)); return v;
@@ -42,4 +44,40 @@ TEST(Framing, OversizeRejected){
 TEST(Framing, EmptyBodyRejected){
   auto q=assemble(proto::eDonkey, {});
   EXPECT_FALSE(q.has_value());
+}
+static std::vector<std::byte> zlib_compress(std::span<const std::byte> in){
+  uLongf bound = compressBound(static_cast<uLong>(in.size()));
+  std::vector<std::byte> out(bound);
+  uLongf outlen = bound;
+  compress(reinterpret_cast<Bytef*>(out.data()), &outlen,
+           reinterpret_cast<const Bytef*>(in.data()), static_cast<uLong>(in.size()));
+  out.resize(outlen);
+  return out;
+}
+TEST(Framing, ZlibPacketDecompressesAndNormalizes){
+  auto payload = bytes({10,20,30,40,50});
+  auto comp = zlib_compress(payload);
+  std::vector<std::byte> body; body.push_back(std::byte{0x16});      // opcode
+  body.insert(body.end(), comp.begin(), comp.end());
+  auto q = assemble(proto::zlib, body);
+  ASSERT_TRUE(q.has_value());
+  EXPECT_EQ(q->protocol, proto::eMule);                              // 归一化
+  EXPECT_EQ(q->opcode, 0x16);
+  EXPECT_EQ(q->payload, payload);
+}
+TEST(Framing, BadZlibStreamFails){
+  auto body = bytes({0x16, 0xFF,0xFF,0xFF,0xFF});                    // opcode + 坏流
+  auto q = assemble(proto::zlib, body);
+  ASSERT_FALSE(q.has_value());
+  EXPECT_EQ(q.error(), make_error_code(errc::decompress_failed));
+}
+TEST(Inflate, RespectsOutputCap){
+  std::vector<std::byte> big(100000, std::byte{0});                  // 压缩极小、解压 100k
+  auto comp = zlib_compress(big);
+  auto over = zlib_inflate(comp, 1024);                             // 上限 < 100k
+  EXPECT_FALSE(over.has_value());
+  EXPECT_EQ(over.error(), make_error_code(errc::decompress_failed));
+  auto ok = zlib_inflate(comp, 200000);
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(ok->size(), big.size());
 }
