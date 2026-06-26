@@ -62,6 +62,7 @@ tl::expected<PartFileState,std::error_code> parse_part_met(std::span<const std::
     if(t.name_id==0xF0 && std::holds_alternative<std::vector<std::byte>>(t.value)){
       auto& blob=std::get<std::vector<std::byte>>(t.value);
       ByteReader gr(blob); std::uint32_t gc=gr.u32();
+      if(gc > 1000000) return tl::unexpected(make_error_code(errc::count_too_large));
       for(std::uint32_t k=0;k<gc && gr.ok();++k){ std::uint64_t a=gr.u64(),b=gr.u64(); p.gaps.emplace_back(a,b); }
     } else p.tags.push_back(std::move(t));
   }

@@ -20,6 +20,11 @@ TEST(PartMet, RoundTrip){
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(out->hash, p.hash);
   EXPECT_EQ(out->gaps, p.gaps);
+  EXPECT_TRUE(out->tags.empty());
+}
+TEST(PartMet, RejectsBadMagic){
+  std::array<std::byte,1> b{ std::byte{0x99} };
+  EXPECT_FALSE(parse_part_met(b).has_value());
 }
 TEST(KnownMet, RejectsBadMagic){
   std::array<std::byte,1> b{ std::byte{0x99} };
