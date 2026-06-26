@@ -16,6 +16,7 @@ target_include_directories(ed2k_core
 target_link_libraries(ed2k_core PUBLIC spdlog::spdlog tl::expected)
 # 后续任务用 target_sources(ed2k_core PRIVATE ...) 追加源文件
 target_sources(ed2k_core PRIVATE src/util/version.cpp)
+target_sources(ed2k_core PRIVATE src/util/error.cpp)
 
 add_executable(ed2k-tool apps/cli/main.cpp)
 target_link_libraries(ed2k-tool PRIVATE ed2k_core)
@@ -23,7 +24,7 @@ target_link_libraries(ed2k-tool PRIVATE ed2k_core)
 if(ED2K_BUILD_TESTS)
   enable_testing()
   find_package(GTest CONFIG REQUIRED)
-  add_executable(ed2k_tests tests/smoke_test.cpp)
+  add_executable(ed2k_tests tests/smoke_test.cpp tests/error_test.cpp)
   target_link_libraries(ed2k_tests PRIVATE ed2k_core GTest::gtest GTest::gtest_main)
   target_include_directories(ed2k_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   include(GoogleTest)
