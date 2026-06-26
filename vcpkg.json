@@ -6,6 +6,7 @@
     "zlib",
     "spdlog",
     "tl-expected",
+    "boost-asio",
     { "name": "gtest", "version>=": "1.14.0" }
   ]
 }

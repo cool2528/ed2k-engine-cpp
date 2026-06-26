@@ -8,12 +8,17 @@ option(ED2K_BUILD_TESTS "Build tests" ON)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(boost_asio CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(ed2k_core)
 target_include_directories(ed2k_core
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(ed2k_core PUBLIC spdlog::spdlog tl::expected)
+target_link_libraries(ed2k_core PUBLIC spdlog::spdlog tl::expected Boost::asio Threads::Threads)
+target_link_libraries(ed2k_core PRIVATE ZLIB::ZLIB)
+# Boost.Asio 在 Windows 上需明确目标版本（否则默认假设 Win7 并告警）；本项目目标 Win10/11。
+target_compile_definitions(ed2k_core PUBLIC $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0A00>)
 # 后续任务用 target_sources(ed2k_core PRIVATE ...) 追加源文件
 target_sources(ed2k_core PRIVATE src/util/version.cpp)
 target_sources(ed2k_core PRIVATE src/util/error.cpp)
@@ -35,7 +40,7 @@ target_link_libraries(ed2k-tool PRIVATE ed2k_core)
 if(ED2K_BUILD_TESTS)
   enable_testing()
   find_package(GTest CONFIG REQUIRED)
-  add_executable(ed2k_tests tests/smoke_test.cpp tests/error_test.cpp tests/md4_test.cpp tests/sha1_test.cpp tests/core_hash_test.cpp tests/byte_io_test.cpp tests/tag_test.cpp tests/ed2k_hasher_test.cpp tests/aich_hasher_test.cpp tests/ed2k_link_test.cpp tests/server_met_test.cpp tests/known_part_met_test.cpp tests/cli_smoke_test.cpp)
+  add_executable(ed2k_tests tests/smoke_test.cpp tests/error_test.cpp tests/md4_test.cpp tests/sha1_test.cpp tests/core_hash_test.cpp tests/byte_io_test.cpp tests/tag_test.cpp tests/ed2k_hasher_test.cpp tests/aich_hasher_test.cpp tests/ed2k_link_test.cpp tests/server_met_test.cpp tests/known_part_met_test.cpp tests/cli_smoke_test.cpp tests/net_smoke_test.cpp)
   target_link_libraries(ed2k_tests PRIVATE ed2k_core GTest::gtest GTest::gtest_main)
   target_include_directories(ed2k_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   include(GoogleTest)
