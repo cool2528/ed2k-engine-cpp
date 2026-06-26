@@ -17,6 +17,7 @@ struct Tag {
   std::string  name_str;
   std::variant<std::uint64_t,std::string,MD4Hash,std::vector<std::byte>> value;
   bool has_string_name() const { return name_id==0 && !name_str.empty(); }
+  auto operator<=>(const Tag&) const = default;
 };
 void write_tag(ByteWriter&, const Tag&);
 tl::expected<Tag,std::error_code> read_tag(ByteReader&);

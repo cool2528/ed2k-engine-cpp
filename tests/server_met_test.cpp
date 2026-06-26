@@ -23,6 +23,9 @@ TEST(ServerMet, RoundTripModelEqual){
   EXPECT_EQ(out->servers[0].description, a.description);
   EXPECT_EQ(out->servers[0].max_users, a.max_users);
   EXPECT_EQ(out->servers[1].name, "S2");
+  // Whole-entry comparison now compiles (ServerEntry's defaulted <=> is real
+  // because codec::Tag is now three-way comparable).
+  EXPECT_EQ(out->servers[0], a);
 }
 TEST(ServerMet, RejectsBadMagic){
   std::array<std::byte,5> bad{ std::byte{0x99}, std::byte{0},std::byte{0},std::byte{0},std::byte{0} };

@@ -23,3 +23,11 @@ TEST(Tag, TruncatedFails){
   std::array<std::byte,1> tiny{ std::byte{0x03} }; // 声明 u32 但无数据
   ByteReader r(tiny); auto t=read_tag(r); EXPECT_FALSE(t.has_value());
 }
+// Regression: Tag now has a defaulted operator<=>, so whole-Tag (in)equality compiles.
+TEST(Tag, EqualityCompares){
+  Tag a = str_tag(0x01,"name");
+  Tag b = str_tag(0x01,"name");
+  Tag c = str_tag(0x01,"other");
+  EXPECT_EQ(a, b);
+  EXPECT_NE(a, c);
+}
