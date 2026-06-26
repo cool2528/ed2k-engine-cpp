@@ -15,6 +15,11 @@ struct Ed2kCategory : std::error_category {
       case errc::io_error: return "io error";
       case errc::hash_mismatch: return "hash mismatch";
       case errc::count_too_large: return "count too large";
+      case errc::connect_failed: return "connect failed";
+      case errc::connection_closed: return "connection closed";
+      case errc::timed_out: return "operation timed out";
+      case errc::packet_too_large: return "packet too large";
+      case errc::decompress_failed: return "decompress failed";
     }
     return "unknown ed2k error";
   }

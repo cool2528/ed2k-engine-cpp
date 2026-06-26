@@ -10,3 +10,10 @@ TEST(Error, MakesCodeWithCategoryAndMessage) {
 TEST(Error, OkIsFalsy) {
   EXPECT_FALSE(ed2k::make_error_code(ed2k::errc::ok));
 }
+TEST(Error, NetCodesHaveMessages){
+  EXPECT_NE(ed2k::make_error_code(ed2k::errc::timed_out).message().find("timed out"), std::string::npos);
+  EXPECT_NE(ed2k::make_error_code(ed2k::errc::packet_too_large).message().find("too large"), std::string::npos);
+  EXPECT_NE(ed2k::make_error_code(ed2k::errc::connection_closed).message().find("closed"), std::string::npos);
+  EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::connect_failed));
+  EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::decompress_failed));
+}
