@@ -137,3 +137,133 @@ TEST(ServerConnection, LoginRejected){
     c.close(); co_return;
   });
 }
+TEST(ServerConnection, SearchRoundTrip){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0u));
+    (void)co_await read_frame(s);                                       // SEARCHREQUEST
+    codec::ByteWriter w; w.u32(1);
+    auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+    w.hash16(h); w.u32(0xDDCCBBAAu); w.u16(0x1234u); w.u32(1);
+    w.u8(0x82); w.u8(tag::FT_FILENAME); w.string16("plain");
+    co_await ed2k::test::send_packet(s, op::SEARCHRESULT, w.take());
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    LoginParams p; p.nickname="u";
+    auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    auto r = co_await c.search(Keyword{"foo"}, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].name, "plain");
+    c.close(); co_return;
+  });
+}
+TEST(ServerConnection, SearchZlibResultInflated){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0u));
+    (void)co_await read_frame(s);
+    codec::ByteWriter w; w.u32(1);
+    auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+    w.hash16(h); w.u32(0xDDCCBBAAu); w.u16(0x1234u); w.u32(1);
+    w.u8(0x82); w.u8(tag::FT_FILENAME); w.string16("zlib");
+    co_await ed2k::test::send_zlib_packet(s, op::SEARCHRESULT, w.take());  // 0xD4 压缩
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    LoginParams p; p.nickname="u";
+    auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    auto r = co_await c.search(Keyword{"foo"}, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;        // P2 recv 已透明解压 0xD4
+    EXPECT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].name, "zlib");
+    c.close(); co_return;
+  });
+}
+TEST(ServerConnection, GetSourcesRoundTrip){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0u));
+    (void)co_await read_frame(s);                                       // GETSOURCES
+    codec::ByteWriter w;
+    auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+    w.hash16(h); w.u8(2);
+    w.u32(0x01000000u); w.u16(0x1234u);                                  // HighID 源
+    w.u32(5u); w.u16(0x5678u);                                           // LowID 源
+    co_await ed2k::test::send_packet(s, op::FOUNDSOURCES, w.take());
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    LoginParams p; p.nickname="u";
+    auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+    auto r = co_await c.get_sources(h, 100, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->sources.size(), 2u);
+    EXPECT_FALSE(r->sources[0].low_id());
+    EXPECT_TRUE(r->sources[1].low_id());
+    c.close(); co_return;
+  });
+}
+TEST(ServerConnection, CallbackRequestedEmitted){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0u));
+    co_await ed2k::test::send_packet(s, op::CALLBACKREQUESTED, cb_payload(0x0D0C0B0Au, 0x1234u));
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    std::vector<ServerEvent> evs;
+    c.on_event([&](const ServerEvent& e){ evs.push_back(e); });
+    LoginParams p; p.nickname="u";
+    auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    auto er = co_await c.receive_events(2s);
+    EXPECT_TRUE(er.has_value());
+    bool got_cb=false;
+    for(auto& e:evs){
+      if(std::holds_alternative<CallbackRequestedEvent>(e)){
+        auto& cb=std::get<CallbackRequestedEvent>(e);
+        got_cb = (cb.ip.value==0x0D0C0B0Au && cb.port==0x1234u);
+      }
+    }
+    EXPECT_TRUE(got_cb);
+    c.close(); co_return;
+  });
+}
+TEST(ServerConnection, SearchTimesOut){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0u));
+    (void)co_await read_frame(s);                                       // SEARCH — 不回
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    LoginParams p; p.nickname="u";
+    auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    auto r = co_await c.search(Keyword{"foo"}, 200ms);
+    EXPECT_FALSE(r.has_value());
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::timed_out));
+    c.close(); co_return;
+  });
+}
