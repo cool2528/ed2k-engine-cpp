@@ -17,3 +17,9 @@ TEST(Error, NetCodesHaveMessages){
   EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::connect_failed));
   EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::decompress_failed));
 }
+TEST(Error, ServerCodesHaveMessages){
+  EXPECT_NE(ed2k::make_error_code(ed2k::errc::login_rejected).message().find("login rejected"), std::string::npos);
+  EXPECT_NE(ed2k::make_error_code(ed2k::errc::server_protocol_error).message().find("protocol error"), std::string::npos);
+  EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::login_rejected));
+  EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::server_protocol_error));
+}

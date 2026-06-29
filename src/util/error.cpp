@@ -20,6 +20,8 @@ struct Ed2kCategory : std::error_category {
       case errc::timed_out: return "operation timed out";
       case errc::packet_too_large: return "packet too large";
       case errc::decompress_failed: return "decompress failed";
+      case errc::login_rejected: return "login rejected";
+      case errc::server_protocol_error: return "server protocol error";
     }
     return "unknown ed2k error";
   }
