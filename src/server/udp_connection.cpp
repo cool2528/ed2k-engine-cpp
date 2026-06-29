@@ -56,4 +56,34 @@ UdpServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chr
   if(v->empty()) co_return FoundSources{h, {}};
   co_return (*v)[0];
 }
+asio::awaitable<tl::expected<ServerStat,std::error_code>>
+UdpServerConnection::server_status(std::uint32_t challenge, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::GLOBSERVSTATREQ;
+  req.payload = encode_server_status_req(challenge);
+  auto sr = co_await sock_.send_to(server_, req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(udpop::GLOBSERVSTATRES, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  co_return decode_server_stat(rp->payload, challenge);
+}
+asio::awaitable<tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::error_code>>
+UdpServerConnection::server_list(IPv4 ask_ip, std::uint16_t ask_port, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::SERVER_LIST_REQ;
+  req.payload = encode_server_list_req(ask_ip, ask_port);
+  auto sr = co_await sock_.send_to(server_, req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(udpop::SERVER_LIST_RES, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  co_return decode_server_list(rp->payload);
+}
+asio::awaitable<tl::expected<ServerDesc,std::error_code>>
+UdpServerConnection::server_desc(std::uint32_t challenge, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::SERVER_DESC_REQ;
+  req.payload = encode_server_desc_req(challenge);
+  auto sr = co_await sock_.send_to(server_, req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(udpop::SERVER_DESC_RES, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  co_return decode_server_desc(rp->payload, challenge);
+}
 }
