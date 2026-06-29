@@ -52,9 +52,8 @@ UdpServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chr
   if(!rp) co_return tl::unexpected(rp.error());
   auto v = decode_glob_found_sources(rp->payload);
   if(!v) co_return tl::unexpected(v.error());
-  for(auto& fs : *v) if(fs.hash == h) co_return fs;
-  if(v->empty()) co_return FoundSources{h, {}};
-  co_return (*v)[0];
+  for(auto& fs : *v) if(fs.hash == h) co_return std::move(fs);
+  co_return FoundSources{h, {}};
 }
 asio::awaitable<tl::expected<ServerStat,std::error_code>>
 UdpServerConnection::server_status(std::uint32_t challenge, std::chrono::milliseconds timeout){

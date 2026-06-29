@@ -1,5 +1,4 @@
 #include <gtest/gtest.h>
-#include <array>
 #include <zlib.h>
 #include "ed2k/net/udp_framing.hpp"
 #include "ed2k/net/packet.hpp"

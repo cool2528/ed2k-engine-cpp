@@ -87,6 +87,28 @@ TEST(UdpConnection, GetSourcesRoundTrip){
     c.close(); co_return;
   });
 }
+TEST(UdpConnection, GetSourcesNoMatchReturnsEmpty){
+  IoRuntime rt;
+  ed2k::test::MockUdpServer srv(rt.context());
+  srv.serve([](udp::socket& s, const Packet&, const udp::endpoint& from) -> asio::awaitable<void>{
+    codec::ByteWriter w;
+    auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");  // 服务端回的是另一个 hash
+    w.hash16(h); w.u8(2);
+    w.u32(0x01000000u); w.u16(0x1234u);          // HighID
+    w.u32(5u); w.u16(0x5678u);                   // LowID
+    co_await ed2k::test::send_packet_to(s, from, udpop::GLOBFOUNDSOURCES, w.take());
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
+    auto h = *FileHash::from_hex("ffeeddccbbaa99887766554433221100");  // 客户端请求的 hash(与 mock 不同)
+    auto r = co_await c.get_sources(h, 100, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->hash, h);                        // 不是 mock 的 hash
+    EXPECT_TRUE(r->sources.empty());
+    c.close(); co_return;
+  });
+}
 TEST(UdpConnection, ServerStatusChallengeOk){
   IoRuntime rt;
   ed2k::test::MockUdpServer srv(rt.context());
@@ -169,6 +191,24 @@ TEST(UdpConnection, ServerDescOldFormat){
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     EXPECT_EQ(r->description, "des");
     EXPECT_EQ(r->name, "nm");
+    c.close(); co_return;
+  });
+}
+TEST(UdpConnection, ServerDescChallengeMismatch){
+  IoRuntime rt;
+  ed2k::test::MockUdpServer srv(rt.context());
+  srv.serve([](udp::socket& s, const Packet&, const udp::endpoint& from) -> asio::awaitable<void>{
+    codec::ByteWriter w; w.u32(0x1234F0FFu); w.u32(2);      // 新格式,challenge 与客户端所发不同
+    w.u8(0x82); w.u8(tag::ST_SERVERNAME);  w.string16("n");
+    w.u8(0x82); w.u8(tag::ST_DESCRIPTION); w.string16("d");
+    co_await ed2k::test::send_packet_to(s, from, udpop::SERVER_DESC_RES, w.take());
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
+    auto r = co_await c.server_desc(0x9999F0FFu, 2s);       // 客户端发的 challenge(低2字节=0xF0FF,与 mock 不同)
+    EXPECT_FALSE(r.has_value());
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::server_protocol_error));
     c.close(); co_return;
   });
 }

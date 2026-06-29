@@ -33,7 +33,6 @@ struct ServerDesc { std::string name, description; };
 tl::expected<UdpSearchResult,std::error_code> decode_glob_search_res(std::span<const std::byte>);
 tl::expected<std::vector<FoundSources>,std::error_code> decode_glob_found_sources(std::span<const std::byte>);
 tl::expected<ServerStat,std::error_code> decode_server_stat(std::span<const std::byte>, std::uint32_t challenge);
-tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::error_code> decode_server_list(std::span<const std::byte>);
 tl::expected<ServerDesc,std::error_code> decode_server_desc(std::span<const std::byte>, std::uint32_t challenge);
 tl::expected<std::uint32_t,std::error_code> decode_invalid_low_id(std::span<const std::byte>);
 }
