@@ -159,6 +159,7 @@ TEST(ServerConnection, SearchRoundTrip){
     auto r = co_await c.search(Keyword{"foo"}, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     EXPECT_EQ(r->size(), 1u);
+    if(r->size()!=1u) co_return;
     EXPECT_EQ((*r)[0].name, "plain");
     c.close(); co_return;
   });
@@ -185,6 +186,7 @@ TEST(ServerConnection, SearchZlibResultInflated){
     auto r = co_await c.search(Keyword{"foo"}, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;        // P2 recv 已透明解压 0xD4
     EXPECT_EQ(r->size(), 1u);
+    if(r->size()!=1u) co_return;
     EXPECT_EQ((*r)[0].name, "zlib");
     c.close(); co_return;
   });
@@ -213,6 +215,7 @@ TEST(ServerConnection, GetSourcesRoundTrip){
     auto r = co_await c.get_sources(h, 100, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     EXPECT_EQ(r->sources.size(), 2u);
+    if(r->sources.size()!=2u) co_return;
     EXPECT_FALSE(r->sources[0].low_id());
     EXPECT_TRUE(r->sources[1].low_id());
     c.close(); co_return;

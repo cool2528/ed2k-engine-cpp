@@ -139,3 +139,20 @@ TEST(ServerMessages, LoginRoundTrip){
   ASSERT_EQ(tags->size(), 3u);
   EXPECT_EQ(std::get<std::string>((*tags)[0].value), "rt");
 }
+
+TEST(ServerMessages, DecodeServerIdent){
+  std::vector<std::byte> d = hex("00112233445566778899aabbccddeeff");   // MD4Hash(16)
+  auto app=[&](std::initializer_list<int> xs){ for(int x:xs) d.push_back(std::byte(x)); };
+  app({1,0,0,0x7F});                                                       // ip 0x7F000001 LE
+  app({0x34,0x12});                                                        // port 0x1234 LE
+  app({2,0,0,0});                                                          // tagcount = 2
+  app({0x82,tag::ST_SERVERNAME,  0x04,0x00,'n','a','m','e'});             // string tag "name"
+  app({0x82,tag::ST_DESCRIPTION, 0x04,0x00,'d','e','s','c'});             // string tag "desc"
+  auto out = decode_server_ident(d);
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->hash, *MD4Hash::from_hex("00112233445566778899aabbccddeeff"));
+  EXPECT_EQ(out->ip.value, 0x7F000001u);
+  EXPECT_EQ(out->port, 0x1234u);
+  EXPECT_EQ(out->name, "name");
+  EXPECT_EQ(out->description, "desc");
+}

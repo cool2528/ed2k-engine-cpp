@@ -1,5 +1,4 @@
 #include <gtest/gtest.h>
-#include <array>
 #include "ed2k/server/search_query.hpp"
 using namespace ed2k::server;
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
