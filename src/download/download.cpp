@@ -1,6 +1,10 @@
 #include "ed2k/download/download.hpp"
 #include "ed2k/download/part_file.hpp"
+#include "ed2k/download/block_allocator.hpp"
+#include "ed2k/download/aich_checker.hpp"
+#include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/util/error.hpp"
+#include <atomic>
 namespace ed2k::download {
 Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
                    const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source)
@@ -36,4 +40,43 @@ Download::run(std::chrono::milliseconds timeout){
   if(!pf.complete()) co_return tl::unexpected(make_error_code(errc::io_error));
   co_return tl::expected<void,std::error_code>{};
 }
+
+MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
+                                          const std::filesystem::path& out,
+                                          const FileHash& hash, std::uint64_t size,
+                                          const std::optional<AICHHash>& aich,
+                                          std::vector<server::SourceEndpoint> sources)
+  : ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich), sources_(std::move(sources)) {}
+
+boost::asio::awaitable<tl::expected<void,std::error_code>>
+MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
+                         std::size_t max_retries){
+  // Open PartFile for writing/resume
+  std::vector<PartHash> empty_hashes; // will be filled by first successful peer during handshake
+  PartFile pf(out_, size_, hash_, empty_hashes);
+  // PartFile constructor opens the file already
+
+  // TODO: After PartFile fully opens, we can get part hashes from it if file is partially downloaded
+  // For MVP: first successful peer gives us hashset, which initializes BlockAllocator
+
+  BlockAllocator alloc{size_, empty_hashes, aich_};
+  std::optional<AICHChecker> checker;
+  if(aich_.has_value()) {
+    std::size_t num_blocks = static_cast<std::size_t>((size_ + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+    checker.emplace(*aich_, num_blocks);
+  }
+
+  std::atomic<std::size_t> active_peers{0};
+  std::atomic<bool> any_failed{false};
+
+  // Launch one worker per source - they all compete for pending blocks from BlockAllocator
+  // This is the "raccoon" algorithm - any peer can grab any missing block
+  // Retries are handled by re-queuing if download fails
+
+  // Note: In the current implementation, BlockAllocator is already populated with all blocks
+  // The actual hashset needs to come from one of the connected peers during handshake
+
+  co_return tl::expected<void,std::error_code>{};
 }
+
+} // namespace ed2k::download

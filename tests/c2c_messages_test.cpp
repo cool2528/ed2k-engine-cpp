@@ -1,27 +1,46 @@
 #include <gtest/gtest.h>
+#include <array>
+#include "crypto/sha1.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 using namespace ed2k; using namespace ed2k::peer; using namespace ed2k::server;
+
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
-  std::vector<std::byte> v; for(int x:xs) v.push_back(std::byte(x)); return v;
+  std::vector<std::byte> v;
+  for(int x: xs) v.push_back(std::byte(x));
+  return v;
 }
 static std::vector<std::byte> hex(std::string_view h){
   std::vector<std::byte> v;
   auto val=[&](char c)->int{ return c<='9'? c-'0' : (c|0x20)-'a'+10; };
-  for(std::size_t i=0;i+1<h.size();i+=2) v.push_back(std::byte(val(h[i])*16+val(h[i+1])));
+  for(std::size_t i=0;i+1<h.size();i+=2)
+    v.push_back(std::byte(val(h[i])*16+val(h[i+1])));
   return v;
 }
+static std::array<std::byte, 20> sha1_from_hex(std::string_view h){
+  std::array<std::byte, 20> out{};
+  for(std::size_t i=0;i<20 && i+1<h.size();i+=2){
+    auto val=[&](char c)->int{ return c<='9'? c-'0' : (c|0x20)-'a'+10; };
+    out[i/2] = std::byte(val(h[i])*16 + val(h[i+1]));
+  }
+  return out;
+}
+
 TEST(C2CMessages, EncodeHello){
-  HelloInfo h; h.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
-  h.client_id=0x01020304u; h.port=0x1234u; h.nickname="u"; h.version=0x3C;
+  HelloInfo h;
+  h.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  h.client_id=0x01020304u;
+  h.port=0x1234u;
+  h.nickname="u";
+  h.version=0x3C;
   auto out=encode_hello(h);
   std::vector<std::byte> want;
-  auto app=[&](const std::vector<std::byte>& b){ want.insert(want.end(),b.begin(),b.end()); };
-  app(hex("0123456789abcdeffedcba9876543210"));  // userhash
-  app(bytes({0x04,0x03,0x02,0x01}));              // clientID LE
-  app(bytes({0x34,0x12}));                          // port LE
-  app(bytes({2,0,0,0}));                            // tagcount=2
-  app(bytes({0x82,tag::CT_NAME, 0x01,0x00,'u'}));  // string tag CT_NAME
-  app(bytes({0x83,tag::CT_VERSION, 0x3c,0x00,0x00,0x00}));  // u32 tag CT_VERSION
+  auto app=[&](const std::vector<std::byte>& b){ want.insert(want.end(), b.begin(), b.end()); };
+  app(hex("0123456789abcdeffedcba9876543210"));
+  app(bytes({0x04,0x03,0x02,0x01}));
+  app(bytes({0x34,0x12}));
+  app(bytes({2,0,0,0}));
+  app(bytes({0x82,tag::CT_NAME, 0x01,0x00,'u'}));
+  app(bytes({0x83,tag::CT_VERSION, 0x3c,0x00,0x00,0x00}));
   EXPECT_EQ(out, want);
 }
 TEST(C2CMessages, EncodeSetReqFile){
@@ -44,8 +63,14 @@ TEST(C2CMessages, EncodeRequestParts){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   auto out=encode_request_parts(h, {100,200,300}, {150,250,350});
   std::vector<std::byte> want=hex("00112233445566778899aabbccddeeff");
-  for(int s : {100,200,300}) { auto b=bytes({s&0xff,(s>>8)&0xff,0,0}); want.insert(want.end(),b.begin(),b.end()); }
-  for(int e : {150,250,350}) { auto b=bytes({e&0xff,(e>>8)&0xff,0,0}); want.insert(want.end(),b.begin(),b.end()); }
+  for(int s : {100,200,300}) {
+    auto b=bytes({s&0xff,(s>>8)&0xff,0,0});
+    want.insert(want.end(), b.begin(), b.end());
+  }
+  for(int e : {150,250,350}) {
+    auto b=bytes({e&0xff,(e>>8)&0xff,0,0});
+    want.insert(want.end(), b.begin(), b.end());
+  }
   EXPECT_EQ(out, want);
 }
 TEST(C2CMessages, EncodeEndOfDownload){
@@ -61,18 +86,27 @@ TEST(C2CMessages, EncodeCancelTransfer){
 using ed2k::codec::ByteWriter;
 static std::vector<std::byte> zlib_compress(std::span<const std::byte> in){
   uLongf bound = compressBound(static_cast<uLong>(in.size()));
-  std::vector<std::byte> out(bound); uLongf outlen=bound;
+  std::vector<std::byte> out(bound);
+  uLongf outlen = bound;
   compress(reinterpret_cast<Bytef*>(out.data()),&outlen,
-           reinterpret_cast<const Bytef*>(in.data()),static_cast<uLong>(in.size()));
-  out.resize(outlen); return out;
+           reinterpret_cast<const Bytef*>(in.data()), static_cast<uLong>(in.size()));
+  out.resize(outlen);
+  return out;
 }
 TEST(C2CMessages, DecodeHelloAnswer){
   ByteWriter w;
   w.hash16(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
-  w.u32(0x01020304u); w.u16(0x1234u); w.u32(2);
-  w.u8(0x82); w.u8(tag::CT_NAME); w.string16("peer");
-  w.u8(0x83); w.u8(tag::CT_VERSION); w.u32(0x3C);
-  w.u32(0x7F000001u); w.u16(0x4662u);              // server_ip + port
+  w.u32(0x01020304u);
+  w.u16(0x1234u);
+  w.u32(2);
+  w.u8(0x82);
+  w.u8(tag::CT_NAME);
+  w.string16("peer");
+  w.u8(0x83);
+  w.u8(tag::CT_VERSION);
+  w.u32(0x3C);
+  w.u32(0x7F000001u);
+  w.u16(0x4662u);
   auto out=decode_hello_answer(w.take());
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(out->nickname, "peer");
@@ -84,8 +118,9 @@ TEST(C2CMessages, DecodeHelloAnswer){
 TEST(C2CMessages, DecodeFileStatus){
   ByteWriter w;
   w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
-  w.u16(9);                                          // 9 parts → 2 bytes
-  w.u8(0xFF); w.u8(0x01);                            // parts 0..7 set, part 8 set
+  w.u16(9);
+  w.u8(0xFF);
+  w.u8(0x01);
   auto out=decode_file_status(w.take());
   ASSERT_TRUE(out.has_value());
   ASSERT_EQ(out->parts.size(), 9u);
@@ -101,7 +136,8 @@ TEST(C2CMessages, DecodeHashsetAnswer){
   ASSERT_EQ(out->size(), 2u);
 }
 TEST(C2CMessages, DecodeHashsetAnswerSinglePart){
-  ByteWriter w; w.u16(0);                            // count==0 → 单 part
+  ByteWriter w;
+  w.u16(0);
   auto out=decode_hashset_answer(w.take());
   ASSERT_TRUE(out.has_value());
   EXPECT_TRUE(out->empty());
@@ -109,13 +145,15 @@ TEST(C2CMessages, DecodeHashsetAnswerSinglePart){
 TEST(C2CMessages, DecodeReqFilenameAnswer){
   ByteWriter w;
   w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
-  w.u32(3); w.blob(bytes({'a','b','c'}));
+  w.u32(3);
+  w.blob(bytes({'a','b','c'}));
   auto out=decode_req_filename_answer(w.take());
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(out->name, "abc");
 }
 TEST(C2CMessages, DecodeQueueRanking){
-  ByteWriter w; w.u16(42);
+  ByteWriter w;
+  w.u16(42);
   auto out=decode_queue_ranking(w.take());
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(*out, 42u);
@@ -123,10 +161,13 @@ TEST(C2CMessages, DecodeQueueRanking){
 TEST(C2CMessages, DecodeSendingPart){
   ByteWriter w;
   w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
-  w.u32(100); w.u32(200); w.blob(bytes({1,2,3}));
+  w.u32(100);
+  w.u32(200);
+  w.blob(bytes({1,2,3}));
   auto out=decode_sending_part(w.take());
   ASSERT_TRUE(out.has_value());
-  EXPECT_EQ(out->start, 100u); EXPECT_EQ(out->end, 200u);
+  EXPECT_EQ(out->start, 100u);
+  EXPECT_EQ(out->end, 200u);
   EXPECT_EQ(out->data, bytes({1,2,3}));
 }
 TEST(C2CMessages, DecodeCompressedPart){
@@ -134,16 +175,85 @@ TEST(C2CMessages, DecodeCompressedPart){
   auto comp = zlib_compress(plain);
   ByteWriter w;
   w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
-  w.u32(100); w.u32(200); w.blob(comp);
+  w.u32(100);
+  w.u32(200);
+  w.blob(comp);
   auto out=decode_compressed_part(w.take());
   ASSERT_TRUE(out.has_value());
-  EXPECT_EQ(out->data, plain);                      // c2c_messages 解压
+  EXPECT_EQ(out->data, plain);
 }
 TEST(C2CMessages, DecodeFileReqAnsNoFil){
-  ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
+  ByteWriter w;
+  w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
   auto out=decode_file_req_ans_no_fil(w.take());
   ASSERT_TRUE(out.has_value());
 }
 TEST(C2CMessages, DecodeSendingPartTruncated){
   EXPECT_FALSE(decode_sending_part(bytes({1,2,3})).has_value());
+}
+
+TEST(C2CMessages, EncodeAichRequest){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=encode_aich_request(h, 42);
+  std::vector<std::byte> want=hex("00112233445566778899aabbccddeeff");
+  auto b = bytes({42, 0});
+  want.insert(want.end(), b.begin(), b.end());
+  EXPECT_EQ(out, want);
+}
+TEST(C2CMessages, DecodeAichAnswer){
+  ByteWriter w;
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  w.hash16(h);
+  w.u16(2);
+  w.hash20(sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+  w.hash20(sha1_from_hex("aabbccddeeff00112233445566778899aabbccdd"));
+  auto out=decode_aich_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->size(), 2u);
+}
+TEST(C2CMessages, EncodeRequestPartsI64){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=encode_request_parts_i64(h, {100, 200, 300}, {150, 250, 350});
+  std::vector<std::byte> want=hex("00112233445566778899aabbccddeeff");
+  for(uint64_t s : {100,200,300}) {
+    want.push_back(std::byte(s&0xff)); want.push_back(std::byte((s>>8)&0xff));
+    want.push_back(std::byte((s>>16)&0xff)); want.push_back(std::byte((s>>24)&0xff)); want.push_back(std::byte((s>>32)&0xff));
+    want.push_back(std::byte((s>>40)&0xff)); want.push_back(std::byte((s>>48)&0xff)); want.push_back(std::byte((s>>56)&0xff));
+  }
+  for(uint64_t e : {150,250,350}) {
+    want.push_back(std::byte(e&0xff)); want.push_back(std::byte((e>>8)&0xff));
+    want.push_back(std::byte((e>>16)&0xff)); want.push_back(std::byte((e>>24)&0xff));
+    want.push_back(std::byte((e>>32)&0xff)); want.push_back(std::byte((e>>40)&0xff));
+    want.push_back(std::byte((e>>48)&0xff)); want.push_back(std::byte((e>>56)&0xff));
+  }
+  EXPECT_EQ(out, want);
+}
+TEST(C2CMessages, DecodeSendingPartI64){
+  ByteWriter w;
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  w.hash16(h);
+  w.u64(100);
+  w.u64(200);
+  w.blob(bytes({1,2,3,4,5}));
+  auto out=decode_sending_part_i64(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->start, 100u);
+  EXPECT_EQ(out->end, 200u);
+  EXPECT_EQ(out->data, bytes({1,2,3,4,5}));
+}
+TEST(C2CMessages, DecodeCompressedPartI64){
+  auto plain = bytes({10,20,30,40,50});
+  auto comp = zlib_compress(plain);
+  ByteWriter w;
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  w.hash16(h);
+  w.u64(100);
+  w.u64(200);
+  w.blob(comp);
+  auto out=decode_compressed_part_i64(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->data, plain);
+}
+TEST(C2CMessages, DecodeSendingPartI64Truncated){
+  EXPECT_FALSE(decode_sending_part_i64(bytes({1,2,3,4})).has_value());
 }

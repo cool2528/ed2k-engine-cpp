@@ -117,4 +117,50 @@ tl::expected<FileHash,std::error_code> decode_file_req_ans_no_fil(std::span<cons
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return h;
 }
+
+std::vector<std::byte> encode_aich_request(const FileHash& h, std::uint16_t idx){
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(idx);
+  return w.take();
+}
+tl::expected<std::vector<std::array<std::byte, 20>>,std::error_code> decode_aich_answer(std::span<const std::byte> data){
+  ByteReader r(data);
+  r.hash16(); // file hash already checked by caller
+  std::uint16_t count = r.u16();
+  std::vector<std::array<std::byte, 20>> out; out.reserve(count);
+  for(std::uint16_t i=0;i<count && r.ok();++i){
+    out.push_back(r.hash20());
+  }
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return out;
+}
+
+std::vector<std::byte> encode_request_parts_i64(const FileHash& h, std::array<std::uint64_t, 3> starts, std::array<std::uint64_t, 3> ends){
+  ByteWriter w;
+  w.hash16(h);
+  for(auto s : starts) w.u64(s);
+  for(auto e : ends) w.u64(e);
+  return w.take();
+}
+tl::expected<Block,std::error_code> decode_sending_part_i64(std::span<const std::byte> data){
+  ByteReader r(data);
+  Block b; b.hash = r.hash16(); b.start = r.u64(); b.end = r.u64();
+  std::size_t dlen = data.size() - r.pos();
+  auto blob = r.blob(dlen);
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  b.data.assign(blob.begin(), blob.end());
+  return b;
+}
+tl::expected<Block,std::error_code> decode_compressed_part_i64(std::span<const std::byte> data){
+  ByteReader r(data);
+  Block b; b.hash = r.hash16(); b.start = r.u64(); b.end = r.u64();
+  std::size_t clen = data.size() - r.pos();
+  auto comp = r.blob(clen);
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  auto dec = ed2k::net::zlib_inflate(comp, ed2k::net::MAX_PACKET_SIZE);
+  if(!dec) return tl::unexpected(dec.error());
+  b.data = std::move(*dec);
+  return b;
+}
 }

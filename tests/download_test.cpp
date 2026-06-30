@@ -144,3 +144,34 @@ TEST(Download, BlockCorruptFails){
   });
   std::filesystem::remove_all(dir);
 }
+
+TEST(Download, BlockLevelSingleSource){
+  // download 2-part file with block-level allocation (no AICH)
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_block"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
+      std::vector{SourceEndpoint{0x7F000001u, peer.port()}});
+    auto r = co_await dl.run(5s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
+TEST(Download, AICHCorruptionRecovers){
+  // one block corrupted on first try, gets re-download from another peer successfully
+  // TODO: implement this test when multi-source fully working
+  GTEST_SKIP() << "Multi-source AICH recovery not implemented yet";
+}
+
+TEST(Download, RequestPartsI64RoundTrip){
+  // test I64 encoding works
+  // Already covered by c2c_messages_test
+  GTEST_SKIP() << "I64 encoding covered by C2CMessages tests";
+}

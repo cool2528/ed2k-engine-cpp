@@ -9,6 +9,7 @@
 #include <vector>
 #include <tl/expected.hpp>
 #include "ed2k/core/hash.hpp"
+#include "crypto/sha1.hpp"
 #include "ed2k/peer/c2c_opcodes.hpp"
 #include "ed2k/server/opcodes.hpp"   // tag::CT_NAME/CT_VERSION
 namespace ed2k::peer {
@@ -46,4 +47,13 @@ tl::expected<std::uint16_t,std::error_code>      decode_queue_ranking(std::span<
 tl::expected<Block,std::error_code>              decode_sending_part(std::span<const std::byte>);
 tl::expected<Block,std::error_code>              decode_compressed_part(std::span<const std::byte>);
 tl::expected<FileHash,std::error_code>           decode_file_req_ans_no_fil(std::span<const std::byte>);
+
+// AICH messages
+std::vector<std::byte> encode_aich_request(const FileHash&, std::uint16_t block_index);
+tl::expected<std::vector<std::array<std::byte, 20>>, std::error_code> decode_aich_answer(std::span<const std::byte>);
+
+// I64 (large file >4GiB) messages
+std::vector<std::byte> encode_request_parts_i64(const FileHash&, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends);
+tl::expected<Block,std::error_code>              decode_sending_part_i64(std::span<const std::byte>);
+tl::expected<Block,std::error_code>              decode_compressed_part_i64(std::span<const std::byte>);
 }
