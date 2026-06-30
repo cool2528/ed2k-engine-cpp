@@ -20,5 +20,11 @@ constexpr std::uint8_t FILEREQANSNOFIL   = 0x48;
 constexpr std::uint8_t OUTOFPARTREQS     = 0x57;
 constexpr std::uint8_t CANCELTRANSFER    = 0x56;
 constexpr std::uint8_t END_OF_DOWNLOAD   = 0x49;
+// AICH / large file (I64) extensions
+constexpr std::uint8_t AICHREQUEST       = 0x61;
+constexpr std::uint8_t AICHANSWER       = 0x62;
+constexpr std::uint8_t REQUESTPARTS_I64 = 0x30;
+constexpr std::uint8_t SENDINGPART_I64  = 0x31;
+constexpr std::uint8_t COMPRESSEDPART_I64 = 0x32;
 }
 }

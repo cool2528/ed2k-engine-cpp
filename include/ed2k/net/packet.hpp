@@ -11,7 +11,7 @@ struct Packet {
   std::vector<std::byte> payload;
   auto operator<=>(const Packet&) const = default;
 };
-// 16 MiB：需容纳单个 eD2k part（PART_SIZE = 9728000 ≈ 9.28 MiB）的 SENDINGPART
-// （整 part 作为单块下载时帧体 ≈ 9.28 MiB + 头部开销），仍可拦截恶意 4 GiB 帧。
-constexpr std::size_t MAX_PACKET_SIZE = 16u * 1024 * 1024;   // 16 MiB
+// 8 MiB：block-level download 每个块 ≤ 180 KiB，远小于 8 MiB，保持 DoS 防护
+// P4a 临时提升到 16 MiB 容纳 whole-part download；P4b block-level 恢复原值
+constexpr std::size_t MAX_PACKET_SIZE = 8u * 1024 * 1024;   // 8 MiB
 }
