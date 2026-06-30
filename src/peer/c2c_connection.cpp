@@ -98,4 +98,26 @@ C2CConnection::request_blocks(const FileHash& h, std::array<std::uint32_t,3> sta
   }
   co_return blocks;
 }
+
+asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
+C2CConnection::request_blocks_i64(const FileHash& h, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::REQUESTPARTS_I64; req.payload=encode_request_parts_i64(h, starts, ends);
+  auto sr = co_await conn_.send(req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::vector<Block> blocks;
+  while(blocks.size() < 3){
+    auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+    if(rem.count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
+    auto rp = co_await conn_.recv(rem);
+    if(!rp) co_return tl::unexpected(rp.error());
+    auto& pkt = *rp;
+    if(pkt.opcode == op::SENDINGPART_I64){ auto b=decode_sending_part_i64(pkt.payload); if(!b) co_return tl::unexpected(b.error()); blocks.push_back(std::move(*b)); }
+    else if(pkt.opcode == op::COMPRESSEDPART_I64){ auto b=decode_compressed_part_i64(pkt.payload); if(!b) co_return tl::unexpected(b.error()); blocks.push_back(std::move(*b)); }
+    else if(pkt.opcode == op::OUTOFPARTREQS){ break; }
+    else if(pkt.opcode == op::FILEREQANSNOFIL){ co_return tl::unexpected(make_error_code(errc::file_not_found)); }
+    else continue;
+  }
+  co_return blocks;
+}
 }

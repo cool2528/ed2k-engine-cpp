@@ -28,6 +28,8 @@ class C2CConnection {
     start_upload(const FileHash&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
     request_blocks(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
+    request_blocks_i64(const FileHash&, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends, std::chrono::milliseconds timeout);
   void close() noexcept;
  private:
   boost::asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>

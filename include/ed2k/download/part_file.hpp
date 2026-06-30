@@ -14,6 +14,7 @@ constexpr std::uint64_t PART_SIZE = 9728000;
 class PartFile {
  public:
   PartFile(const std::filesystem::path& path, std::uint64_t size, const FileHash& file_hash, std::vector<PartHash> part_hashes);
+  bool open_for_write() const noexcept;
   std::vector<std::uint32_t> missing_parts_peer_has(const std::vector<bool>& peer_parts) const;
   tl::expected<void,std::error_code> write_block(std::uint32_t start, std::uint32_t end, std::span<const std::byte> data);
   bool complete() const noexcept;
@@ -24,6 +25,7 @@ class PartFile {
   FileHash file_hash_;
   std::vector<PartHash> part_hashes_;
   std::vector<bool> part_done_;
+  std::vector<std::uint64_t> part_filled_;  // 每 part 已写入字节数，用于增量组装后触发 MD4 校验
   std::fstream f_;
 };
 }

@@ -86,8 +86,13 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
     (void)s1;(void)s2;(void)e1;(void)e2;
     if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
     std::uint32_t part = s0 / static_cast<std::uint32_t>(PART);
+    std::uint64_t pstart = static_cast<std::uint64_t>(part) * PART;
     const auto& d = (part==0)?mf.d0:mf.d1;
-    codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0); w.blob(d);
+    // 只回送请求范围内的切片(整 part 9.72MiB > 8MiB 帧上限,必须分块)
+    std::size_t off = static_cast<std::size_t>(s0 - pstart);
+    std::size_t len = static_cast<std::size_t>(e0 - s0);
+    codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
+    w.blob(std::span<const std::byte>(d).subspan(off, len));
     co_await send_pkt(s, op::SENDINGPART, w.take());
     co_await send_pkt(s, op::OUTOFPARTREQS, {});         // 终止 request_blocks 多响应循环
   }
