@@ -55,3 +55,95 @@ TEST(C2CMessages, EncodeEndOfDownload){
 TEST(C2CMessages, EncodeCancelTransfer){
   EXPECT_TRUE(encode_cancel_transfer().empty());
 }
+
+#include "ed2k/codec/byte_io.hpp"
+#include <zlib.h>
+using ed2k::codec::ByteWriter;
+static std::vector<std::byte> zlib_compress(std::span<const std::byte> in){
+  uLongf bound = compressBound(static_cast<uLong>(in.size()));
+  std::vector<std::byte> out(bound); uLongf outlen=bound;
+  compress(reinterpret_cast<Bytef*>(out.data()),&outlen,
+           reinterpret_cast<const Bytef*>(in.data()),static_cast<uLong>(in.size()));
+  out.resize(outlen); return out;
+}
+TEST(C2CMessages, DecodeHelloAnswer){
+  ByteWriter w;
+  w.hash16(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
+  w.u32(0x01020304u); w.u16(0x1234u); w.u32(2);
+  w.u8(0x82); w.u8(tag::CT_NAME); w.string16("peer");
+  w.u8(0x83); w.u8(tag::CT_VERSION); w.u32(0x3C);
+  w.u32(0x7F000001u); w.u16(0x4662u);              // server_ip + port
+  auto out=decode_hello_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->nickname, "peer");
+  EXPECT_EQ(out->version, 0x3Cu);
+  EXPECT_TRUE(out->server_ip.has_value());
+  EXPECT_EQ(out->server_ip->value, 0x7F000001u);
+  EXPECT_EQ(out->server_port, 0x4662u);
+}
+TEST(C2CMessages, DecodeFileStatus){
+  ByteWriter w;
+  w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
+  w.u16(9);                                          // 9 parts → 2 bytes
+  w.u8(0xFF); w.u8(0x01);                            // parts 0..7 set, part 8 set
+  auto out=decode_file_status(w.take());
+  ASSERT_TRUE(out.has_value());
+  ASSERT_EQ(out->parts.size(), 9u);
+  for(int i=0;i<9;++i) EXPECT_TRUE(out->parts[i]) << "part " << i;
+}
+TEST(C2CMessages, DecodeHashsetAnswer){
+  ByteWriter w;
+  w.u16(2);
+  w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
+  w.hash16(*PartHash::from_hex("22222222222222222222222222222222"));
+  auto out=decode_hashset_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  ASSERT_EQ(out->size(), 2u);
+}
+TEST(C2CMessages, DecodeHashsetAnswerSinglePart){
+  ByteWriter w; w.u16(0);                            // count==0 → 单 part
+  auto out=decode_hashset_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_TRUE(out->empty());
+}
+TEST(C2CMessages, DecodeReqFilenameAnswer){
+  ByteWriter w;
+  w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
+  w.u32(3); w.blob(bytes({'a','b','c'}));
+  auto out=decode_req_filename_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->name, "abc");
+}
+TEST(C2CMessages, DecodeQueueRanking){
+  ByteWriter w; w.u16(42);
+  auto out=decode_queue_ranking(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(*out, 42u);
+}
+TEST(C2CMessages, DecodeSendingPart){
+  ByteWriter w;
+  w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
+  w.u32(100); w.u32(200); w.blob(bytes({1,2,3}));
+  auto out=decode_sending_part(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->start, 100u); EXPECT_EQ(out->end, 200u);
+  EXPECT_EQ(out->data, bytes({1,2,3}));
+}
+TEST(C2CMessages, DecodeCompressedPart){
+  auto plain = bytes({10,20,30,40,50});
+  auto comp = zlib_compress(plain);
+  ByteWriter w;
+  w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
+  w.u32(100); w.u32(200); w.blob(comp);
+  auto out=decode_compressed_part(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->data, plain);                      // c2c_messages 解压
+}
+TEST(C2CMessages, DecodeFileReqAnsNoFil){
+  ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
+  auto out=decode_file_req_ans_no_fil(w.take());
+  ASSERT_TRUE(out.has_value());
+}
+TEST(C2CMessages, DecodeSendingPartTruncated){
+  EXPECT_FALSE(decode_sending_part(bytes({1,2,3})).has_value());
+}

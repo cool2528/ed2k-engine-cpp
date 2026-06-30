@@ -32,4 +32,18 @@ std::vector<std::byte> encode_start_upload(const FileHash&);
 std::vector<std::byte> encode_request_parts(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends);
 std::vector<std::byte> encode_end_of_download(const FileHash&);
 std::vector<std::byte> encode_cancel_transfer();
+
+// S→C 结构
+struct FileStatus { FileHash hash; std::vector<bool> parts; };
+struct FileNameAnswer { FileHash hash; std::string name; };
+struct Block { FileHash hash; std::uint32_t start=0, end=0; std::vector<std::byte> data; };
+
+tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>);
+tl::expected<FileStatus,std::error_code>         decode_file_status(std::span<const std::byte>);
+tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(std::span<const std::byte>);
+tl::expected<FileNameAnswer,std::error_code>     decode_req_filename_answer(std::span<const std::byte>);
+tl::expected<std::uint16_t,std::error_code>      decode_queue_ranking(std::span<const std::byte>);
+tl::expected<Block,std::error_code>              decode_sending_part(std::span<const std::byte>);
+tl::expected<Block,std::error_code>              decode_compressed_part(std::span<const std::byte>);
+tl::expected<FileHash,std::error_code>           decode_file_req_ans_no_fil(std::span<const std::byte>);
 }
