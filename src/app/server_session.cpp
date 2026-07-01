@@ -2,6 +2,7 @@
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/util/error.hpp"
 #include "ed2k/download/download.hpp"
+#include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include <unordered_set>
 namespace ed2k::app {
@@ -71,11 +72,13 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
   if(!lg) co_return tl::unexpected(lg.error());
   auto gs = co_await lg->conn.get_sources(link.hash, link.size, opts.per_server_timeout);
   if(!gs) co_return tl::unexpected(gs.error());
-  auto hi = filter_high_id(gs->sources);
-  if(hi.empty()) co_return tl::unexpected(make_error_code(errc::file_not_found));
+  // M3: 不再 filter 掉 LowID —— HighID 直连, LowID 走回调(listener+server_conn)。
+  // listener 与 lg->conn 均为本协程栈上局部, 覆盖整个 dl.run 生命周期。
+  ed2k::peer::InboundListener listener(ex, opts.client_port);
   // M2: aich=nullopt -> MultiSourceDownload 走 part-MD4 兜底路径
   ed2k::download::MultiSourceDownload dl(ex, opts.out_path, link.hash, link.size,
-                                         std::nullopt, std::move(hi));
+                                         std::nullopt, std::move(gs->sources),
+                                         &lg->conn, &listener);
   co_return co_await dl.run(opts.total_timeout, 3);
 }
 }

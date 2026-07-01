@@ -63,13 +63,20 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
                                           const std::filesystem::path& out,
                                           const FileHash& hash, std::uint64_t size,
                                           const std::optional<AICHHash>& aich,
-                                          std::vector<server::SourceEndpoint> sources)
-  : ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich), sources_(std::move(sources)) {}
+                                          std::vector<server::SourceEndpoint> sources,
+                                          server::ServerConnection* server_conn,
+                                          peer::InboundListener* listener)
+  : ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich),
+    sources_(std::move(sources)), server_conn_(server_conn), listener_(listener) {}
 
 // 单源 worker:连接 source,握手+拉 hashset,初始化 BlockAllocator(从 PartFile 恢复),
 // 按 BlockAllocator 分配的 AICH 小块逐块请求。
 // AICH 启用时:先向 peer 请求 proof,verify_block 校验通过才 write_block(先验证后写入)。
 // 校验失败:requeue + 同源重试,超过 max_retries 返回 block_corrupt 让 MultiSourceDownload 切源。
+// 连接阶段按 source.low_id() 分支(M3):
+//   LowID(+server_conn+listener): callback_request -> listener.accept -> C2CConnection(socket&&)
+//   LowID(缺 server_conn/listener): 防御性 connect_failed(M2 已 filter 掉 LowID)
+//   HighID: 直连 conn.connect(IPv4{source.id}, source.port) —— 现状不变
 static boost::asio::awaitable<tl::expected<void,std::error_code>>
 peer_worker(boost::asio::any_io_executor ex,
             const std::filesystem::path& out,
@@ -77,11 +84,24 @@ peer_worker(boost::asio::any_io_executor ex,
             const std::optional<AICHHash>& aich,
             const ed2k::server::SourceEndpoint& source,
             std::chrono::milliseconds timeout,
-            std::size_t max_retries){
-  ed2k::peer::C2CConnection conn(ex);
-  IPv4 ip{source.id};
-  auto cr = co_await conn.connect(ip, source.port, timeout);
-  if(!cr) co_return tl::unexpected(cr.error());
+            std::size_t max_retries,
+            ed2k::server::ServerConnection* server_conn,
+            ed2k::peer::InboundListener* listener){
+  std::optional<ed2k::peer::C2CConnection> conn_opt;
+  if(source.low_id()){
+    if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
+    auto cb = co_await server_conn->callback_request(source.id, timeout);
+    if(!cb) co_return tl::unexpected(cb.error());
+    auto acc = co_await listener->accept(timeout);
+    if(!acc) co_return tl::unexpected(acc.error());
+    conn_opt.emplace(std::move(*acc));
+  } else {
+    ed2k::peer::C2CConnection c(ex);
+    auto cr = co_await c.connect(IPv4{source.id}, source.port, timeout);
+    if(!cr) co_return tl::unexpected(cr.error());
+    conn_opt.emplace(std::move(c));
+  }
+  auto& conn = *conn_opt;
   ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
   auto hr = co_await conn.handshake(mine, timeout);
   if(!hr) co_return tl::unexpected(hr.error());
@@ -164,7 +184,8 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   // 状态与异步并发 worker，单线程 io_context 下用 condition_variable 会死锁。
   std::error_code last_err = make_error_code(errc::connect_failed);
   for(const auto& source : sources_){
-    auto r = co_await peer_worker(ex_, out_, hash_, size_, aich_, source, total_timeout, max_retries);
+    auto r = co_await peer_worker(ex_, out_, hash_, size_, aich_, source, total_timeout, max_retries,
+                                  server_conn_, listener_);
     if(r.has_value()) co_return tl::expected<void,std::error_code>{};
     last_err = r.error();
     // 失败则尝试下一个 source

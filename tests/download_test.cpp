@@ -3,11 +3,13 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <utility>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/buffer.hpp>
@@ -16,12 +18,16 @@
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/framing.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
+#include "ed2k/peer/inbound_listener.hpp"
+#include "ed2k/server/connection.hpp"
+#include "ed2k/server/opcodes.hpp"
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
 #include "crypto/md4.hpp"
 #include "crypto/sha1.hpp"
 #include "ed2k/util/error.hpp"
 #include "mock_peer.hpp"
+#include "mock_server.hpp"
 using namespace ed2k; using namespace ed2k::net; using namespace ed2k::peer;
 using namespace ed2k::download;
 using ed2k::server::SourceEndpoint;
@@ -38,6 +44,10 @@ template <class F> static void run_coro(IoRuntime& rt, F&& body){
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
   std::vector<std::byte> v; for(int x:xs) v.push_back(std::byte(x)); return v;
 }
+// IDCHANGE payload = u32 client_id + u32 flags（对照 server_connection_test 同名 helper）
+static std::vector<std::byte> idchange_payload(std::uint32_t id, std::uint32_t flags){
+  codec::ByteWriter w; w.u32(id); w.u32(flags); return w.take();
+}
 static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t op, std::span<const std::byte> pl){
   Packet p; p.protocol=proto::eDonkey; p.opcode=op; p.payload.assign(pl.begin(),pl.end());
   auto fr=encode_frame(p); auto [e,n]=co_await asio::async_write(s,asio::buffer(fr),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return;
@@ -49,6 +59,15 @@ static asio::awaitable<std::vector<std::byte>> read_frame(tcp::socket& s){
   std::vector<std::byte> body(h->size); auto [e2,n2]=co_await asio::async_read(s,asio::buffer(body),asio::as_tuple(asio::use_awaitable)); (void)n2;
   if(e2) co_return std::vector<std::byte>{};
   co_return body;
+}
+// read_frame 丢弃 5 字节头但保留 opcode 作为 body 首字节; read_pkt 进一步拆出
+// (opcode, payload) 便于 MockServer 按 opcode 分派(如 CALLBACKREQUEST)。空帧(EOF/错)→ {0,{}}。
+static asio::awaitable<std::pair<std::uint8_t,std::vector<std::byte>>> read_pkt(tcp::socket& s){
+  auto body = co_await read_frame(s);
+  if(body.empty()) co_return std::pair<std::uint8_t,std::vector<std::byte>>{0u, std::vector<std::byte>{}};
+  std::uint8_t opcode = std::to_integer<std::uint8_t>(body[0]);
+  std::vector<std::byte> rest(body.begin()+1, body.end());
+  co_return std::pair<std::uint8_t,std::vector<std::byte>>{opcode, std::move(rest)};
 }
 static asio::awaitable<void> keep_alive(tcp::socket& s){ std::array<std::byte,1> t; auto [e,n]=co_await asio::async_read(s,asio::buffer(t),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return; }
 // mock peer 提供一个 2-part 文件,part 数据由 fill 决定
@@ -134,6 +153,47 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
     std::size_t off = static_cast<std::size_t>(s0);
     std::size_t len = static_cast<std::size_t>(e0 - s0);
     codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
+    w.blob(std::span<const std::byte>(full).subspan(off, len));
+    co_await send_pkt(s, op::SENDINGPART, w.take());
+    co_await send_pkt(s, op::OUTOFPARTREQS, {});         // 终止 request_blocks 多响应循环
+  }
+  co_await keep_alive(s); co_return;
+}
+// 参数化重载: 服务指定 full 数据 + hashset(M3 LowID 回调路径与多源测试复用)。
+// 分派与 serve_full_peer(MockFile) 同款: HELLOANSWER/FILESTATUS/HASHSETANSWER/
+// FILENAMEANSWER/ACCEPTUPLOADREQ/SENDINGPART + OUTOFPARTREQS 终止多响应循环。
+static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<std::byte>& full,
+                                             const FileHash& fhash, const std::vector<PartHash>& parts){
+  using namespace ed2k::peer;
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(fhash);
+    w.u16(static_cast<std::uint16_t>(parts.size()));
+    std::size_t nbytes = (parts.size() + 7) / 8;
+    for(std::size_t i=0;i<nbytes;++i) w.u8(0xFF);        // 所有 part 均可用
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.u16(static_cast<std::uint16_t>(parts.size()));
+    for(const auto& p : parts) w.hash16(p);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
+    (void)r.hash16();                                    // 文件 hash
+    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
+    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
+    (void)s1;(void)s2;(void)e1;(void)e2;
+    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+    std::size_t off = static_cast<std::size_t>(s0);
+    std::size_t len = static_cast<std::size_t>(e0 - s0);
+    codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
     w.blob(std::span<const std::byte>(full).subspan(off, len));
     co_await send_pkt(s, op::SENDINGPART, w.take());
     co_await send_pkt(s, op::OUTOFPARTREQS, {});         // 终止 request_blocks 多响应循环
@@ -400,6 +460,56 @@ TEST(Download, AICHWrongRootFails){
     co_return;
   });
   std::filesystem::remove_all(dir);
+}
+
+TEST(Download, LowIdSourceViaCallback){
+  // M3 capstone: LowID source via server callback. MockServer 登录后读到客户端发来的
+  // CALLBACKREQUEST(source.id=0x100), 即刻 spawn 一个 MockPeer 主动连 InboundListener
+  // 端口并供文件; peer_worker LowID 分支:
+  //   callback_request -> listener.accept -> C2CConnection(tcp::socket&&) -> handshake/下载。
+  // HighID 直连路径不动, 此测试只覆盖 LowID 回调分支。
+  auto mf = make_mock_file(0x33, 0x44);   // 2-part
+  std::vector<std::byte> full;
+  full.insert(full.end(), mf.d0.begin(), mf.d0.end());
+  full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  IoRuntime rt;
+  ed2k::peer::InboundListener lst(rt.executor(), 0);   // 临时端口
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    co_await send_pkt(s, server::op::IDCHANGE, idchange_payload(0x01000000u, 0x0119u));
+    // 读到 CALLBACKREQUEST 一帧即触发回调 peer 主动连 listener(修正说明 #2: 用 read_pkt 保留 opcode)
+    auto [opcode, payload] = co_await read_pkt(s);
+    (void)payload;
+    if(opcode != server::op::CALLBACKREQUEST){ co_return; }
+    asio::co_spawn(s.get_executor(), [&,kk=lst.local_port()]() -> asio::awaitable<void>{
+      tcp::socket c(s.get_executor());
+      tcp::endpoint ep(asio::ip::make_address_v4("127.0.0.1"), kk);
+      auto [ec] = co_await c.async_connect(ep, asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      co_await serve_full_peer(std::move(c), full, mf.fhash, {mf.h0, mf.h1});
+      co_return;
+    }, asio::detached);
+    co_await keep_alive(s); co_return;
+  });
+  auto tmp = std::filesystem::temp_directory_path()/"ed2k_lowid_cb"; std::filesystem::remove(tmp);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    // 用真实 ServerConnection 登录到 mock srv, 取得 server_conn(LowID 回调路径需要)
+    server::ServerConnection sc(rt.executor());
+    server::LoginParams p; p.nickname="u"; p.client_port=lst.local_port();
+    p.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+    auto lr = co_await sc.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 3000ms);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    // LowID 源: id=0x100(<0x1000000), port=0(回调路径不用 port)
+    std::vector<server::SourceEndpoint> srcs = { {0x100u, 0} };
+    MultiSourceDownload dl(rt.executor(), tmp, mf.fhash, PART*2, std::nullopt, srcs, &sc, &lst);
+    auto r = co_await dl.run(20000ms, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    co_return;
+  });
+  ASSERT_TRUE(std::filesystem::exists(tmp));
+  EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
+  std::filesystem::remove(tmp);
 }
 
 TEST(Download, RequestPartsI64RoundTrip){

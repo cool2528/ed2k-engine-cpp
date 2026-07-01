@@ -9,7 +9,9 @@
 #include <boost/asio/awaitable.hpp>
 #include "ed2k/core/hash.hpp"
 #include "ed2k/server/messages.hpp"   // SourceEndpoint
+#include "ed2k/server/connection.hpp"  // ServerConnection (M3 LowID callback)
 #include "ed2k/peer/c2c_connection.hpp"
+#include "ed2k/peer/inbound_listener.hpp"  // InboundListener (M3 LowID callback)
 namespace ed2k::download {
 
 class Download {
@@ -31,7 +33,9 @@ class MultiSourceDownload {
                       const std::filesystem::path& out,
                       const FileHash& hash, std::uint64_t size,
                       const std::optional<AICHHash>& aich,
-                      std::vector<server::SourceEndpoint> sources);
+                      std::vector<server::SourceEndpoint> sources,
+                      server::ServerConnection* server_conn = nullptr,
+                      peer::InboundListener* listener = nullptr);
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(
     std::chrono::milliseconds total_timeout,
     std::size_t max_retries = 3);
@@ -42,6 +46,8 @@ class MultiSourceDownload {
   std::uint64_t size_;
   std::optional<AICHHash> aich_;
   std::vector<server::SourceEndpoint> sources_;
+  server::ServerConnection* server_conn_ = nullptr;
+  peer::InboundListener* listener_ = nullptr;
 };
 
 }
