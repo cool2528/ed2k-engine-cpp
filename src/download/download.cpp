@@ -59,16 +59,18 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
                                           std::vector<server::SourceEndpoint> sources)
   : ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich), sources_(std::move(sources)) {}
 
-// 单源 worker：连接一个 source，握手 + 拉取 hashset，初始化 BlockAllocator，
-// 然后按 BlockAllocator 分配的 AICH 小块逐块请求并写入 PartFile。
-// 失败时返回错误码（多源版本可继续尝试下一个 source）。
+// 单源 worker:连接 source,握手+拉 hashset,初始化 BlockAllocator(从 PartFile 恢复),
+// 按 BlockAllocator 分配的 AICH 小块逐块请求。
+// AICH 启用时:先向 peer 请求 proof,verify_block 校验通过才 write_block(先验证后写入)。
+// 校验失败:requeue + 同源重试,超过 max_retries 返回 block_corrupt 让 MultiSourceDownload 切源。
 static boost::asio::awaitable<tl::expected<void,std::error_code>>
 peer_worker(boost::asio::any_io_executor ex,
             const std::filesystem::path& out,
             const FileHash& hash, std::uint64_t size,
             const std::optional<AICHHash>& aich,
             const ed2k::server::SourceEndpoint& source,
-            std::chrono::milliseconds timeout){
+            std::chrono::milliseconds timeout,
+            std::size_t max_retries){
   ed2k::peer::C2CConnection conn(ex);
   IPv4 ip{source.id};
   auto cr = co_await conn.connect(ip, source.port, timeout);
@@ -83,47 +85,65 @@ peer_worker(boost::asio::any_io_executor ex,
 
   // 用真实 part hashes 打开 PartFile（构造时即校验已存在的 part 实现续传）
   PartFile pf(out, size, hash, *hs);
-  // 用真实 part hashes 初始化 BlockAllocator
-  BlockAllocator alloc{size, *hs, aich};
+  // 从 PartFile 已有块状态恢复 BlockAllocator:已完成的块不入 pending 队列
+  BlockAllocator alloc{size, *hs, aich, pf};
   std::optional<AICHChecker> checker;
-  if(aich.has_value()){
-    std::size_t num_blocks = static_cast<std::size_t>((size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+  std::size_t num_blocks = static_cast<std::size_t>((size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+  bool aich_active = false;
+  // u16 block_index 容量上限:超过 65535 块(~11.5GB)时降级为 part-MD4-only
+  if(aich.has_value() && num_blocks <= 65535){
     checker.emplace(*aich, num_blocks);
+    aich_active = true;
   }
 
   (void)co_await conn.request_filename(hash, timeout);   // 可选,忽略
   auto up = co_await conn.start_upload(hash, timeout);
   if(!up) co_return tl::unexpected(up.error());
 
+  // PART_SIZE(9728000) 不是 AICH_BLOCK_SIZE(184320) 的整数倍(≈52.78),
+  // 故 global_block_index 不能用 start_byte/AICH_BLOCK_SIZE, 必须用 pi*blocks_per_part+ai。
+  // blocks_per_part = ceil(PART_SIZE / AICH_BLOCK_SIZE) = 53 (第 53 块短,143360 字节)。
+  constexpr std::size_t blocks_per_part = (PART_SIZE + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
   bool large_file = size > (std::uint64_t(1) << 32);
+  std::size_t retry = 0;
   while(!alloc.complete()){
     auto nb = alloc.next_block();
     if(!nb.has_value()) break;
     auto [pi, ai, start_byte, end_byte] = *nb;
-    (void)pi; (void)ai;
 
     std::vector<ed2k::peer::Block> blocks;
     if(large_file){
-      std::array<std::uint64_t,3> starts{start_byte,0,0};
-      std::array<std::uint64_t,3> ends{end_byte,0,0};
-      auto r = co_await conn.request_blocks_i64(hash, starts, ends, timeout);
+      auto r = co_await conn.request_blocks_i64(hash,
+        std::array<std::uint64_t,3>{start_byte,0,0}, std::array<std::uint64_t,3>{end_byte,0,0}, timeout);
       if(!r) co_return tl::unexpected(r.error());
       blocks = std::move(*r);
     } else {
-      std::array<std::uint32_t,3> starts{static_cast<std::uint32_t>(start_byte),0,0};
-      std::array<std::uint32_t,3> ends{static_cast<std::uint32_t>(end_byte),0,0};
-      auto r = co_await conn.request_blocks(hash, starts, ends, timeout);
+      auto r = co_await conn.request_blocks(hash,
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start_byte),0,0},
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end_byte),0,0}, timeout);
       if(!r) co_return tl::unexpected(r.error());
       blocks = std::move(*r);
     }
+    if(blocks.empty()) co_return tl::unexpected(make_error_code(errc::io_error));
 
     for(auto& b : blocks){
-      // 块级写入：write_block 只在整 part 写齐时做 MD4 校验；
-      // 块级增量写入不会被校验为 corrupt，AICH 校验由 checker 负责（若有 root hash）。
+      // C2 先验证后写入:AICH 启用时,先拉 proof + verify_block,通过才写盘;
+      // 校验失败 requeue 同源重试,超过 max_retries 返回 block_corrupt 让上层切源。
+      if(aich_active){
+        std::size_t global = pi * blocks_per_part + ai;
+        auto proof = co_await conn.request_aich_proof(hash, static_cast<std::uint16_t>(global), timeout);
+        bool ok = proof.has_value() && checker->verify_block(global, b.data, *proof);
+        if(!ok){
+          alloc.requeue_block(pi, ai);
+          if(++retry > max_retries) co_return tl::unexpected(make_error_code(errc::block_corrupt));
+          break;   // 同源重下该块(重新 next_block 会取到 requeue 的块或下一块)
+        }
+      }
       auto w = pf.write_block(static_cast<std::uint32_t>(b.start),
                               static_cast<std::uint32_t>(b.end), b.data);
       if(!w) co_return tl::unexpected(w.error());
       alloc.mark_block_done(pi, ai);
+      retry = 0;   // 成功一块,重置同源重试计数
     }
   }
 
@@ -137,10 +157,9 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   // MVP：顺序尝试每个 source，第一个成功的 source 完成整文件块级下载。
   // 多源并发编排（raccoon 算法）留待后续：需要跨 source 共享 BlockAllocator
   // 状态与异步并发 worker，单线程 io_context 下用 condition_variable 会死锁。
-  (void)max_retries;
   std::error_code last_err = make_error_code(errc::connect_failed);
   for(const auto& source : sources_){
-    auto r = co_await peer_worker(ex_, out_, hash_, size_, aich_, source, total_timeout);
+    auto r = co_await peer_worker(ex_, out_, hash_, size_, aich_, source, total_timeout, max_retries);
     if(r.has_value()) co_return tl::expected<void,std::error_code>{};
     last_err = r.error();
     // 失败则尝试下一个 source
