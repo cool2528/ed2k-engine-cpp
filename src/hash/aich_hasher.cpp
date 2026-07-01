@@ -1,5 +1,5 @@
 #include "ed2k/hash/aich_hasher.hpp"
-#include "ed2k/hash/ed2k_hasher.hpp"  // CHUNK_SIZE
+#include "ed2k/hash/ed2k_hasher.hpp"
 #include "crypto/sha1.hpp"
 #include <fstream>
 #include <vector>
@@ -23,27 +23,18 @@ Digest merkle_root(std::vector<Digest> level){
   }
   return level[0];
 }
-// 计算单个 chunk（<=9.28MB）的 chunk 哈希：按 184320B 小块 SHA-1 → Merkle
-Digest chunk_hash(std::span<const std::byte> chunk){
-  std::vector<Digest> leaves;
-  std::size_t off=0, n=chunk.size();
-  do {
-    std::size_t take=std::min(AICH_BLOCK_SIZE, n-off);
-    leaves.push_back(crypto::sha1(chunk.subspan(off,take)));
-    off+=take;
-  } while(off<n);
-  return merkle_root(std::move(leaves));
-}
 }
 AICHHash aich_hash_bytes(std::span<const std::byte> data){
-  std::vector<Digest> chunk_hashes;
+  // 扁平单层 Merkle:所有 184320B 块的 SHA-1 叶子 → lone-child 归并到根。
+  std::vector<Digest> leaves;
   std::size_t off=0, n=data.size();
+  if(n==0) return AICHHash::from_bytes(crypto::sha1({}));
   do {
-    std::size_t take=std::min(CHUNK_SIZE, n-off);
-    chunk_hashes.push_back(chunk_hash(data.subspan(off,take)));
+    std::size_t take=std::min(AICH_BLOCK_SIZE, n-off);
+    leaves.push_back(crypto::sha1(data.subspan(off,take)));
     off+=take;
   } while(off<n);
-  return AICHHash::from_bytes(merkle_root(std::move(chunk_hashes)));
+  return AICHHash::from_bytes(merkle_root(std::move(leaves)));
 }
 tl::expected<AICHHash,std::error_code> aich_hash_file(const std::filesystem::path& p){
   std::error_code ec; auto size=std::filesystem::file_size(p,ec);
