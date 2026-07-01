@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -275,29 +276,83 @@ TEST(Download, BlockLevelSingleSource){
 
 TEST(Download, AICHCorruptionRecovers){
   // Block-level AICH recovery: peer A always serves a corrupted flat block 5;
-  // peer_worker exhausts same-peer retries -> block_corrupt -> MultiSourceDownload
-  // switches to peer B which serves the clean block. File completes and verifies.
+  // peer_worker exhausts same-peer retries -> block_corrupt. Then peer B (clean)
+  // resumes from the on-disk PartFile and completes the file.
+  //
+  // C2 isolation: peer A and peer B run as two separate single-source downloads
+  // against the SAME on-disk path so the disk can be inspected between peers.
+  // After peer A fails, the corrupted block 5 region (uniform 0xFF from
+  // serve_aich_peer) must NOT be on disk — verify-before-write (C2) prevented the
+  // bad data from being persisted. After peer B completes, that region must equal
+  // the correct file bytes — proving the corrupt data never survived.
   auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_aich"; std::filesystem::create_directories(dir);
   auto path = dir/"out";
+  std::filesystem::remove(path);   // 从干净盘开始(隔离上次运行残留)
   auto mf = make_mock_file(0x11, 0x22);
   // C1: root 来自生产 hasher aich_hash_bytes(整文件), 与 AICHChecker::verify_block 的
   // flat 单层 Merkle 完全一致 —— 不再用任何 part-respecting 合成根。
   std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
   AICHHash root = aich_hash_bytes(full);
 
+  // 被损坏的 flat 块索引 5: 字节区 [5*AICH_BLOCK_SIZE, 6*AICH_BLOCK_SIZE)。
+  constexpr std::size_t corrupt_blk = 5;
+  const std::size_t corrupt_off = corrupt_blk * AICH_BLOCK_SIZE;
+
   IoRuntime rt;
   ed2k::test::MockPeer peerA(rt.context());
-  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, true, 5); co_return; });
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, true, corrupt_blk); co_return; });
   ed2k::test::MockPeer peerB(rt.context());
   peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, false); co_return; });
 
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
-      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
-    auto r = co_await dl.run(10s, 3);
-    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    // Phase 1: peer A 单源 —— 块 5 持续供坏数据 -> 同源重试耗尽 -> block_corrupt。
+    download::MultiSourceDownload dlA(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
+      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}});
+    auto rA = co_await dlA.run(10s, 3);
+    EXPECT_FALSE(rA.has_value());
+    if(rA.has_value()) co_return;
+    EXPECT_EQ(rA.error(), make_error_code(errc::block_corrupt));
+
+    // C2 (between peers): peer A 的坏块 5 (uniform 0xFF) 必须从未落盘 —— 先验证后写入生效。
+    // 块 5 未写 -> 区间为洞(零); 若 C2 失效(先写后校验) -> 区间为全 0xFF, std::equal 命中 ->
+    // EXPECT_FALSE 失败 -> 暴露 C2 回归。
+    {
+      std::ifstream f(path, std::ios::binary);
+      EXPECT_TRUE(f.is_open());
+      if(!f.is_open()) co_return;
+      std::vector<std::byte> buf(AICH_BLOCK_SIZE);
+      f.seekg(static_cast<std::streamoff>(corrupt_off));
+      f.read(reinterpret_cast<char*>(buf.data()), AICH_BLOCK_SIZE);
+      EXPECT_EQ(static_cast<std::size_t>(f.gcount()), AICH_BLOCK_SIZE);
+      if(static_cast<std::size_t>(f.gcount()) != AICH_BLOCK_SIZE) co_return;
+      std::vector<std::byte> corrupt_fill(AICH_BLOCK_SIZE, std::byte(0xFF));
+      EXPECT_FALSE(std::equal(buf.begin(), buf.end(), corrupt_fill.begin()))
+        << "peer A persisted corrupt 0xFF block to disk before AICH verify (C2 broken)";
+    }
+
+    // Phase 2: peer B (clean) —— 从盘上 PartFile 恢复, 补齐块 5 及其余, 完成文件。
+    download::MultiSourceDownload dlB(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
+      std::vector{SourceEndpoint{0x7F000001u, peerB.port()}});
+    auto rB = co_await dlB.run(10s, 3);
+    EXPECT_TRUE(rB.has_value()); if(!rB) co_return;
+
     download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
     EXPECT_TRUE(pf.complete());
+
+    // C2 (after completion): 块 5 区间最终等于正确文件数据 -> 坏数据从未存活。
+    {
+      std::ifstream f(path, std::ios::binary);
+      EXPECT_TRUE(f.is_open());
+      if(!f.is_open()) co_return;
+      std::vector<std::byte> buf(AICH_BLOCK_SIZE);
+      f.seekg(static_cast<std::streamoff>(corrupt_off));
+      f.read(reinterpret_cast<char*>(buf.data()), AICH_BLOCK_SIZE);
+      EXPECT_EQ(static_cast<std::size_t>(f.gcount()), AICH_BLOCK_SIZE);
+      if(static_cast<std::size_t>(f.gcount()) != AICH_BLOCK_SIZE) co_return;
+      auto expect = std::span<const std::byte>(full).subspan(corrupt_off, AICH_BLOCK_SIZE);
+      EXPECT_TRUE(std::equal(buf.begin(), buf.end(), expect.begin()))
+        << "final block 5 bytes do not match the correct file data";
+    }
     co_return;
   });
   std::filesystem::remove_all(dir);

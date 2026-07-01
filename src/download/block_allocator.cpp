@@ -1,5 +1,5 @@
 #include "ed2k/download/block_allocator.hpp"
-#include "ed2k/download/part_file.hpp" // for PART_SIZE
+#include "ed2k/download/part_file.hpp" // for PartFile recover ctor
 
 namespace ed2k::download {
 

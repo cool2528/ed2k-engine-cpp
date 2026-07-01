@@ -112,6 +112,6 @@ TEST(BlockAllocator, RequeueBlock){
   EXPECT_EQ(a.missing_count(), 53u);   // 仍未完成
   // 消费到队尾应再遇到块 0
   std::size_t seen=0;
-  while(auto b = a.next_block()){ if(std::get<0>(*b)==global) ++seen; if(a.missing_count()==0) break; }
+  while(auto b = a.next_block()){ if(std::get<0>(*b)==global) ++seen; }
   EXPECT_GE(seen, 1u);
 }

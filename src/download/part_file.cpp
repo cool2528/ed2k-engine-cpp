@@ -77,7 +77,7 @@ tl::expected<void,std::error_code> PartFile::write_block(std::uint32_t start, st
       f_.seekg(pstart);
       f_.read(reinterpret_cast<char*>(buf.data()), pend - pstart);
       f_.clear();
-      if(static_cast<std::uint64_t>(f_.gcount()) != (pend - pstart)) return {};
+      if(static_cast<std::uint64_t>(f_.gcount()) != (pend - pstart)) return tl::unexpected(make_error_code(errc::io_error));
       crypto::MD4 m; m.update(buf);
       if(PartHash::from_bytes(m.finish()) != part_hashes_[part])
         return tl::unexpected(make_error_code(errc::block_corrupt));
