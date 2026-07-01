@@ -3,6 +3,10 @@
 #include <chrono>
 #include <filesystem>
 #include <vector>
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#endif
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
@@ -148,6 +152,68 @@ TEST(AppDownload, EndToEndHighIdMockDownload){
     co_return;
   });
   // 校验文件存在 + size == PART*2 (内容已由 PartFile part-MD4 校验保证)
+  ASSERT_TRUE(std::filesystem::exists(tmp));
+  EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
+  std::filesystem::remove(tmp);
+}
+
+// Regression (Task-7 fix): a HighID-only download_link must NOT construct an
+// InboundListener, so it must still succeed when opts.client_port is already
+// (exclusively) bound by another socket. Pre-fix, InboundListener(ex,port) was
+// constructed unconditionally and its ctor threw boost::system::system_error on
+// the occupied port (asio's 2-arg acceptor ctor cannot share a port held under
+// SO_EXCLUSIVEADDRUSE), failing the HighID path even though the listener is
+// never used for HighID sources. Post-fix the listener is constructed lazily
+// (only when a LowID source is present), so HighID-only download completes.
+TEST(AppDownload, HighIdOnlySucceedsWhenClientPortBound){
+  auto mf = make_mock_file(0x33, 0x44);
+  IoRuntime rt;
+  // Exclusively occupy a free port. SO_EXCLUSIVEADDRUSE must be set before bind
+  // and defeats the SO_REUSEADDR that asio's 2-arg acceptor ctor sets by default
+  // (so InboundListener's ctor cannot share the port -> throws pre-fix).
+  tcp::acceptor occ(rt.context());
+  occ.open(tcp::v4());
+#ifdef _WIN32
+  {
+    BOOL excl = TRUE;
+    int sr = ::setsockopt(occ.native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                          reinterpret_cast<const char*>(&excl), sizeof(excl));
+    ASSERT_NE(sr, SOCKET_ERROR) << "setsockopt(SO_EXCLUSIVEADDRUSE) failed";
+  }
+#endif
+  occ.bind(tcp::endpoint(asio::ip::address_v4::any(), 0));
+  occ.listen();
+  std::uint16_t occupied = occ.local_endpoint().port();
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, server::op::IDCHANGE, w.take()); }
+    (void)co_await read_frame(s);   // GETSOURCES
+    // HighID-only source: 127.0.0.1 (0x7F000001, id >= 0x1000000) -> !low_id().
+    codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
+    w.u32(0x7F000001u); w.u16(peer.port());
+    co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
+    co_await keep_alive(s);
+    co_return;
+  });
+  Ed2kFileLink link; link.name="t"; link.size=PART*2; link.hash=mf.fhash;
+  ServerList sl; ServerEntry sv; sv.ip=IPv4::from_dotted("127.0.0.1").value(); sv.port=srv.port(); sl.servers={sv};
+  auto metbytes = write_server_met(sl);
+  auto tmp = std::filesystem::temp_directory_path() / "ed2k_app_dl_portbound_test";
+  std::filesystem::remove(tmp);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    DownloadOpts o; o.out_path=tmp; o.client_port=occupied;
+    o.per_server_timeout=3000ms; o.total_timeout=20000ms;
+    auto r = co_await download_link(rt.executor(), link, metbytes,
+      ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()}, o);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    co_return;
+  });
   ASSERT_TRUE(std::filesystem::exists(tmp));
   EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
   std::filesystem::remove(tmp);

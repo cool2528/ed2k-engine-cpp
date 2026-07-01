@@ -4,6 +4,8 @@
 #include "ed2k/download/download.hpp"
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/link/ed2k_link.hpp"
+#include <algorithm>
+#include <optional>
 #include <unordered_set>
 namespace ed2k::app {
 std::vector<ServerTarget> fallback_servers(){
@@ -73,12 +75,18 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
   auto gs = co_await lg->conn.get_sources(link.hash, link.size, opts.per_server_timeout);
   if(!gs) co_return tl::unexpected(gs.error());
   // M3: 不再 filter 掉 LowID —— HighID 直连, LowID 走回调(listener+server_conn)。
-  // listener 与 lg->conn 均为本协程栈上局部, 覆盖整个 dl.run 生命周期。
-  ed2k::peer::InboundListener listener(ex, opts.client_port);
+  // Fix(M3): 仅当存在 LowID 源时才构造 InboundListener。HighID-only 下载不需要
+  // 监听器, 无条件 bind opts.client_port 会在端口被占用时抛 system_error, 回归
+  // HighID 路径(本进程并发 download_link / 其它客户端占用 4662)。LowID 回调路径
+  // 仍按原方式构造监听器。listener 生命周期覆盖整个 dl.run。
+  bool has_low_id = std::any_of(gs->sources.begin(), gs->sources.end(),
+                                [](const ed2k::server::SourceEndpoint& s){ return s.low_id(); });
+  std::optional<ed2k::peer::InboundListener> listener;
+  if(has_low_id) listener.emplace(ex, opts.client_port);
   // M2: aich=nullopt -> MultiSourceDownload 走 part-MD4 兜底路径
   ed2k::download::MultiSourceDownload dl(ex, opts.out_path, link.hash, link.size,
                                          std::nullopt, std::move(gs->sources),
-                                         &lg->conn, &listener);
+                                         &lg->conn, listener.has_value() ? &*listener : nullptr);
   co_return co_await dl.run(opts.total_timeout, 3);
 }
 }
