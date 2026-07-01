@@ -120,4 +120,15 @@ C2CConnection::request_blocks_i64(const FileHash& h, std::array<std::uint64_t,3>
   }
   co_return blocks;
 }
+
+asio::awaitable<tl::expected<std::vector<std::array<std::byte,20>>,std::error_code>>
+C2CConnection::request_aich_proof(const FileHash& h, std::uint16_t block_index, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::AICHREQUEST;
+  req.payload=encode_aich_request(h, block_index);
+  auto sr = co_await conn_.send(req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(op::AICHANSWER, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  co_return decode_aich_answer(rp->payload);
+}
 }

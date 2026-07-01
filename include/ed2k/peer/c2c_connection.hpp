@@ -30,6 +30,8 @@ class C2CConnection {
     request_blocks(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
     request_blocks_i64(const FileHash&, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<std::vector<std::array<std::byte,20>>,std::error_code>>
+    request_aich_proof(const FileHash&, std::uint16_t block_index, std::chrono::milliseconds timeout);
   void close() noexcept;
  private:
   boost::asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>

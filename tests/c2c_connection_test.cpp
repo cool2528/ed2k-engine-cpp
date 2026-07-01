@@ -215,6 +215,36 @@ TEST(C2CConnection, FileNotFound){
     c.close(); co_return;
   });
 }
+TEST(C2CConnection, RequestAichProofRoundTrip){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  FileHash fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    // request_aich_proof 只发 AICHREQUEST 收 AICHANSWER, 不需握手。
+    auto body = co_await read_frame(s);                  // [opcode(1)][payload]
+    EXPECT_FALSE(body.empty()); if(body.empty()) co_return;
+    EXPECT_EQ(body[0], std::byte(op::AICHREQUEST));      // opcode
+    // payload = [16]hash + [2]u16 block_index(LE); block_index 在偏移 17
+    EXPECT_EQ(body.size(), 1u + 16u + 2u); if(body.size() != 19u) co_return;
+    EXPECT_EQ(std::to_integer<std::uint8_t>(body[17]), 42u);
+    EXPECT_EQ(std::to_integer<std::uint8_t>(body[18]), 0u);
+    // answer: [16]hash + [2]count=1 + [20]proof
+    codec::ByteWriter w; w.hash16(fh); w.u16(1);
+    std::array<std::byte,20> proof{}; proof[0]=std::byte(0xAB);
+    w.blob(std::span<const std::byte>(proof));
+    co_await send_pkt(s, op::AICHANSWER, w.take());
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto r = co_await c.request_aich_proof(fh, 42, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->size(), 1u); if(r->size()!=1u) co_return;
+    EXPECT_EQ((*r)[0][0], std::byte(0xAB));
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, RequestFileTimesOut){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{
