@@ -270,3 +270,34 @@ TEST(ServerConnection, SearchTimesOut){
     c.close(); co_return;
   });
 }
+TEST(ServerConnection, CallbackRequestSendsEncodedFrame){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  std::uint32_t captured = 0;
+  std::uint8_t captured_opcode = 0;
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    auto f = co_await read_frame(s);   // 第一帧 LOGINREQUEST
+    (void)f;
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0x0119u));
+    auto f2 = co_await read_frame(s);   // 第二帧 CALLBACKREQUEST
+    // read_frame 返回的 body 含 opcode 首字节（parse_header.size = opcode+payload），先 u8 跳过再读 u32
+    if(f2.size() >= 5){
+      codec::ByteReader r(f2);
+      captured_opcode = r.u8();
+      captured = r.u32();
+    }
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    LoginParams p; p.nickname="u"; p.client_port=4662;
+    p.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+    auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    auto cr = co_await c.callback_request(0x00001234u, 2s);
+    EXPECT_TRUE(cr.has_value());
+    c.close(); co_return;
+  });
+  EXPECT_EQ(captured_opcode, op::CALLBACKREQUEST);
+  EXPECT_EQ(captured, 0x00001234u);
+}

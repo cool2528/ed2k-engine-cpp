@@ -82,6 +82,13 @@ ServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_found_sources(rp->payload);
 }
+asio::awaitable<tl::expected<void,std::error_code>>
+ServerConnection::callback_request(std::uint32_t client_id, std::chrono::milliseconds timeout){
+  (void)timeout;
+  net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::CALLBACKREQUEST;
+  req.payload = encode_callback_request(client_id);
+  co_return co_await conn_.send(req);
+}
 
 asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::receive_events(std::chrono::milliseconds timeout){

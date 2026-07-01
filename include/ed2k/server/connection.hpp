@@ -36,6 +36,8 @@ class ServerConnection {
   boost::asio::awaitable<tl::expected<FoundSources,std::error_code>>
     get_sources(const FileHash&, std::uint64_t size, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
+    callback_request(std::uint32_t client_id, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<void,std::error_code>>
     receive_events(std::chrono::milliseconds timeout);
   void close() noexcept;
   bool is_open() const noexcept;
