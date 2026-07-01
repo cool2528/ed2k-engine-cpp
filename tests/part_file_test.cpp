@@ -68,3 +68,52 @@ TEST(PartFile, GapsForMissing){
   }
   std::filesystem::remove_all(dir);
 }
+TEST(PartFile, WriteBlockIdempotent){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_idem"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto d0 = make_part_data(0x11, PART);
+  {
+    PartFile pf(path, PART, *FileHash::from_hex("00112233445566778899aabbccddeeff"), {md4_of(d0)});
+    // 写第 0 块两次:幂等,不重复计数
+    std::size_t blk = 184320;
+    auto b0 = make_part_data(0x11, blk);
+    EXPECT_TRUE(pf.write_block(0, std::uint32_t(blk), b0).has_value());
+    EXPECT_TRUE(pf.write_block(0, std::uint32_t(blk), b0).has_value());   // 重复写同块
+    EXPECT_FALSE(pf.complete());   // 仅 1/53 块
+  }
+  std::filesystem::remove_all(dir);
+}
+TEST(PartFile, IncrementalBlocksCompletePart){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_incr"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto d0 = make_part_data(0x11, PART);
+  {
+    PartFile pf(path, PART, *FileHash::from_hex("00112233445566778899aabbccddeeff"), {md4_of(d0)});
+    std::size_t blk = 184320;
+    for(std::size_t off=0; off<PART; off+=blk){
+      std::uint32_t start = std::uint32_t(off);
+      std::uint32_t end = std::uint32_t(std::min(off+blk, PART));
+      EXPECT_TRUE(pf.write_block(start, end, std::span(d0).subspan(off, end-start)).has_value());
+    }
+    EXPECT_TRUE(pf.complete());   // 所有块写齐 -> part MD4 校验通过
+  }
+  std::filesystem::remove_all(dir);
+}
+TEST(PartFile, PendingBlocksAfterReopen){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_reopen"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto d0 = make_part_data(0x11, PART), d1 = make_part_data(0x22, PART);
+  // 完整下载 part0
+  { PartFile pf(path, PART*2, *FileHash::from_hex("00112233445566778899aabbccddeeff"), {md4_of(d0), md4_of(d1)});
+    pf.write_block(0, std::uint32_t(PART), d0); }
+  // 重新打开:part0 已验证, pending_blocks 应不含 part0 的块
+  {
+    PartFile pf(path, PART*2, *FileHash::from_hex("00112233445566778899aabbccddeeff"), {md4_of(d0), md4_of(d1)});
+    EXPECT_TRUE(pf.is_block_done(0, 0));
+    auto pend = pf.pending_blocks();
+    // part0 全部块 done, pending 只含 part1 的 53 块
+    EXPECT_EQ(pend.size(), 53u);
+    for(auto& [pi,ai] : pend) EXPECT_EQ(pi, 1u);
+  }
+  std::filesystem::remove_all(dir);
+}
