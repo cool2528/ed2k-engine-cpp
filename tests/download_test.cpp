@@ -162,12 +162,21 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
 // 参数化重载: 服务指定 full 数据 + hashset(M3 LowID 回调路径与多源测试复用)。
 // 分派与 serve_full_peer(MockFile) 同款: HELLOANSWER/FILESTATUS/HASHSETANSWER/
 // FILENAMEANSWER/ACCEPTUPLOADREQ/SENDINGPART + OUTOFPARTREQS 终止多响应循环。
+// send_hello_first: 模拟 TCP 主动方(LowID 回调里拨入 listener 的源)——先发 HELLO 再等
+// HELLOANSWER;默认 false = acceptor 模式(读 HELLO 回 HELLOANSWER),保持既有 HighID 调用不变。
 static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<std::byte>& full,
-                                             const FileHash& fhash, const std::vector<PartHash>& parts){
+                                             const FileHash& fhash, const std::vector<PartHash>& parts,
+                                             bool send_hello_first = false){
   using namespace ed2k::peer;
-  (void)co_await read_frame(s);                          // HELLO
-  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
-    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+  if(send_hello_first){
+    // initiator: 先发 HELLO,再等对端(acceptor)回 HELLOANSWER。复用同一 HelloInfo。
+    co_await send_pkt(s, op::HELLO, encode_hello(h));
+    (void)co_await read_frame(s);                        // HELLOANSWER
+  } else {
+    (void)co_await read_frame(s);                        // HELLO
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h));
+  }
   (void)co_await read_frame(s);                          // SETREQFILEID
   { codec::ByteWriter w; w.hash16(fhash);
     w.u16(static_cast<std::uint16_t>(parts.size()));
@@ -487,7 +496,7 @@ TEST(Download, LowIdSourceViaCallback){
       tcp::endpoint ep(asio::ip::make_address_v4("127.0.0.1"), kk);
       auto [ec] = co_await c.async_connect(ep, asio::as_tuple(asio::use_awaitable));
       if(ec) co_return;
-      co_await serve_full_peer(std::move(c), full, mf.fhash, {mf.h0, mf.h1});
+      co_await serve_full_peer(std::move(c), full, mf.fhash, {mf.h0, mf.h1}, /*send_hello_first=*/true);
       co_return;
     }, asio::detached);
     co_await keep_alive(s); co_return;

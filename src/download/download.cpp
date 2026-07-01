@@ -87,6 +87,7 @@ peer_worker(boost::asio::any_io_executor ex,
             std::size_t max_retries,
             ed2k::server::ServerConnection* server_conn,
             ed2k::peer::InboundListener* listener){
+  bool accepted = false;   // LowID 回调路径下我方是 TCP acceptor,握手角色随之翻转
   std::optional<ed2k::peer::C2CConnection> conn_opt;
   if(source.low_id()){
     if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
@@ -95,15 +96,21 @@ peer_worker(boost::asio::any_io_executor ex,
     auto acc = co_await listener->accept(timeout);
     if(!acc) co_return tl::unexpected(acc.error());
     conn_opt.emplace(std::move(*acc));
+    accepted = true;
   } else {
     ed2k::peer::C2CConnection c(ex);
     auto cr = co_await c.connect(IPv4{source.id}, source.port, timeout);
     if(!cr) co_return tl::unexpected(cr.error());
     conn_opt.emplace(std::move(c));
+    accepted = false;
   }
   auto& conn = *conn_opt;
   ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
-  auto hr = co_await conn.handshake(mine, timeout);
+  // 握手角色:acceptor(我方接收 HELLO 再回 HELLOANSWER) vs initiator(我方先发 HELLO)。
+  // 不用 co_await 三目运算(parser-fragile),显式 if/else;HighID 路径与改前逐字节一致。
+  tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
+  if(accepted) hr = co_await conn.handshake_acceptor(mine, timeout);
+  else         hr = co_await conn.handshake(mine, timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn.request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());

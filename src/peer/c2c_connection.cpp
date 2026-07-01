@@ -39,6 +39,20 @@ C2CConnection::handshake(const HelloInfo& mine, std::chrono::milliseconds timeou
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_hello_answer(rp->payload);
 }
+asio::awaitable<tl::expected<HelloInfo,std::error_code>>
+C2CConnection::handshake_acceptor(const HelloInfo& mine, std::chrono::milliseconds timeout){
+  // acceptor: peer (TCP initiator) sends HELLO first; we decode it then reply HELLOANSWER.
+  // HELLO 与 HELLOANSWER 线格式相同(aMule ProcessHelloPacket 同一例程处理二者),
+  // 故复用 decode_hello_answer 解码对端 HELLO、encode_hello 编码我方 HELLOANSWER。
+  auto rp = co_await pump_until(op::HELLO, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  auto peer = decode_hello_answer(rp->payload);
+  if(!peer) co_return tl::unexpected(peer.error());
+  ed2k::net::Packet ans; ans.protocol=ed2k::net::proto::eDonkey; ans.opcode=op::HELLOANSWER; ans.payload=encode_hello(mine);
+  auto sr = co_await conn_.send(ans);
+  if(!sr) co_return tl::unexpected(sr.error());
+  co_return std::move(*peer);
+}
 asio::awaitable<tl::expected<FileStatus,std::error_code>>
 C2CConnection::request_file(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::SETREQFILEID; req.payload=encode_set_req_file(h);
