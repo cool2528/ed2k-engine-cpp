@@ -9,7 +9,6 @@
 #include <vector>
 #include <tl/expected.hpp>
 #include "ed2k/core/hash.hpp"
-#include "crypto/sha1.hpp"
 #include "ed2k/peer/c2c_opcodes.hpp"
 #include "ed2k/server/opcodes.hpp"   // tag::CT_NAME/CT_VERSION
 namespace ed2k::peer {

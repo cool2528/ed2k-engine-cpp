@@ -54,10 +54,6 @@ target_sources(ed2k_core PRIVATE src/app/server_session.cpp)
 
 add_executable(ed2k-tool apps/cli/main.cpp)
 target_link_libraries(ed2k-tool PRIVATE ed2k_core)
-# ed2k_core's public headers (e.g. peer/c2c_messages.hpp) use the project's
-# internal "crypto/*.hpp" include convention, which resolves via src/. Give
-# ed2k-tool the same src/ include path ed2k_tests already has.
-target_include_directories(ed2k-tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 if(ED2K_BUILD_TESTS)
   enable_testing()
