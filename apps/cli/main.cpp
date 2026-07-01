@@ -22,7 +22,8 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool parse <ed2k-link>\n"
   "       ed2k-tool login <server.met> [--ip:x.x.x.x] [--port:n]\n"
   "       ed2k-tool search <server.met> <keyword>\n"
-  "       ed2k-tool sources <server.met> <ed2k-link>"); return 2; }
+  "       ed2k-tool sources <server.met> <ed2k-link>\n"
+  "       ed2k-tool download <ed2k-link> [--out:PATH] [--server:server.met]"); return 2; }
 static std::vector<std::byte> read_all(const char* p){
   std::ifstream f(p,std::ios::binary); std::vector<std::byte> v;
   f.seekg(0,std::ios::end); auto n=f.tellg(); f.seekg(0);
@@ -125,6 +126,32 @@ int main(int argc,char** argv){
       for(const auto& s : gs->sources)
         std::printf("%s  id=0x%08X  port=%u  %s\n", IPv4{s.id}.to_dotted().c_str(), s.id, s.port, s.low_id()?"LowID":"HighID");
       std::printf("(%zu sources)\n", gs->sources.size());
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
+  }
+  if(cmd=="download"){
+    if(argc<3) return usage();
+    auto link_s = std::string(argv[2]);
+    auto pl = parse_link(link_s);
+    if(!pl){ std::printf("error: %s\n", pl.error().message().c_str()); return 1; }
+    auto* f = std::get_if<Ed2kFileLink>(&*pl);
+    if(!f){ std::printf("error: not a file link\n"); return 1; }
+    std::filesystem::path out = f->name.empty() ? "download.bin" : f->name;
+    std::optional<ed2k::app::ServerTarget> ov;
+    // --server:PATH reads server.met bytes; empty (default) -> download_link
+    // falls back to its internal fallback server list.
+    std::vector<std::byte> metbytes;
+    for(int i=3;i<argc;++i){ std::string a=argv[i];
+      if(a.rfind("--out:",0)==0) out = a.substr(6);
+      else if(a.rfind("--server:",0)==0){ metbytes = read_all(a.substr(9).c_str()); }
+    }
+    ed2k::net::IoRuntime rt; int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::app::DownloadOpts o; o.out_path=out; o.total_timeout=std::chrono::seconds(300);
+      auto r = co_await ed2k::app::download_link(rt.executor(), *f, metbytes, ov, o);
+      if(!r){ std::printf("error: %s\n", r.error().message().c_str()); rc=1; }
+      else std::printf("downloaded %s\n", out.string().c_str());
       rt.stop(); co_return;
     }, asio::detached);
     rt.run(); return rc;
