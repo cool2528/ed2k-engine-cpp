@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <system_error>
+#include <utility>
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -12,6 +13,7 @@ namespace ed2k::net {
 class Connection {
  public:
   explicit Connection(boost::asio::any_io_executor ex);
+  explicit Connection(boost::asio::ip::tcp::socket&& s) : socket_(std::move(s)) {}
   Connection(Connection&&) noexcept = default;
   Connection& operator=(Connection&&) noexcept = default;
 
