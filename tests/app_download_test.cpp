@@ -218,3 +218,67 @@ TEST(AppDownload, HighIdOnlySucceedsWhenClientPortBound){
   EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
   std::filesystem::remove(tmp);
 }
+
+// Regression (I1 fix): when a LowID source is present, download_link attempts to
+// construct InboundListener(opts.client_port). If that port is already (exclusively)
+// bound, the InboundListener ctor throws boost::system::system_error. Pre-fix the
+// throw propagated out of the expected<> coroutine (CLI spawns it asio::detached
+// with no handler) -> std::terminate, violating spec §6.1 ("无异常/CLI 不崩").
+// Post-fix the throw is contained at the call site: listener stays empty, peer_worker's
+// LowID branch returns connect_failed (defensive `!listener` guard) -> LowID source is
+// skipped gracefully, and a following HighID source completes the download normally.
+TEST(AppDownload, LowIdSourceSkipsGracefullyWhenClientPortBound){
+  auto mf = make_mock_file(0x55, 0x66);
+  IoRuntime rt;
+  // Exclusively occupy a free port (same technique as HighIdOnlySucceedsWhenClientPortBound).
+  tcp::acceptor occ(rt.context());
+  occ.open(tcp::v4());
+#ifdef _WIN32
+  {
+    BOOL excl = TRUE;
+    int sr = ::setsockopt(occ.native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                          reinterpret_cast<const char*>(&excl), sizeof(excl));
+    ASSERT_NE(sr, SOCKET_ERROR) << "setsockopt(SO_EXCLUSIVEADDRUSE) failed";
+  }
+#endif
+  occ.bind(tcp::endpoint(asio::ip::address_v4::any(), 0));
+  occ.listen();
+  std::uint16_t occupied = occ.local_endpoint().port();
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, server::op::IDCHANGE, w.take()); }
+    (void)co_await read_frame(s);   // GETSOURCES
+    // FOUNDSOURCES: file_hash(16) + u8 count(2) + src0(LowID id=0x100 <0x1000000, port=0)
+    //   + src1(HighID id=127.0.0.1=0x7F000001, port=peer.port()). LowID first so the
+    //   skipped path is exercised before the completing HighID source.
+    codec::ByteWriter w; w.hash16(mf.fhash); w.u8(2);
+    w.u32(0x00000100u); w.u16(0);              // LowID source (callback path, skipped)
+    w.u32(0x7F000001u); w.u16(peer.port());    // HighID source (completes the download)
+    co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
+    co_await keep_alive(s);
+    co_return;
+  });
+  Ed2kFileLink link; link.name="t"; link.size=PART*2; link.hash=mf.fhash;
+  ServerList sl; ServerEntry sv; sv.ip=IPv4::from_dotted("127.0.0.1").value(); sv.port=srv.port(); sl.servers={sv};
+  auto metbytes = write_server_met(sl);
+  auto tmp = std::filesystem::temp_directory_path() / "ed2k_app_dl_lowid_portbound_test";
+  std::filesystem::remove(tmp);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    DownloadOpts o; o.out_path=tmp; o.client_port=occupied;
+    o.per_server_timeout=3000ms; o.total_timeout=20000ms;
+    auto r = co_await download_link(rt.executor(), link, metbytes,
+      ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()}, o);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    co_return;
+  });
+  // LowID skipped (listener null) + HighID completed -> file exists with full size.
+  ASSERT_TRUE(std::filesystem::exists(tmp));
+  EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
+  std::filesystem::remove(tmp);
+}

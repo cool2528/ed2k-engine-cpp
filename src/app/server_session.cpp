@@ -5,6 +5,7 @@
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include <algorithm>
+#include <exception>
 #include <optional>
 #include <unordered_set>
 namespace ed2k::app {
@@ -79,10 +80,21 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
   // 监听器, 无条件 bind opts.client_port 会在端口被占用时抛 system_error, 回归
   // HighID 路径(本进程并发 download_link / 其它客户端占用 4662)。LowID 回调路径
   // 仍按原方式构造监听器。listener 生命周期覆盖整个 dl.run。
+  // Fix(I1): InboundListener 构造仍可能抛 system_error(bind 失败: 端口被占用/
+  // 权限不足)。download_link 是 expected<> 协程, CLI 以 asio::detached 派生无
+  // 异常处理器, 抛出会穿出 io_context::run() -> std::terminate, 违反 spec §6.1
+  // (无异常/CLI 不崩)。此处 try/catch 在调用点容纳该抛出: 失败则保持 listener
+  // 为空, peer_worker 的 LowID 分支已有 `if(!server_conn || !listener) co_return
+  // tl::unexpected(connect_failed)` 防御性守卫 -> LowID 源优雅跳过, HighID 源照常
+  // 进行。InboundListener 的抛出式 ctor API 不变(Task 5 范围), 仅在调用点转换为
+  // 干净的 expected 式降级(设置态, 非热路径)。
   bool has_low_id = std::any_of(gs->sources.begin(), gs->sources.end(),
                                 [](const ed2k::server::SourceEndpoint& s){ return s.low_id(); });
   std::optional<ed2k::peer::InboundListener> listener;
-  if(has_low_id) listener.emplace(ex, opts.client_port);
+  if(has_low_id){
+    try { listener.emplace(ex, opts.client_port); }
+    catch(const std::exception&) { /* bind 失败 — 保持 listener 为空; LowID 源优雅跳过 */ }
+  }
   // M2: aich=nullopt -> MultiSourceDownload 走 part-MD4 兜底路径
   ed2k::download::MultiSourceDownload dl(ex, opts.out_path, link.hash, link.size,
                                          std::nullopt, std::move(gs->sources),
