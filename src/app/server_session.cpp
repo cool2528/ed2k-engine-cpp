@@ -1,6 +1,8 @@
 #include "ed2k/app/server_session.hpp"
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/util/error.hpp"
+#include "ed2k/download/download.hpp"
+#include "ed2k/link/ed2k_link.hpp"
 #include <unordered_set>
 namespace ed2k::app {
 std::vector<ServerTarget> fallback_servers(){
@@ -50,5 +52,30 @@ login_with_rotation(boost::asio::any_io_executor ex,
     conn.close();
   }
   co_return tl::unexpected(last);
+}
+
+std::vector<ed2k::server::SourceEndpoint>
+filter_high_id(const std::vector<ed2k::server::SourceEndpoint>& sources){
+  std::vector<ed2k::server::SourceEndpoint> out;
+  for(const auto& s : sources) if(!s.low_id()) out.push_back(s);
+  return out;
+}
+
+boost::asio::awaitable<tl::expected<void, std::error_code>>
+download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
+              std::span<const std::byte> met_bytes, std::optional<ServerTarget> override,
+              const DownloadOpts& opts){
+  ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=opts.client_port;
+  p.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  auto lg = co_await login_with_rotation(ex, met_bytes, override, p, opts.per_server_timeout);
+  if(!lg) co_return tl::unexpected(lg.error());
+  auto gs = co_await lg->conn.get_sources(link.hash, link.size, opts.per_server_timeout);
+  if(!gs) co_return tl::unexpected(gs.error());
+  auto hi = filter_high_id(gs->sources);
+  if(hi.empty()) co_return tl::unexpected(make_error_code(errc::file_not_found));
+  // M2: aich=nullopt -> MultiSourceDownload 走 part-MD4 兜底路径
+  ed2k::download::MultiSourceDownload dl(ex, opts.out_path, link.hash, link.size,
+                                         std::nullopt, std::move(hi));
+  co_return co_await dl.run(opts.total_timeout, 3);
 }
 }
