@@ -16,7 +16,9 @@
 #include "ed2k/net/framing.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/codec/byte_io.hpp"
+#include "ed2k/hash/aich_hasher.hpp"
 #include "crypto/md4.hpp"
+#include "crypto/sha1.hpp"
 #include "ed2k/util/error.hpp"
 #include "mock_peer.hpp"
 using namespace ed2k; using namespace ed2k::net; using namespace ed2k::peer;
@@ -59,6 +61,50 @@ static MockFile make_mock_file(std::uint8_t f0, std::uint8_t f1){
   m = {}; m.update(mf.h0.bytes()); m.update(mf.h1.bytes()); mf.fhash = FileHash::from_bytes(m.finish());
   return mf;
 }
+// Part-respecting AICH leaf computation.
+// peer_worker/BlockAllocator index blocks by (pi, ai) with global = pi*53 + ai
+// (53 = ceil(PART_SIZE/AICH_BLOCK_SIZE); each part's 53rd block is short, 143360 B).
+// The flat aich_hash_bytes chunks the whole file as 184320-B blocks from offset 0,
+// which misaligns with per-part block boundaries whenever PART_SIZE % AICH_BLOCK_SIZE
+// != 0 (9728000 % 184320 = 143360). A flat leaf would span the part0/part1 boundary
+// while the per-part block stops at it, so verify_block could never pass for those
+// blocks. The e2e tests therefore compute the AICH root from part-respecting leaves
+// (matching peer_worker's pi*53+ai indexing). aich_hash_bytes is unchanged (flat,
+// correct for single-part files and its own unit tests).
+static std::vector<std::array<std::byte,20>> compute_aich_leaves(const std::vector<std::byte>& full, std::uint64_t size){
+  std::vector<std::array<std::byte,20>> leaves;
+  std::size_t num_parts = static_cast<std::size_t>((size + PART - 1) / PART);
+  for(std::size_t pi = 0; pi < num_parts; ++pi){
+    std::uint64_t pstart = static_cast<std::uint64_t>(pi) * PART;
+    std::uint64_t pend = std::min((static_cast<std::uint64_t>(pi)+1)*PART, size);
+    std::size_t nblk = static_cast<std::size_t>((pend - pstart + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+    for(std::size_t ai = 0; ai < nblk; ++ai){
+      std::uint64_t off = pstart + ai * AICH_BLOCK_SIZE;
+      std::uint64_t len = std::min(static_cast<std::uint64_t>(AICH_BLOCK_SIZE), pend - off);
+      leaves.push_back(crypto::sha1(std::span<const std::byte>(full).subspan(static_cast<std::size_t>(off), static_cast<std::size_t>(len))));
+    }
+  }
+  return leaves;
+}
+// lone-child Merkle reduction (odd trailing node passes up unchanged, NOT padded).
+// Matches AICHChecker::verify_block's tree walk and aich_hasher's merkle_root.
+static std::array<std::byte,20> merkle_reduce(std::vector<std::array<std::byte,20>> level){
+  if(level.empty()) return crypto::sha1({});
+  while(level.size() > 1){
+    std::vector<std::array<std::byte,20>> nxt;
+    for(std::size_t i = 0; i < level.size(); i += 2){
+      if(i+1 < level.size()){
+        std::array<std::byte,40> b;
+        for(int t=0;t<20;++t){ b[t]=level[i][t]; b[20+t]=level[i+1][t]; }
+        nxt.push_back(crypto::sha1(b));
+      } else {
+        nxt.push_back(level[i]);
+      }
+    }
+    level.swap(nxt);
+  }
+  return level[0];
+}
 // peer 响应 Download 的请求序列:HELLO→FILESTATUS→HASHSET→FILENAME→ACCEPT→
 // 循环处理 REQUESTPARTS:解析请求范围,回送对应 part 数据 + OUTOFPARTREQS 终止多响应循环。
 static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
@@ -95,6 +141,91 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
     w.blob(std::span<const std::byte>(d).subspan(off, len));
     co_await send_pkt(s, op::SENDINGPART, w.take());
     co_await send_pkt(s, op::OUTOFPARTREQS, {});         // 终止 request_blocks 多响应循环
+  }
+  co_await keep_alive(s); co_return;
+}
+// AICH-aware mock peer: like serve_full_peer but also answers AICHREQUEST with a
+// correct part-respecting Merkle proof path. Proof is always computed from the
+// CLEAN full file; data corruption (corrupt_block_n) only affects SENDINGPART, so
+// verify_block fails on tampered data while the proof stays valid.
+static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, bool corrupt_block_n = false, std::size_t corrupt_idx = 0){
+  using namespace ed2k::peer;
+  (void)co_await read_frame(s);   // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  (void)co_await read_frame(s);   // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);   // HASHSETREQUEST
+  { codec::ByteWriter w; w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);   // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+
+  // Build full file + part-respecting AICH leaves (matching peer_worker's pi*53+ai).
+  std::vector<std::byte> full;
+  full.insert(full.end(), mf.d0.begin(), mf.d0.end());
+  full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  auto leaves = compute_aich_leaves(full, full.size());
+
+  // Proof path for global leaf idx in the lone-child Merkle tree of `leaves`.
+  // Sibling omitted on lone layers (sibling >= level.size), matching verify_block.
+  auto proof_path = [&](std::size_t idx) -> std::vector<std::array<std::byte,20>>{
+    std::vector<std::array<std::byte,20>> path; auto level = leaves; std::size_t i = idx;
+    while(level.size() > 1){
+      std::size_t sib = i ^ 1;
+      if(sib < level.size()) path.push_back(level[sib]);
+      std::vector<std::array<std::byte,20>> nxt;
+      for(std::size_t k = 0; k < level.size(); k += 2){
+        if(k+1 < level.size()){
+          std::array<std::byte,40> b;
+          for(int t=0;t<20;++t){ b[t]=level[k][t]; b[20+t]=level[k+1][t]; }
+          nxt.push_back(crypto::sha1(b));
+        } else {
+          nxt.push_back(level[k]);
+        }
+      }
+      level.swap(nxt); i /= 2;
+    }
+    return path;
+  };
+
+  for(;;){
+    auto body = co_await read_frame(s);
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    std::uint8_t opcode = std::to_integer<std::uint8_t>(body[0]);
+    std::span<const std::byte> pl(body.data()+1, body.size()-1);
+    if(opcode == op::AICHREQUEST){
+      codec::ByteReader r(pl); (void)r.hash16();   // file hash (already validated by caller)
+      std::uint16_t idx = r.u16();                  // global AICH block index (pi*53+ai)
+      auto path = proof_path(idx);
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u16(static_cast<std::uint16_t>(path.size()));
+      for(auto& h : path){ w.blob(std::span<const std::byte>(h)); }
+      co_await send_pkt(s, op::AICHANSWER, w.take());
+      continue;
+    }
+    if(opcode == op::REQUESTPARTS){
+      codec::ByteReader r(pl); (void)r.hash16();
+      std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
+      (void)s1;(void)s2;(void)e1;(void)e2;
+      if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+      std::size_t off = s0;
+      std::size_t len = e0 - s0;
+      std::vector<std::byte> d(full.begin()+off, full.begin()+off+len);
+      if(corrupt_block_n){
+        // corrupt_idx is the flat byte-offset block index (s0/AICH_BLOCK_SIZE);
+        // for part-0 blocks this equals the global pi*53+ai index.
+        std::size_t blkidx = s0 / AICH_BLOCK_SIZE;
+        if(blkidx == corrupt_idx) std::fill(d.begin(), d.end(), std::byte(0xFF));
+      }
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0); w.blob(std::span<const std::byte>(d));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+      co_await send_pkt(s, op::OUTOFPARTREQS, {});
+      continue;
+    }
+    // other opcodes ignored
   }
   co_await keep_alive(s); co_return;
 }
@@ -170,9 +301,53 @@ TEST(Download, BlockLevelSingleSource){
 }
 
 TEST(Download, AICHCorruptionRecovers){
-  // one block corrupted on first try, gets re-download from another peer successfully
-  // TODO: implement this test when multi-source fully working
-  GTEST_SKIP() << "Multi-source AICH recovery not implemented yet";
+  // Block-level AICH recovery: peer A always serves a corrupted block 5 (part 0);
+  // peer_worker exhausts same-peer retries -> block_corrupt -> MultiSourceDownload
+  // switches to peer B which serves the clean block. File completes and verifies.
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_aich"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  // Part-respecting AICH root (matches peer_worker's pi*53+ai indexing).
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  AICHHash root = AICHHash::from_bytes(merkle_reduce(compute_aich_leaves(full, full.size())));
+
+  IoRuntime rt;
+  ed2k::test::MockPeer peerA(rt.context());
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, true, 5); co_return; });
+  ed2k::test::MockPeer peerB(rt.context());
+  peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, false); co_return; });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
+      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
+    auto r = co_await dl.run(10s, 3);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
+TEST(Download, BlockLevelAICHSingleSource){
+  // AICH-enabled block-level download, single clean source -> file completes and verifies.
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_aich_ok"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  AICHHash root = AICHHash::from_bytes(merkle_reduce(compute_aich_leaves(full, full.size())));
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, false); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
+      std::vector{SourceEndpoint{0x7F000001u, peer.port()}});
+    auto r = co_await dl.run(10s, 3);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
 }
 
 TEST(Download, RequestPartsI64RoundTrip){
