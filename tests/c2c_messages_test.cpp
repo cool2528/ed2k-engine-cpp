@@ -241,6 +241,22 @@ TEST(C2CMessages, DecodeSendingPartI64){
   EXPECT_EQ(out->end, 200u);
   EXPECT_EQ(out->data, bytes({1,2,3,4,5}));
 }
+// P4c-3-3: peer::Block is now u64. Offsets beyond 4 GiB must survive decode
+// without the silent u32 narrowing decode_sending_part_i64 had when
+// Block.start/end were u32 (the >4GiB corruption root cause, P4c-3 spec §3.1).
+// Full >4GiB block-offset e2e is exercised in M4.
+TEST(C2CMessages, DecodeSendingPartI64Beyond4GiB){
+  ByteWriter w;
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  w.hash16(h);
+  w.u64(0x100000000ULL);                 // exactly 4 GiB
+  w.u64(0x100000000ULL + 184320);        // one AICH block past 4 GiB
+  w.blob(bytes({1,2,3}));
+  auto out=decode_sending_part_i64(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->start, 0x100000000ULL);
+  EXPECT_EQ(out->end,   0x100000000ULL + 184320);
+}
 TEST(C2CMessages, DecodeCompressedPartI64){
   auto plain = bytes({10,20,30,40,50});
   auto comp = zlib_compress(plain);

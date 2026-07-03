@@ -50,8 +50,7 @@ Download::run(std::chrono::milliseconds timeout){
     if(!blocks) co_return tl::unexpected(blocks.error());
     if(blocks->empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
     for(auto& b : *blocks){
-      auto w = pf.write_block(static_cast<std::uint32_t>(b.start),
-                              static_cast<std::uint32_t>(b.end), b.data);
+      auto w = pf.write_block(b.start, b.end, b.data);
       if(!w) co_return tl::unexpected(w.error());
     }
   }
@@ -171,8 +170,7 @@ peer_worker(boost::asio::any_io_executor ex,
           break;   // 同源重下该块(重新 next_block 会取到 requeue 的块或下一块)
         }
       }
-      auto w = pf.write_block(static_cast<std::uint32_t>(b.start),
-                              static_cast<std::uint32_t>(b.end), b.data);
+      auto w = pf.write_block(b.start, b.end, b.data);
       if(!w) co_return tl::unexpected(w.error());
       alloc.mark_block_done(global);
       retry = 0;   // 成功一块,重置同源重试计数

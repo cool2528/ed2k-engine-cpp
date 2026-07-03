@@ -17,7 +17,7 @@ class PartFile {
   PartFile(const std::filesystem::path& path, std::uint64_t size, const FileHash& file_hash, std::vector<PartHash> part_hashes);
   bool open_for_write() const noexcept;
   std::vector<std::uint32_t> missing_parts_peer_has(const std::vector<bool>& peer_parts) const;
-  tl::expected<void,std::error_code> write_block(std::uint32_t start, std::uint32_t end, std::span<const std::byte> data);
+  tl::expected<void,std::error_code> write_block(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data);
   bool is_block_done(std::size_t global_block) const noexcept;          // flat whole-file block index
   std::vector<std::size_t> pending_blocks() const;                      // flat global block indices
   bool complete() const noexcept;

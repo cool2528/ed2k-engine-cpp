@@ -36,7 +36,7 @@ std::vector<std::byte> encode_cancel_transfer();
 // S→C 结构
 struct FileStatus { FileHash hash; std::vector<bool> parts; };
 struct FileNameAnswer { FileHash hash; std::string name; };
-struct Block { FileHash hash; std::uint32_t start=0, end=0; std::vector<std::byte> data; };
+struct Block { FileHash hash; std::uint64_t start=0, end=0; std::vector<std::byte> data; };
 
 tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>);
 tl::expected<FileStatus,std::error_code>         decode_file_status(std::span<const std::byte>);

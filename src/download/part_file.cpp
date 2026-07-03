@@ -52,7 +52,7 @@ std::vector<std::uint32_t> PartFile::missing_parts_peer_has(const std::vector<bo
 // 写入一个 flat 整文件块 [start, end)。块可跨越 part 边界: 一次连续写盘, 然后按 part 边界
 // 切分累计 part_filled_, 每个 part 字节满即回读整 part 做 MD4 校验。整 part 兼容路径已移除
 // (一个整 part 是 53 个 flat 块, 不是单个块)。
-tl::expected<void,std::error_code> PartFile::write_block(std::uint32_t start, std::uint32_t end, std::span<const std::byte> data){
+tl::expected<void,std::error_code> PartFile::write_block(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data){
   std::size_t global = static_cast<std::size_t>(static_cast<std::uint64_t>(start) / AICH_BLK);
   if(global >= block_done_.size()) return {};
   if(block_done_[global]) return {};   // 幂等: 已置位直接成功, 不重复写盘/校验/计数
