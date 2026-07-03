@@ -58,7 +58,7 @@
 | P4b 下载增强 | BlockAllocator + AICHChecker Merkle 校验 + MultiSourceDownload 骨架 | ✅ 已完成 |
 | P4b AICH 恢复 | 扁平 AICH 块级损坏恢复（184320B 块）+ 同源重试 + e2e/单源测试 | ✅ 已完成 |
 | **P4c-1 真实互操作** | `ed2k-tool` login/search/sources/download + server_session 编排 + LowID 回调框架（InboundListener + OP_CALLBACKREQUEST + peer_worker 分支）+ 门控 live 测试 | ✅ 已完成（代码） |
-| **P4c-2 AICH 两级树互操作** | 真实 eMule AICH 两级树（OP_AICHFILEHASHREQ/ANS）+ `aich_hash_bytes` 回两级 + AICHChecker 两级 | 🚧 spec 起草中 |
+| **P4c-2 AICH 两级树互操作** | 真实 eMule AICH 两级树（OP_AICHFILEHASHREQ/ANS）+ `aich_hash_bytes` 回两级 + AICHChecker 两级 | 🚧 spec✓ M1-M3 待实现 |
 | **P4c-3 多源并发 + 续传增强** | raccoon 多源并发 + 块粒度续传 + `peer::Block` u64 + 异步磁盘 I/O + .part.met 接入下载流程 | 🚧 M1 进行中（spec✓ Block u64✓） |
 
 ---
@@ -298,8 +298,8 @@ v1.0 ──► P7(混淆) ──► v2.0
 | 2026-07-03 | /loop 启动：编排 v1.0 关键路径。R0-5 完成（CMake install/export + BUILD/INSTALL_INTERFACE 修复，configure/build/测试绿）。P4c-2-1/P4c-3-1 设计 spec 派子代理起草中 | 9051eb8 |
 | 2026-07-03 | P4c-3-1 完成：多源并发设计 spec 评审通过并提交（`docs/superpowers/specs/2026-07-03-ed2k-p4c3-multisource-design.md`，四里程碑 M1–M4，`asio::experimental::channel` 完成信号避单线程 io_context 死锁）。P4c-2-1 子代理（前次 compaction 后失效）重新派发 | 6381985 |
 | 2026-07-03 | P4c-3-3 完成：`peer::Block` u32→u64（`ed80bcc`），消除 `decode_*_i64` >4GiB 窄化（D3 清偿）；新增 `DecodeSendingPartI64Beyond4GiB`；214 测试 209 过 5 skip 不回归 | ed80bcc |
-| 2026-07-03 | P4c-3-2 完成：M1 raccoon 实现计划（`docs/superpowers/plans/2026-07-03-ed2k-p4c3-raccoon-impl-plan.md`），4 阶段 S1–S4 + 10 项陷阱清单 + 测试门 | （本提交） |
-| 2026-07-03 | P4c-2-1 完成：AICH 两级树互操作设计 spec 评审通过（`docs/superpowers/specs/2026-07-03-ed2k-p4c2-aich-interop-design.md`，B1-B8 已核对代码，三里程碑 M1-M3）。**发现 B8 与 P4c-3 块模型冲突**——P4c-2 要求 per-part 块、P4c-3 假设 flat 块；建议 P4c-2 C3 回退先于 P4c-3 raccoon（见 §7） | （本提交） |
+| 2026-07-03 | P4c-3-2 完成：M1 raccoon 实现计划（`docs/superpowers/plans/2026-07-03-ed2k-p4c3-raccoon-impl-plan.md`），4 阶段 S1–S4 + 10 项陷阱清单 + 测试门 | 7c623d7 |
+| 2026-07-03 | P4c-2-1 完成：AICH 两级树互操作设计 spec 评审通过（`docs/superpowers/specs/2026-07-03-ed2k-p4c2-aich-interop-design.md`，B1-B8 已核对代码，三里程碑 M1-M3）。**发现 B8 与 P4c-3 块模型冲突**——P4c-2 要求 per-part 块、P4c-3 假设 flat 块；建议 P4c-2 C3 回退先于 P4c-3 raccoon（见 §7） | 828f655 |
 
 ---
 
