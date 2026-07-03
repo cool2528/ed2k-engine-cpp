@@ -10,31 +10,40 @@ Digest sha1_concat(const Digest& l, const Digest& r){
   std::array<std::byte,40> buf; for(int i=0;i<20;++i){buf[i]=l[i]; buf[20+i]=r[i];}
   return crypto::sha1(buf);
 }
-// 把一组叶子两两 Merkle 归并为根（奇数末位直接上提）
-Digest merkle_root(std::vector<Digest> level){
-  if(level.empty()) return crypto::sha1({}); // 不会发生，留作保护
-  while(level.size()>1){
-    std::vector<Digest> next;
-    for(std::size_t i=0;i<level.size();i+=2){
-      if(i+1<level.size()) next.push_back(sha1_concat(level[i],level[i+1]));
-      else next.push_back(level[i]);
-    }
-    level.swap(next);
+// 两级平衡二叉 Merkle 子树（对照 aMule SHAHashSet.cpp CAICHHashTree 构造 + FindHash + ReCalculateHash）。
+//   data_size: 本节点覆盖的数据长度
+//   base_size: 叶层基大小（顶层 PART_SIZE / 底层 AICH_BLOCK_SIZE）
+//   is_left:   m_bIsLeftBranch（左子=true，右子=false；根=true）
+Digest build_subtree(std::span<const std::byte> data,
+                     std::uint64_t data_size, std::uint64_t base_size, bool is_left) {
+  if (data_size <= base_size) {
+    // 叶节点：SHA1(原始块数据)（aMule FindHash:113 「m_nDataSize <= m_nBaseSize 即末层」）
+    return crypto::sha1(data.first(static_cast<std::size_t>(data_size)));
   }
-  return level[0];
+  // 平衡二叉分裂（aMule FindHash:118-120）：
+  //   nBlocks = ceil(data_size / base_size)
+  //   nLeft   = (is_left ? ceil(nBlocks/2) : floor(nBlocks/2)) * base_size
+  std::uint64_t nBlocks = data_size / base_size + ((data_size % base_size != 0) ? 1 : 0);
+  std::uint64_t nLeft   = (((is_left ? nBlocks + 1 : nBlocks) / 2)) * base_size;
+  std::uint64_t nRight  = data_size - nLeft;
+  // 子节点 baseSize 切换（aMule FindHash:128,138）：nLeft/nRight <= PARTSIZE → EMBLOCKSIZE
+  std::uint64_t base_left  = (nLeft  <= PART_SIZE) ? AICH_BLOCK_SIZE : PART_SIZE;
+  std::uint64_t base_right = (nRight <= PART_SIZE) ? AICH_BLOCK_SIZE : PART_SIZE;
+  Digest left_hash  = build_subtree(data.first(static_cast<std::size_t>(nLeft)),
+                                     nLeft, base_left, true);
+  Digest right_hash = build_subtree(data.subspan(static_cast<std::size_t>(nLeft)),
+                                     nRight, base_right, false);
+  return sha1_concat(left_hash, right_hash);
 }
-}
+} // namespace
+
 AICHHash aich_hash_bytes(std::span<const std::byte> data){
-  // 扁平单层 Merkle:所有 184320B 块的 SHA-1 叶子 → lone-child 归并到根。
-  std::vector<Digest> leaves;
-  std::size_t off=0, n=data.size();
-  if(n==0) return AICHHash::from_bytes(crypto::sha1({}));
-  do {
-    std::size_t take=std::min(AICH_BLOCK_SIZE, n-off);
-    leaves.push_back(crypto::sha1(data.subspan(off,take)));
-    off+=take;
-  } while(off<n);
-  return AICHHash::from_bytes(merkle_root(std::move(leaves)));
+  // 两级 Merkle 树：顶层以 PARTSIZE 为基、part 子树以 EMBLOCKSIZE 为基，块不跨 part 边界。
+  std::uint64_t n = static_cast<std::uint64_t>(data.size());
+  if (n == 0) return AICHHash::from_bytes(crypto::sha1({}));
+  // 根 baseSize（aMule SetFileSize）：n <= PARTSIZE → EMBLOCKSIZE，否则 PARTSIZE。根 isLeft=true。
+  std::uint64_t root_base = (n <= PART_SIZE) ? AICH_BLOCK_SIZE : PART_SIZE;
+  return AICHHash::from_bytes(build_subtree(data, n, root_base, true));
 }
 tl::expected<AICHHash,std::error_code> aich_hash_file(const std::filesystem::path& p){
   std::error_code ec; auto size=std::filesystem::file_size(p,ec);

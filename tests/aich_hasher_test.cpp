@@ -22,34 +22,82 @@ TEST(Aich, DiffersFromPlainSha1WhenMultiBlock){
   auto data=fill(AICH_BLOCK_SIZE*2, 0x33);
   EXPECT_NE(aich_hash_bytes(data).bytes(), crypto::sha1(data)); // 多块走 Merkle
 }
-TEST(Aich, FlatMerkleLoneChildMatchesManual){
-  // 3 块:末位 lone。扁平后根应等于手算的 lone-child 归并。
+namespace {
+// 独立参考实现：两级平衡二叉 Merkle（与 aich_hasher.cpp 的 build_subtree 分开编写以交叉校验）。
+// 对照 aMule SHAHashSet FindHash + ReCalculateHash。真实 aMule 字节级对照留 R0-1 live。
+using RDigest = std::array<std::byte,20>;
+RDigest ref_cat(const RDigest& l, const RDigest& r){
+  std::array<std::byte,40> b; for(int i=0;i<20;++i){b[i]=l[i];b[20+i]=r[i];}
+  return crypto::sha1(b);
+}
+RDigest ref_build(std::span<const std::byte> d, std::uint64_t n, std::uint64_t base, bool is_left){
+  if(n <= base) return crypto::sha1(d.first(static_cast<std::size_t>(n)));
+  std::uint64_t nBlocks = n/base + ((n%base)!=0?1:0);
+  std::uint64_t nLeft   = ((is_left?nBlocks+1:nBlocks)/2)*base;
+  std::uint64_t nRight  = n - nLeft;
+  std::uint64_t bl = (nLeft  <= PART_SIZE)?static_cast<std::uint64_t>(AICH_BLOCK_SIZE):PART_SIZE;
+  std::uint64_t br = (nRight <= PART_SIZE)?static_cast<std::uint64_t>(AICH_BLOCK_SIZE):PART_SIZE;
+  auto L = ref_build(d.first(static_cast<std::size_t>(nLeft)),  nLeft,  bl, true);
+  auto R = ref_build(d.subspan(static_cast<std::size_t>(nLeft)), nRight, br, false);
+  return ref_cat(L, R);
+}
+RDigest ref_two_level(std::span<const std::byte> d){
+  std::uint64_t n = d.size();
+  if(n==0) return crypto::sha1({});
+  std::uint64_t root_base = (n <= PART_SIZE)?static_cast<std::uint64_t>(AICH_BLOCK_SIZE):PART_SIZE;
+  return ref_build(d, n, root_base, true);
+}
+} // namespace
+
+TEST(Aich, TwoLevelThreeBlocksMatchesManual){
+  // 3 块(<1 part)：两级根 = SHA1(SHA1(h0||h1) || h2)。
+  // 注：3 块单 part 的两级 split 恰与旧扁平 lone-child 同根，故此用例兼作两级 left-biased(ceil) 锚点。
   std::vector<std::byte> data(AICH_BLOCK_SIZE*3, std::byte(0x77));
   auto h0 = crypto::sha1(std::span(data).subspan(0, AICH_BLOCK_SIZE));
   auto h1 = crypto::sha1(std::span(data).subspan(AICH_BLOCK_SIZE, AICH_BLOCK_SIZE));
   auto h2 = crypto::sha1(std::span(data).subspan(AICH_BLOCK_SIZE*2, AICH_BLOCK_SIZE));
-  // 手算扁平 lone-child: level0=[h0,h1,h2], level1=[SHA1(h0||h1), h2(lone上提)], root=SHA1(L||h2)
   std::array<std::byte,40> ab; for(int i=0;i<20;++i){ab[i]=h0[i];ab[20+i]=h1[i];}
   auto L = crypto::sha1(ab);
   std::array<std::byte,40> rb; for(int i=0;i<20;++i){rb[i]=L[i];rb[20+i]=h2[i];}
-  auto expected = crypto::sha1(rb);
+  auto expected = crypto::sha1(rb);   // SHA1(SHA1(h0||h1) || h2)
   EXPECT_EQ(aich_hash_bytes(data).bytes(), expected);
+  EXPECT_EQ(aich_hash_bytes(data).bytes(), ref_two_level(data));
 }
-TEST(Aich, FlatMerkleTwoChunkMatchesManual){
-  // 跨 chunk 边界(>9728000 字节):两级与扁平必然不同,验证扁平
-  std::size_t n = AICH_BLOCK_SIZE*54; // 54 块, 跨 CHUNK_SIZE(=53块/part)
-  std::vector<std::byte> data(n, std::byte(0x77));
+TEST(Aich, TwoLevelFourBlocksMatchesManual){
+  // 4 块(<1 part)：两级根 = SHA1(SHA1(h0||h1) || SHA1(h2||h3))，验证偶数 split 归并。
+  std::vector<std::byte> data(AICH_BLOCK_SIZE*4, std::byte(0x66));
+  auto h0 = crypto::sha1(std::span(data).subspan(0, AICH_BLOCK_SIZE));
+  auto h1 = crypto::sha1(std::span(data).subspan(AICH_BLOCK_SIZE, AICH_BLOCK_SIZE));
+  auto h2 = crypto::sha1(std::span(data).subspan(AICH_BLOCK_SIZE*2, AICH_BLOCK_SIZE));
+  auto h3 = crypto::sha1(std::span(data).subspan(AICH_BLOCK_SIZE*3, AICH_BLOCK_SIZE));
+  std::array<std::byte,40> ab; for(int i=0;i<20;++i){ab[i]=h0[i];ab[20+i]=h1[i];}
+  auto L = crypto::sha1(ab);
+  std::array<std::byte,40> cd; for(int i=0;i<20;++i){cd[i]=h2[i];cd[20+i]=h3[i];}
+  auto R = crypto::sha1(cd);
+  std::array<std::byte,40> root; for(int i=0;i<20;++i){root[i]=L[i];root[20+i]=R[i];}
+  EXPECT_EQ(aich_hash_bytes(data).bytes(), crypto::sha1(root));
+  EXPECT_EQ(aich_hash_bytes(data).bytes(), ref_two_level(data));
+}
+TEST(Aich, TwoLevelMultiPartMatchesReference){
+  // 跨 part 边界(>9728000)：两级按 part 重新切叶（part0 末叶 143360B 非 184320B），根与扁平必然不同。
+  // 用独立参考实现 ref_two_level 交叉校验 aich_hash_bytes。
+  // 2 part：9953280B = part0(53块)+part1(2块短)
+  std::vector<std::byte> a(AICH_BLOCK_SIZE*54, std::byte(0x77));
+  EXPECT_EQ(aich_hash_bytes(a).bytes(), ref_two_level(a));
+  // 3 part：PART_SIZE*2+1000 = part0+part1(各53块)+part2(1000B) —— 顶层右子 floor split
+  std::vector<std::byte> b(static_cast<std::size_t>(PART_SIZE*2 + 1000), std::byte(0xFF));
+  EXPECT_EQ(aich_hash_bytes(b).bytes(), ref_two_level(b));
+  // 两级与扁平确实不同（旧扁平 54 块 lone-child 根 ≠ 两级根）
   std::vector<std::array<std::byte,20>> leaves;
-  for(std::size_t i=0;i<54;++i) leaves.push_back(crypto::sha1(std::span(data).subspan(i*AICH_BLOCK_SIZE, AICH_BLOCK_SIZE)));
-  // lone-child 归并手算根
+  for(std::size_t i=0;i<54;++i) leaves.push_back(crypto::sha1(std::span(a).subspan(i*AICH_BLOCK_SIZE, AICH_BLOCK_SIZE)));
   auto level = leaves;
   while(level.size()>1){
     std::vector<std::array<std::byte,20>> nxt;
     for(std::size_t i=0;i<level.size();i+=2){
-      if(i+1<level.size()){ std::array<std::byte,40> b; for(int k=0;k<20;++k){b[k]=level[i][k];b[20+k]=level[i+1][k];} nxt.push_back(crypto::sha1(b)); }
+      if(i+1<level.size()){ std::array<std::byte,40> bb; for(int k=0;k<20;++k){bb[k]=level[i][k];bb[20+k]=level[i+1][k];} nxt.push_back(crypto::sha1(bb)); }
       else nxt.push_back(level[i]);
     }
     level.swap(nxt);
   }
-  EXPECT_EQ(aich_hash_bytes(data).bytes(), level[0]);
+  EXPECT_NE(aich_hash_bytes(a).bytes(), level[0]);
 }
