@@ -39,8 +39,12 @@ class C2CConnection {
     request_blocks(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
     request_blocks_i64(const FileHash&, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends, std::chrono::milliseconds timeout);
-  boost::asio::awaitable<tl::expected<std::vector<std::array<std::byte,20>>,std::error_code>>
-    request_aich_proof(const FileHash&, std::uint16_t block_index, std::chrono::milliseconds timeout);
+  // AICH master hash 交换 (OP_AICHFILEHASHREQ 0x9E -> OP_AICHFILEHASHANS 0x9D, 均 OP_EMULEPROT)
+  boost::asio::awaitable<tl::expected<AICHHash,std::error_code>>
+    request_aich_master_hash(const FileHash&, std::chrono::milliseconds timeout);
+  // AICH part 恢复数据 (OP_AICHREQUEST 0x9B -> OP_AICHANSWER 0x9C, 均 OP_EMULEPROT)
+  boost::asio::awaitable<tl::expected<AICHRecoveryData,std::error_code>>
+    request_aich_proof(const FileHash&, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout);
   void close() noexcept;
  private:
   boost::asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>

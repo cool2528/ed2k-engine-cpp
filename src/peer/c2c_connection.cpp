@@ -1,5 +1,6 @@
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/net/framing.hpp"
+#include "ed2k/codec/byte_io.hpp"
 #include "ed2k/util/error.hpp"
 #include <chrono>
 namespace ed2k::peer {
@@ -135,14 +136,34 @@ C2CConnection::request_blocks_i64(const FileHash& h, std::array<std::uint64_t,3>
   co_return blocks;
 }
 
-asio::awaitable<tl::expected<std::vector<std::array<std::byte,20>>,std::error_code>>
-C2CConnection::request_aich_proof(const FileHash& h, std::uint16_t block_index, std::chrono::milliseconds timeout){
-  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::AICHREQUEST;
-  req.payload=encode_aich_request(h, block_index);
+asio::awaitable<tl::expected<AICHHash,std::error_code>>
+C2CConnection::request_aich_master_hash(const FileHash& h, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::AICHFILEHASHREQ;
+  req.payload=encode_aich_file_hash_req(h);
+  auto sr = co_await conn_.send(req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(op::AICHFILEHASHANS, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  co_return decode_aich_file_hash_ans(rp->payload);
+}
+
+asio::awaitable<tl::expected<AICHRecoveryData,std::error_code>>
+C2CConnection::request_aich_proof(const FileHash& h, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::AICHREQUEST;
+  req.payload=encode_aich_request(h, master, part_index);
   auto sr = co_await conn_.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
   auto rp = co_await pump_until(op::AICHANSWER, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
+  // 校验回显的 master_hash 与请求一致 (aMule DownloadClient.cpp:1634 ahMasterHash == GetMasterHash):
+  // 帧 = file_hash(16) + part_index(2) + master_hash(20) + V2 data,master_hash 在偏移 18..38。
+  {
+    codec::ByteReader r(rp->payload);
+    r.hash16();                          // file_hash(16)
+    r.u16();                             // part_index(2)
+    auto echoed = AICHHash::from_bytes(r.hash20());
+    if(!r.ok() || echoed != master) co_return tl::unexpected(make_error_code(errc::hash_mismatch));
+  }
   co_return decode_aich_answer(rp->payload);
 }
 }

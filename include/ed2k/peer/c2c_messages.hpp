@@ -47,9 +47,25 @@ tl::expected<Block,std::error_code>              decode_sending_part(std::span<c
 tl::expected<Block,std::error_code>              decode_compressed_part(std::span<const std::byte>);
 tl::expected<FileHash,std::error_code>           decode_file_req_ans_no_fil(std::span<const std::byte>);
 
-// AICH messages
-std::vector<std::byte> encode_aich_request(const FileHash&, std::uint16_t block_index);
-tl::expected<std::vector<std::array<std::byte, 20>>, std::error_code> decode_aich_answer(std::span<const std::byte>);
+// AICH (aMule SHAHashSet) — 两级 Merkle 树恢复数据。详见 aich_checker.hpp / 设计 spec §5。
+// 四个 opcode 均在 OP_EMULEPROT(0xC5) 下，非 eDonkey(0xE3)。
+struct AICHProofHash {
+  std::uint32_t identifier;                 // 16-bit 标识符高位补零到 32-bit (aMule ReCalculateHash 路径)
+  std::array<std::byte, 20> hash;
+};
+struct AICHRecoveryData {
+  std::vector<AICHProofHash> hashes;        // V2 recovery data: 16-bit + 32-bit 标识符 hash 列表
+};
+
+// OP_AICHFILEHASHREQ(0x9E) -> OP_AICHFILEHASHANS(0x9D): 交换文件 AICH master hash (根)
+std::vector<std::byte> encode_aich_file_hash_req(const FileHash&);
+tl::expected<AICHHash, std::error_code> decode_aich_file_hash_ans(std::span<const std::byte>);
+
+// OP_AICHREQUEST(0x9B) -> OP_AICHANSWER(0x9C): 请求/返回某 part 的 V2 恢复数据
+//   请求帧 = file_hash(16) + part_index(u16) + master_hash(20) = 38B (aMule SendAICHRequest 顺序)
+//   应答帧 = file_hash(16) + part_index(u16) + master_hash(20) + V2 recovery data
+std::vector<std::byte> encode_aich_request(const FileHash&, const AICHHash& master, std::uint16_t part_index);
+tl::expected<AICHRecoveryData, std::error_code> decode_aich_answer(std::span<const std::byte>);
 
 // I64 (large file >4GiB) messages
 std::vector<std::byte> encode_request_parts_i64(const FileHash&, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends);

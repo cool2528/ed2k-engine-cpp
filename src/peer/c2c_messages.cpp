@@ -118,19 +118,44 @@ tl::expected<FileHash,std::error_code> decode_file_req_ans_no_fil(std::span<cons
   return h;
 }
 
-std::vector<std::byte> encode_aich_request(const FileHash& h, std::uint16_t idx){
+std::vector<std::byte> encode_aich_file_hash_req(const FileHash& h){
   ByteWriter w;
   w.hash16(h);
-  w.u16(idx);
+  return w.take();                       // file_hash(16) — aMule CPacket(OP_AICHFILEHASHREQ,16,OP_EMULEPROT)
+}
+tl::expected<AICHHash,std::error_code> decode_aich_file_hash_ans(std::span<const std::byte> data){
+  ByteReader r(data);
+  r.hash16();                            // file_hash(16) — 调用方已知请求的文件,此处丢弃
+  auto master = r.hash20();              // aich_master_hash(20)
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return AICHHash::from_bytes(master);
+}
+
+std::vector<std::byte> encode_aich_request(const FileHash& h, const AICHHash& master, std::uint16_t part_index){
+  // aMule SendAICHRequest 顺序: file_hash(16) -> part_index(u16) -> master_hash(20) = 38B
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(part_index);
+  w.hash20(master.bytes());
   return w.take();
 }
-tl::expected<std::vector<std::array<std::byte, 20>>,std::error_code> decode_aich_answer(std::span<const std::byte> data){
+tl::expected<AICHRecoveryData,std::error_code> decode_aich_answer(std::span<const std::byte> data){
   ByteReader r(data);
-  r.hash16(); // file hash already checked by caller
-  std::uint16_t count = r.u16();
-  std::vector<std::array<std::byte, 20>> out; out.reserve(count);
-  for(std::uint16_t i=0;i<count && r.ok();++i){
-    out.push_back(r.hash20());
+  r.hash16();                            // file_hash(16)
+  r.u16();                               // part_index(u16) — 回显请求的 part,校验由 C2CConnection 负责
+  r.hash20();                            // master_hash(20) — 校验由 C2CConnection 负责
+  // V2 recovery data (aMule ReadRecoveryData)
+  std::uint16_t count16 = r.u16();       // 16-bit 标识符 hash 数
+  AICHRecoveryData out;
+  out.hashes.reserve(128);               // 单 part 全 hashset ≤ ~113 节点; 避免 untrusted count 驱动分配
+  for(std::uint16_t i=0;i<count16 && r.ok();++i){
+    AICHProofHash p; p.identifier = r.u16(); p.hash = r.hash20();
+    out.hashes.push_back(std::move(p));
+  }
+  std::uint16_t count32 = r.u16();       // 32-bit 标识符 hash 数(大文件路径;非大文件为 0)
+  for(std::uint16_t i=0;i<count32 && r.ok();++i){
+    AICHProofHash p; p.identifier = r.u32(); p.hash = r.hash20();
+    out.hashes.push_back(std::move(p));
   }
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return out;

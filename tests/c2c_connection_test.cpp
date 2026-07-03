@@ -3,6 +3,7 @@
 #include <chrono>
 #include <exception>
 #include <initializer_list>
+#include <utility>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -36,8 +37,8 @@ template <class F> static void run_coro(IoRuntime& rt, F&& body){
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
   std::vector<std::byte> v; for(int x:xs) v.push_back(std::byte(x)); return v;
 }
-static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t opcode, std::span<const std::byte> payload){
-  Packet p; p.protocol=proto::eDonkey; p.opcode=opcode; p.payload.assign(payload.begin(), payload.end());
+static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t opcode, std::span<const std::byte> payload, std::uint8_t proto_val = proto::eDonkey){
+  Packet p; p.protocol=proto_val; p.opcode=opcode; p.payload.assign(payload.begin(), payload.end());
   auto frame = encode_frame(p);
   auto [e,n] = co_await asio::async_write(s, asio::buffer(frame), asio::as_tuple(asio::use_awaitable));
   (void)e;(void)n; co_return;
@@ -56,6 +57,26 @@ static asio::awaitable<void> keep_alive(tcp::socket& s){
   std::array<std::byte,1> t; auto [e,n]=co_await asio::async_read(s,asio::buffer(t),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return;
 }
 static HelloInfo peer_hello(){ HelloInfo h; h.nickname="peer"; h.version=0x3C; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff"); return h; }
+static int hexval(char c){ return c<='9'? c-'0' : (c|0x20)-'a'+10; }
+static std::array<std::byte,20> sha1_from_hex(std::string_view h){
+  std::array<std::byte,20> out{};
+  for(std::size_t b=0;b<20 && 2*b+1<h.size();++b) out[b]=std::byte(hexval(h[2*b])*16+hexval(h[2*b+1]));
+  return out;
+}
+static AICHHash aich_from_hex(std::string_view h){ return AICHHash::from_bytes(sha1_from_hex(h)); }
+// 读一帧并返回 [proto(1)][body=opcode+payload]; 供 AICH 测试断言协议层字节(OP_EMULEPROT 0xC5)。
+static asio::awaitable<std::pair<std::uint8_t,std::vector<std::byte>>> read_frame_proto(tcp::socket& s){
+  using R = std::pair<std::uint8_t,std::vector<std::byte>>;
+  std::array<std::byte,5> hdr;
+  auto [e1,n1] = co_await asio::async_read(s, asio::buffer(hdr), asio::as_tuple(asio::use_awaitable));
+  (void)n1; if(e1) co_return R{0, {}};
+  std::uint8_t proto_byte = std::to_integer<std::uint8_t>(hdr[0]);
+  auto h = parse_header(hdr); if(!h) co_return R{0, {}};
+  std::vector<std::byte> body(h->size);
+  auto [e2,n2] = co_await asio::async_read(s, asio::buffer(body), asio::as_tuple(asio::use_awaitable));
+  (void)n2; if(e2) co_return R{0, {}};
+  co_return R{proto_byte, std::move(body)};
+}
 
 TEST(C2CConnection, HandshakeRoundTrip){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
@@ -218,30 +239,83 @@ TEST(C2CConnection, FileNotFound){
 TEST(C2CConnection, RequestAichProofRoundTrip){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   FileHash fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  AICHHash master = aich_from_hex("00112233445566778899aabbccddeeff00112233");
+  std::array<std::byte,20> proof_hash = sha1_from_hex("aabbccddeeff00112233445566778899aabbccdd");
   peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
-    // request_aich_proof 只发 AICHREQUEST 收 AICHANSWER, 不需握手。
-    auto body = co_await read_frame(s);                  // [opcode(1)][payload]
+    // request_aich_proof 只发 AICHREQUEST 收 AICHANSWER, 不需握手;协议层必须 OP_EMULEPROT(0xC5)。
+    auto [proto_byte, body] = co_await read_frame_proto(s);
+    EXPECT_EQ(proto_byte, proto::eMule);                  // interop-critical: AICH under OP_EMULEPROT
     EXPECT_FALSE(body.empty()); if(body.empty()) co_return;
-    EXPECT_EQ(body[0], std::byte(op::AICHREQUEST));      // opcode
-    // payload = [16]hash + [2]u16 block_index(LE); block_index 在偏移 17
-    EXPECT_EQ(body.size(), 1u + 16u + 2u); if(body.size() != 19u) co_return;
-    EXPECT_EQ(std::to_integer<std::uint8_t>(body[17]), 42u);
+    // body = [opcode(1)][file_hash(16)][part_index(2)][master_hash(20)] = 39B
+    EXPECT_EQ(body.size(), 1u + 38u); if(body.size() != 39u) co_return;
+    EXPECT_EQ(body[0], std::byte(op::AICHREQUEST));
+    EXPECT_EQ(std::to_integer<std::uint8_t>(body[17]), 7u);   // part_index LE low (偏移 1+16)
     EXPECT_EQ(std::to_integer<std::uint8_t>(body[18]), 0u);
-    // answer: [16]hash + [2]count=1 + [20]proof
-    codec::ByteWriter w; w.hash16(fh); w.u16(1);
-    std::array<std::byte,20> proof{}; proof[0]=std::byte(0xAB);
-    w.blob(std::span<const std::byte>(proof));
-    co_await send_pkt(s, op::AICHANSWER, w.take());
+    std::array<std::byte,20> got_master{}; for(int i=0;i<20;++i) got_master[i]=body[19+i];
+    EXPECT_EQ(got_master, master.bytes());                    // master_hash 偏移 19..39
+    // answer: file_hash(16)+part_index(2)+master_hash(20)+V2(count16=1,ident=0,hash; count32=0)
+    codec::ByteWriter w; w.hash16(fh); w.u16(7); w.hash20(master.bytes());
+    w.u16(1); w.u16(0); w.hash20(proof_hash); w.u16(0);
+    co_await send_pkt(s, op::AICHANSWER, w.take(), proto::eMule);
     co_await keep_alive(s); co_return;
   });
   run_coro(rt, [&]() -> asio::awaitable<void>{
     C2CConnection c(rt.executor());
     auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
     EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
-    auto r = co_await c.request_aich_proof(fh, 42, 2s);
+    auto r = co_await c.request_aich_proof(fh, master, 7, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
-    EXPECT_EQ(r->size(), 1u); if(r->size()!=1u) co_return;
-    EXPECT_EQ((*r)[0][0], std::byte(0xAB));
+    EXPECT_EQ(r->hashes.size(), 1u); if(r->hashes.size()!=1u) co_return;
+    EXPECT_EQ(r->hashes[0].identifier, 0u);
+    EXPECT_EQ(r->hashes[0].hash, proof_hash);
+    c.close(); co_return;
+  });
+}
+TEST(C2CConnection, RequestAichMasterHashRoundTrip){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  FileHash fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  AICHHash master = aich_from_hex("00112233445566778899aabbccddeeff00112233");
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    auto [proto_byte, body] = co_await read_frame_proto(s);
+    EXPECT_EQ(proto_byte, proto::eMule);
+    EXPECT_FALSE(body.empty()); if(body.empty()) co_return;
+    EXPECT_EQ(body.size(), 1u + 16u); if(body.size() != 17u) co_return;   // opcode+file_hash
+    EXPECT_EQ(body[0], std::byte(op::AICHFILEHASHREQ));
+    // answer: file_hash(16) + aich_master_hash(20)
+    codec::ByteWriter w; w.hash16(fh); w.hash20(master.bytes());
+    co_await send_pkt(s, op::AICHFILEHASHANS, w.take(), proto::eMule);
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto r = co_await c.request_aich_master_hash(fh, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->bytes(), master.bytes());
+    c.close(); co_return;
+  });
+}
+TEST(C2CConnection, RequestAichProofMasterMismatch){
+  // 回显的 master_hash 与请求不一致 → hash_mismatch (aMule DownloadClient.cpp:1634 守卫)
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  FileHash fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  AICHHash master = aich_from_hex("00112233445566778899aabbccddeeff00112233");
+  AICHHash wrong = aich_from_hex("ff112233445566778899aabbccddeeff00112233");
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                          // 丢弃 AICHREQUEST
+    codec::ByteWriter w; w.hash16(fh); w.u16(7); w.hash20(wrong.bytes());   // 回显错误 master
+    w.u16(0); w.u16(0);                                    // V2: count16=0, count32=0
+    co_await send_pkt(s, op::AICHANSWER, w.take(), proto::eMule);
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto r = co_await c.request_aich_proof(fh, master, 7, 2s);
+    EXPECT_FALSE(r.has_value());
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::hash_mismatch));
     c.close(); co_return;
   });
 }

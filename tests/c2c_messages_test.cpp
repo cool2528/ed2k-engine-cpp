@@ -18,9 +18,9 @@ static std::vector<std::byte> hex(std::string_view h){
 }
 static std::array<std::byte, 20> sha1_from_hex(std::string_view h){
   std::array<std::byte, 20> out{};
-  for(std::size_t i=0;i<20 && i+1<h.size();i+=2){
-    auto val=[&](char c)->int{ return c<='9'? c-'0' : (c|0x20)-'a'+10; };
-    out[i/2] = std::byte(val(h[i])*16 + val(h[i+1]));
+  auto val=[&](char c)->int{ return c<='9'? c-'0' : (c|0x20)-'a'+10; };
+  for(std::size_t b=0;b<20 && 2*b+1<h.size();++b){
+    out[b] = std::byte(val(h[2*b])*16 + val(h[2*b+1]));
   }
   return out;
 }
@@ -192,24 +192,57 @@ TEST(C2CMessages, DecodeSendingPartTruncated){
   EXPECT_FALSE(decode_sending_part(bytes({1,2,3})).has_value());
 }
 
-TEST(C2CMessages, EncodeAichRequest){
+TEST(C2CMessages, EncodeAichFileHashReq){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
-  auto out=encode_aich_request(h, 42);
-  std::vector<std::byte> want=hex("00112233445566778899aabbccddeeff");
-  auto b = bytes({42, 0});
-  want.insert(want.end(), b.begin(), b.end());
-  EXPECT_EQ(out, want);
+  auto out=encode_aich_file_hash_req(h);
+  EXPECT_EQ(out, hex("00112233445566778899aabbccddeeff"));
+  EXPECT_EQ(out.size(), 16u);
 }
-TEST(C2CMessages, DecodeAichAnswer){
+TEST(C2CMessages, DecodeAichFileHashAns){
   ByteWriter w;
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   w.hash16(h);
-  w.u16(2);
   w.hash20(sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
-  w.hash20(sha1_from_hex("aabbccddeeff00112233445566778899aabbccdd"));
+  auto out=decode_aich_file_hash_ans(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->bytes(), sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+}
+TEST(C2CMessages, EncodeAichRequest){
+  // aMule SendAICHRequest 顺序: file_hash(16) + part_index(u16 LE) + master_hash(20) = 38B
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  AICHHash master = AICHHash::from_bytes(sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+  auto out=encode_aich_request(h, master, 42);
+  std::vector<std::byte> want=hex("00112233445566778899aabbccddeeff");
+  want.push_back(std::byte(42)); want.push_back(std::byte(0));   // part_index LE
+  auto m = hex("00112233445566778899aabbccddeeff00112233");
+  want.insert(want.end(), m.begin(), m.end());
+  EXPECT_EQ(out.size(), 38u);
+  EXPECT_EQ(out, want);
+}
+TEST(C2CMessages, DecodeAichAnswerV2RecoveryData){
+  // 帧 = file_hash(16) + part_index(2) + master_hash(20) + V2(count16 + [ident16+hash]×n + count32(0))
+  ByteWriter w;
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  AICHHash master = AICHHash::from_bytes(sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+  w.hash16(h); w.u16(7); w.hash20(master.bytes());
+  w.u16(2);                                                // count16 = 2
+  w.u16(0x0001); w.hash20(sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+  w.u16(0x0002); w.hash20(sha1_from_hex("aabbccddeeff00112233445566778899aabbccdd"));
+  w.u16(0);                                                // count32 = 0 (非大文件)
   auto out=decode_aich_answer(w.take());
   ASSERT_TRUE(out.has_value());
-  EXPECT_EQ(out->size(), 2u);
+  ASSERT_EQ(out->hashes.size(), 2u);
+  EXPECT_EQ(out->hashes[0].identifier, 0x0001u);
+  EXPECT_EQ(out->hashes[1].identifier, 0x0002u);
+  EXPECT_EQ(out->hashes[0].hash, sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+  EXPECT_EQ(out->hashes[1].hash, sha1_from_hex("aabbccddeeff00112233445566778899aabbccdd"));
+}
+TEST(C2CMessages, DecodeAichAnswerTruncated){
+  // 缺 master_hash/ V2 头 → buffer_underflow
+  ByteWriter w;
+  w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
+  w.u16(0);   // 仅 part_index,缺 master_hash
+  EXPECT_FALSE(decode_aich_answer(w.take()).has_value());
 }
 TEST(C2CMessages, EncodeRequestPartsI64){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");

@@ -163,8 +163,14 @@ peer_worker(boost::asio::any_io_executor ex,
       // C2 先验证后写入:AICH 启用时,先拉 proof + verify_block,通过才写盘;
       // 校验失败 requeue 同源重试,超过 max_retries 返回 block_corrupt 让上层切源。
       if(aich_active){
-        auto proof = co_await conn.request_aich_proof(hash, static_cast<std::uint16_t>(global), timeout);
-        bool ok = proof.has_value() && checker->verify_block(global, b.data, *proof);
+        // M3: request_aich_proof 改为 (file_hash, master_hash, part_index) → AICHRecoveryData。
+        //   master 取链接 h= 的 AICH 根(*aich);part_index 此处仍用 flat global 块索引占位 ——
+        //   M4 per-part 块分解落地后改真实 part_index。证明哈希按 wire 原序取出供 verify_block
+        //   (M2 ordered-span);M4 改标识符重建对齐 V2 recovery data。3 个 flat AICH 下载测试已 DISABLED。
+        auto rd = co_await conn.request_aich_proof(hash, *aich, static_cast<std::uint16_t>(global), timeout);
+        std::vector<std::array<std::byte,20>> proofs;
+        if(rd) for(const auto& p : rd->hashes) proofs.push_back(p.hash);
+        bool ok = rd.has_value() && checker->verify_block(global, b.data, proofs);
         if(!ok){
           alloc.requeue_block(global);
           if(++retry > max_retries) co_return tl::unexpected(make_error_code(errc::block_corrupt));

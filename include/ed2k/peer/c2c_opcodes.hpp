@@ -20,9 +20,12 @@ constexpr std::uint8_t FILEREQANSNOFIL   = 0x48;
 constexpr std::uint8_t OUTOFPARTREQS     = 0x57;
 constexpr std::uint8_t CANCELTRANSFER    = 0x56;
 constexpr std::uint8_t END_OF_DOWNLOAD   = 0x49;
-// AICH / large file (I64) extensions
-constexpr std::uint8_t AICHREQUEST       = 0x61;
-constexpr std::uint8_t AICHANSWER       = 0x62;
+// AICH (aMule src/include/protocol/ed2k/Client2Client/TCP.h) — 四个 opcode 均在 OP_EMULEPROT(0xC5) 下
+constexpr std::uint8_t AICHREQUEST       = 0x9B;  // <HASH16><u16 part_index><HASH20 master>
+constexpr std::uint8_t AICHANSWER        = 0x9C;  // <HASH16><u16 part_index><HASH20 master><V2 recovery data>
+constexpr std::uint8_t AICHFILEHASHANS   = 0x9D;  // <HASH16><HASH20 aich_master>
+constexpr std::uint8_t AICHFILEHASHREQ   = 0x9E;  // <HASH16>
+// large file (I64) extensions
 constexpr std::uint8_t REQUESTPARTS_I64 = 0x30;
 constexpr std::uint8_t SENDINGPART_I64  = 0x31;
 constexpr std::uint8_t COMPRESSEDPART_I64 = 0x32;
