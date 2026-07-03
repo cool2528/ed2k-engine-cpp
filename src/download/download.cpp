@@ -160,20 +160,13 @@ peer_worker(boost::asio::any_io_executor ex,
       // C2 先验证后写入:AICH 启用时,先拉 proof + verify_block,通过才写盘;
       // 校验失败 requeue 同源重试,超过 max_retries 返回 block_corrupt 让上层切源。
       if(aich_active){
-        // M4a: request_aich_proof 发真实 u16 part_index (不再用 flat global 占位)。
-        //   verify_block 仍用 M2 签名 (block_index=part-major 叶序, data, span<Digest>):
-        //   block_index = Σ blocks_in_part(p) for p<part_index + block_in_part。
-        //   M4b 改签名 verify_block(part_index, block_in_part, data, span<AICHProofHash>) + 标识符重建,
-        //   届时去掉 leaf 折算与 flat 哈希提取。3 个 AICH 下载用例仍 DISABLED 待 M4b/M4c。
+        // M4b: request_aich_proof 发真实 u16 part_index → AICHRecoveryData (V2 恢复数据)。
+        //   verify_block(part_index, block_in_part, data, span<AICHProofHash>) 两步安全验证:
+        //   叶 hash == SHA1(data) + rebuild(file)==master (标识符重建, 对照 aMule SHAHashSet)。
         auto rd = co_await conn.request_aich_proof(hash, *aich, static_cast<std::uint16_t>(part_index), timeout);
-        std::vector<std::array<std::byte,20>> proofs;
-        if(rd) for(const auto& p : rd->hashes) proofs.push_back(p.hash);
-        std::size_t leaf = block_in_part;
-        for(std::size_t p=0; p<part_index; ++p){
-          std::uint64_t ps = std::min(PART_SIZE, size - static_cast<std::uint64_t>(p)*PART_SIZE);
-          leaf += static_cast<std::size_t>((ps + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
-        }
-        bool ok = rd.has_value() && checker->verify_block(leaf, b.data, proofs);
+        bool ok = false;
+        if(rd) ok = checker->verify_block(part_index, block_in_part, b.data,
+                                           std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
         if(!ok){
           alloc.requeue_block(part_index, block_in_part);
           if(++retry > max_retries) co_return tl::unexpected(make_error_code(errc::block_corrupt));
