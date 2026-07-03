@@ -4,11 +4,15 @@
 #include <queue>
 #include <vector>
 #include <tuple>
+#include <utility>
 #include "ed2k/core/hash.hpp"
+#include "ed2k/hash/aich_hasher.hpp"   // AICH_BLOCK_SIZE / PART_SIZE 单一定义源
 #include "ed2k/download/part_file.hpp"
 namespace ed2k::download {
 
-constexpr std::size_t AICH_BLOCK_SIZE = 184320; // 180 KiB per AICH block
+// AICH 块基 = ed2k::AICH_BLOCK_SIZE（aich_hasher.hpp）；顶层 part 基 = ed2k::PART_SIZE。
+// per-part 块模型：块绝不跨 part 边界，每 part ceil(part_size/AICH_BLOCK_SIZE) 块
+// （满 part = 53 块，末块 143360B）。与 aMule SHAHashSet 两级树 per-part 叶序一致。
 
 class BlockAllocator {
  public:
@@ -18,11 +22,12 @@ class BlockAllocator {
   BlockAllocator(std::uint64_t size, const std::vector<PartHash>& part_hashes,
                  const std::optional<AICHHash>& root_hash, const PartFile& pf);
 
-  // Mark a flat whole-file block done; returns true if the whole file is now complete
-  bool mark_block_done(std::size_t global_block);
+  // Mark a per-part block done; returns true if the whole file is now complete
+  bool mark_block_done(std::size_t part, std::size_t block_in_part);
 
-  // Get next missing block -> (global_block, start_byte, end_byte); end is size-capped, NOT part-capped
-  std::optional<std::tuple<std::size_t, std::uint64_t, std::uint64_t>> next_block();
+  // Get next missing block -> (part, block_in_part, start_byte, end_byte)。
+  // 块绝不跨 part：end = min(start+AICH_BLOCK_SIZE, part_end, size)。
+  std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>> next_block();
 
   // Is entire file complete?
   bool complete() const;
@@ -31,17 +36,29 @@ class BlockAllocator {
   std::size_t missing_count() const;
 
   // 坏块重入 pending 队列尾部(损坏恢复:同 peer 重试 N 次后换源,见 T6)
-  void requeue_block(std::size_t global_block);
+  void requeue_block(std::size_t part, std::size_t block_in_part);
 
  private:
   std::uint64_t size_;
   std::vector<PartHash> part_hashes_;
   std::optional<AICHHash> root_hash_;
-  std::vector<bool> done_;                  // FLAT 整文件位图, size = ceil(size/AICH_BLOCK_SIZE)
-  std::queue<std::size_t> pending_;         // global block indices
+  std::vector<std::vector<bool>> done_;      // done_[part][block_in_part]; 块不跨 part
+  std::queue<std::pair<std::size_t,std::size_t>> pending_;  // (part, block_in_part)
 
-  void init_done(std::uint64_t size);   // 按 size 初始化 done_(全 false, flat)
-  void enqueue_missing();               // 把 done_ 中 false 的块入 pending_
+  std::size_t num_parts() const {
+    return static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE);
+  }
+  std::uint64_t part_size(std::size_t part) const {
+    std::uint64_t base = static_cast<std::uint64_t>(part) * PART_SIZE;
+    if (base >= size_) return 0;
+    return std::min(PART_SIZE, size_ - base);
+  }
+  std::size_t blocks_in_part(std::size_t part) const {
+    return static_cast<std::size_t>((part_size(part) + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+  }
+
+  void init_done();       // 按 size_/num_parts 初始化 done_(全 false, per-part)
+  void enqueue_missing(); // 把 done_ 中 false 的块入 pending_(part-major 序)
 };
 
 }

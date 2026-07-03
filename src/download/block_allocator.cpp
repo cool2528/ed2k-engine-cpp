@@ -3,23 +3,28 @@
 
 namespace ed2k::download {
 
-// FLAT 整文件块位图: num_blocks = ceil(size/AICH_BLOCK_SIZE)。
-// PART_SIZE 不是 AICH_BLOCK_SIZE 的整数倍, 故块可跨越 part 边界(与 aich_hash_bytes / AICHChecker 一致)。
-void BlockAllocator::init_done(std::uint64_t size) {
-  std::size_t num_blocks = static_cast<std::size_t>((size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
-  done_.assign(num_blocks, false);
+// per-part 块位图: done_[part][block_in_part]。每 part ceil(part_size/AICH_BLOCK_SIZE) 块,
+// 块绝不跨 part 边界 —— 与 aMule SHAHashSet 两级树 per-part 叶序一致 (满 part 53 块, 末块 143360B)。
+void BlockAllocator::init_done() {
+  done_.clear();
+  done_.resize(num_parts());
+  for (std::size_t p = 0; p < num_parts(); ++p) {
+    done_[p].assign(blocks_in_part(p), false);
+  }
 }
 
 void BlockAllocator::enqueue_missing() {
-  for (std::size_t g = 0; g < done_.size(); ++g) {
-    if (!done_[g]) pending_.push(g);
+  for (std::size_t p = 0; p < num_parts(); ++p) {
+    for (std::size_t b = 0; b < done_[p].size(); ++b) {
+      if (!done_[p][b]) pending_.push({p, b});
+    }
   }
 }
 
 BlockAllocator::BlockAllocator(std::uint64_t size, const std::vector<PartHash>& part_hashes,
                                const std::optional<AICHHash>& root_hash)
   : size_(size), part_hashes_(part_hashes), root_hash_(root_hash) {
-  init_done(size);
+  init_done();
   enqueue_missing();
 }
 
@@ -27,49 +32,58 @@ BlockAllocator::BlockAllocator(std::uint64_t size, const std::vector<PartHash>& 
 BlockAllocator::BlockAllocator(std::uint64_t size, const std::vector<PartHash>& part_hashes,
                                const std::optional<AICHHash>& root_hash, const PartFile& pf)
   : size_(size), part_hashes_(part_hashes), root_hash_(root_hash) {
-  init_done(size);
-  for (std::size_t g = 0; g < done_.size(); ++g) {
-    if (pf.is_block_done(g)) done_[g] = true;
+  init_done();
+  for (std::size_t p = 0; p < num_parts(); ++p) {
+    for (std::size_t b = 0; b < done_[p].size(); ++b) {
+      if (pf.is_block_done(p, b)) done_[p][b] = true;
+    }
   }
   enqueue_missing();
 }
 
-bool BlockAllocator::mark_block_done(std::size_t global_block) {
-  if (global_block >= done_.size()) return false;
-  done_[global_block] = true;
+bool BlockAllocator::mark_block_done(std::size_t part, std::size_t block_in_part) {
+  if (part >= done_.size() || block_in_part >= done_[part].size()) return false;
+  done_[part][block_in_part] = true;
   return complete();
 }
 
-// 返回 (global, start, end): start = global*AICH_BLOCK_SIZE, end = min(start+AICH_BLOCK_SIZE, size_),
-// 绝不按 part 截断 —— 跨界块的 end 可越过下一个 part 的起点。
-std::optional<std::tuple<std::size_t, std::uint64_t, std::uint64_t>>
+// 返回 (part, block_in_part, start, end): 块绝不跨 part 边界。
+//   start = part*PART_SIZE + block_in_part*AICH_BLOCK_SIZE
+//   end   = min(start + AICH_BLOCK_SIZE, part_end, size_)
+std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>>
 BlockAllocator::next_block() {
   if (pending_.empty()) return std::nullopt;
-  std::size_t global = pending_.front();
+  auto [part, bip] = pending_.front();
   pending_.pop();
 
-  std::uint64_t start = global * AICH_BLOCK_SIZE;
-  std::uint64_t end = std::min(start + AICH_BLOCK_SIZE, size_);
-  return std::make_tuple(global, start, end);
+  std::uint64_t pstart = static_cast<std::uint64_t>(part) * PART_SIZE;
+  std::uint64_t start = pstart + static_cast<std::uint64_t>(bip) * AICH_BLOCK_SIZE;
+  std::uint64_t pend = pstart + part_size(part);   // part 边界 (≤ size_)
+  std::uint64_t end = std::min(static_cast<std::uint64_t>(start) + AICH_BLOCK_SIZE, pend);
+  return std::make_tuple(part, bip, start, end);
 }
 
 bool BlockAllocator::complete() const {
-  for (bool b : done_) {
-    if (!b) return false;
+  for (const auto& pv : done_) {
+    for (bool b : pv) {
+      if (!b) return false;
+    }
   }
   return true;
 }
 
 std::size_t BlockAllocator::missing_count() const {
   std::size_t cnt = 0;
-  for (bool b : done_) {
-    if (!b) cnt++;
+  for (const auto& pv : done_) {
+    for (bool b : pv) {
+      if (!b) ++cnt;
+    }
   }
   return cnt;
 }
 
-void BlockAllocator::requeue_block(std::size_t global_block) {
-  pending_.push(global_block);
+void BlockAllocator::requeue_block(std::size_t part, std::size_t block_in_part) {
+  pending_.push({part, block_in_part});
 }
 
 }

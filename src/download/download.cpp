@@ -27,31 +27,30 @@ Download::run(std::chrono::milliseconds timeout){
   auto up = co_await conn_.start_upload(hash_, timeout);
   if(!up) co_return tl::unexpected(up.error());
   auto missing = pf.missing_parts_peer_has(fs->parts);
-  // 缺失 part 位图: 用于判断一个 flat 块是否需要请求(块可跨界, 只要触及任一缺失 part 即请求)。
+  // 缺失 part 位图: 用于跳过对端没有 / 已完成的 part。
   std::vector<bool> need_part(static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE), false);
   for(std::uint32_t p : missing) need_part[p] = true;
-  // FLAT 整文件块迭代: 每块 [start, end) 可能跨越 part 边界, write_block 负责跨界写盘 + 按 part 触发 MD4。
-  // 这与 aich_hash_bytes / AICHChecker 的扁平块定义一致(单层 Merkle, 叶子可跨 part)。
-  std::size_t num_blocks = static_cast<std::size_t>((size_ + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
-  for(std::size_t g=0; g<num_blocks; ++g){
-    if(pf.is_block_done(g)) continue;
-    std::uint64_t start = g * AICH_BLOCK_SIZE;
-    std::uint64_t end = std::min(start + AICH_BLOCK_SIZE, size_);
-    std::size_t p_first = static_cast<std::size_t>(start / PART_SIZE);
-    std::size_t p_last  = static_cast<std::size_t>((end - 1) / PART_SIZE);
-    bool needed = false;
-    for(std::size_t p=p_first; p<=p_last && p<need_part.size(); ++p)
-      if(need_part[p]){ needed = true; break; }
-    if(!needed) continue;
-    auto blocks = co_await conn_.request_blocks(hash_,
-      std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start),0,0},
-      std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end),0,0},
-      timeout);
-    if(!blocks) co_return tl::unexpected(blocks.error());
-    if(blocks->empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
-    for(auto& b : *blocks){
-      auto w = pf.write_block(b.start, b.end, b.data);
-      if(!w) co_return tl::unexpected(w.error());
+  // per-part 块迭代: 块绝不跨 part 边界, 与 aMule 两级树 per-part 叶序一致。
+  std::size_t np = static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE);
+  for(std::size_t p=0; p<np; ++p){
+    if(p >= need_part.size() || !need_part[p]) continue;
+    std::uint64_t pstart = static_cast<std::uint64_t>(p) * PART_SIZE;
+    std::uint64_t plen = std::min(PART_SIZE, size_ - pstart);
+    std::size_t nb = static_cast<std::size_t>((plen + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+    for(std::size_t b=0; b<nb; ++b){
+      if(pf.is_block_done(p, b)) continue;
+      std::uint64_t start = pstart + static_cast<std::uint64_t>(b) * AICH_BLOCK_SIZE;
+      std::uint64_t end = std::min(start + AICH_BLOCK_SIZE, pstart + plen);
+      auto blocks = co_await conn_.request_blocks(hash_,
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start),0,0},
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end),0,0},
+        timeout);
+      if(!blocks) co_return tl::unexpected(blocks.error());
+      if(blocks->empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
+      for(auto& b2 : *blocks){
+        auto w = pf.write_block(b2.start, b2.end, b2.data);
+        if(!w) co_return tl::unexpected(w.error());
+      }
     }
   }
   if(!pf.complete()) co_return tl::unexpected(make_error_code(errc::io_error));
@@ -121,11 +120,10 @@ peer_worker(boost::asio::any_io_executor ex,
   // 从 PartFile 已有块状态恢复 BlockAllocator:已完成的块不入 pending 队列
   BlockAllocator alloc{size, *hs, aich, pf};
   std::optional<AICHChecker> checker;
-  std::size_t num_blocks = static_cast<std::size_t>((size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
   bool aich_active = false;
-  // u16 block_index 容量上限:超过 65535 块(~11.5GB)时降级为 part-MD4-only。
-  // M2 起 AICHChecker 按 file_size 构造（两级树结构）；block_index 仍 flat，M4 per-part 落地后改两级叶序。
-  if(aich.has_value() && num_blocks <= 65535){
+  // part_index 在线协议为 u16 (FILESTATUS part 计数即 u16, ≤65535 part≈580TiB) —— 自然有界,
+  // 旧 flat 块索引的 num_blocks<=65535 守卫已删 (G10)。M4 per-part 块不跨 part, 叶序与两级树一致。
+  if(aich.has_value()){
     checker.emplace(*aich, size);
     aich_active = true;
   }
@@ -134,15 +132,14 @@ peer_worker(boost::asio::any_io_executor ex,
   auto up = co_await conn.start_upload(hash, timeout);
   if(!up) co_return tl::unexpected(up.error());
 
-  // PART_SIZE(9728000) 不是 AICH_BLOCK_SIZE(184320) 的整数倍(≈52.78), 但 flat 块定义下
-  // global = start_byte/AICH_BLOCK_SIZE 由 next_block 直接保证(start = global*AICH_BLOCK_SIZE),
-  // 不再需要 pi*53+ai 这种 per-part 重算 —— 消除旧实现跨界块索引失配的根因。
+  // per-part 块分解(M4): next_block 返回 (part_index, block_in_part, start, end), 块绝不跨 part。
+  // start = part_index*PART_SIZE + block_in_part*AICH_BLOCK_SIZE, end 按 part 边界截断。
   bool large_file = size > (std::uint64_t(1) << 32);
   std::size_t retry = 0;
   while(!alloc.complete()){
     auto nb = alloc.next_block();
     if(!nb.has_value()) break;
-    auto [global, start_byte, end_byte] = *nb;
+    auto [part_index, block_in_part, start_byte, end_byte] = *nb;
 
     std::vector<ed2k::peer::Block> blocks;
     if(large_file){
@@ -163,23 +160,29 @@ peer_worker(boost::asio::any_io_executor ex,
       // C2 先验证后写入:AICH 启用时,先拉 proof + verify_block,通过才写盘;
       // 校验失败 requeue 同源重试,超过 max_retries 返回 block_corrupt 让上层切源。
       if(aich_active){
-        // M3: request_aich_proof 改为 (file_hash, master_hash, part_index) → AICHRecoveryData。
-        //   master 取链接 h= 的 AICH 根(*aich);part_index 此处仍用 flat global 块索引占位 ——
-        //   M4 per-part 块分解落地后改真实 part_index。证明哈希按 wire 原序取出供 verify_block
-        //   (M2 ordered-span);M4 改标识符重建对齐 V2 recovery data。3 个 flat AICH 下载测试已 DISABLED。
-        auto rd = co_await conn.request_aich_proof(hash, *aich, static_cast<std::uint16_t>(global), timeout);
+        // M4a: request_aich_proof 发真实 u16 part_index (不再用 flat global 占位)。
+        //   verify_block 仍用 M2 签名 (block_index=part-major 叶序, data, span<Digest>):
+        //   block_index = Σ blocks_in_part(p) for p<part_index + block_in_part。
+        //   M4b 改签名 verify_block(part_index, block_in_part, data, span<AICHProofHash>) + 标识符重建,
+        //   届时去掉 leaf 折算与 flat 哈希提取。3 个 AICH 下载用例仍 DISABLED 待 M4b/M4c。
+        auto rd = co_await conn.request_aich_proof(hash, *aich, static_cast<std::uint16_t>(part_index), timeout);
         std::vector<std::array<std::byte,20>> proofs;
         if(rd) for(const auto& p : rd->hashes) proofs.push_back(p.hash);
-        bool ok = rd.has_value() && checker->verify_block(global, b.data, proofs);
+        std::size_t leaf = block_in_part;
+        for(std::size_t p=0; p<part_index; ++p){
+          std::uint64_t ps = std::min(PART_SIZE, size - static_cast<std::uint64_t>(p)*PART_SIZE);
+          leaf += static_cast<std::size_t>((ps + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+        }
+        bool ok = rd.has_value() && checker->verify_block(leaf, b.data, proofs);
         if(!ok){
-          alloc.requeue_block(global);
+          alloc.requeue_block(part_index, block_in_part);
           if(++retry > max_retries) co_return tl::unexpected(make_error_code(errc::block_corrupt));
           break;   // 同源重下该块(重新 next_block 会取到 requeue 的块或下一块)
         }
       }
       auto w = pf.write_block(b.start, b.end, b.data);
       if(!w) co_return tl::unexpected(w.error());
-      alloc.mark_block_done(global);
+      alloc.mark_block_done(part_index, block_in_part);
       retry = 0;   // 成功一块,重置同源重试计数
     }
   }
