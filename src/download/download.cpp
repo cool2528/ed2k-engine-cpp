@@ -123,9 +123,10 @@ peer_worker(boost::asio::any_io_executor ex,
   std::optional<AICHChecker> checker;
   std::size_t num_blocks = static_cast<std::size_t>((size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
   bool aich_active = false;
-  // u16 block_index 容量上限:超过 65535 块(~11.5GB)时降级为 part-MD4-only
+  // u16 block_index 容量上限:超过 65535 块(~11.5GB)时降级为 part-MD4-only。
+  // M2 起 AICHChecker 按 file_size 构造（两级树结构）；block_index 仍 flat，M4 per-part 落地后改两级叶序。
   if(aich.has_value() && num_blocks <= 65535){
-    checker.emplace(*aich, num_blocks);
+    checker.emplace(*aich, size);
     aich_active = true;
   }
 
