@@ -36,11 +36,15 @@ class MultiSourceDownload {
                       std::vector<server::SourceEndpoint> sources,
                       server::ServerConnection* server_conn = nullptr,
                       peer::InboundListener* listener = nullptr);
+  // P4c-3 M3: 注入磁盘卸载线程池 ex (IoRuntime::disk_executor())。
+  // 未调用时 disk_ex_==ex_ → write_block_async 退化为 post(net) 同步等效 (测试默认路径)。
+  void set_disk_executor(boost::asio::any_io_executor ex) { disk_ex_ = std::move(ex); }
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(
     std::chrono::milliseconds total_timeout,
     std::size_t max_retries = 3);
  private:
   boost::asio::any_io_executor ex_;
+  boost::asio::any_io_executor disk_ex_;   // M3: 默认 = ex_ (同步等效), set_disk_executor 注入 disk 池
   std::filesystem::path out_;
   FileHash hash_;
   std::uint64_t size_;

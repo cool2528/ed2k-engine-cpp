@@ -72,7 +72,7 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
                                           std::vector<server::SourceEndpoint> sources,
                                           server::ServerConnection* server_conn,
                                           peer::InboundListener* listener)
-  : ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich),
+  : ex_(ex), disk_ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich),
     sources_(std::move(sources)), server_conn_(server_conn), listener_(listener) {}
 
 // === raccoon 多源并发 (P4c-3) ===
@@ -136,6 +136,7 @@ struct SharedState {
   std::optional<AICHHash> aich;
   FileHash hash;
   std::uint64_t size;
+  boost::asio::any_io_executor disk_ex;   // M3: PartFile::write_block_async 卸载用
   bool complete = false;
   std::size_t active_workers = 0;
   std::optional<std::error_code> first_err;
@@ -266,7 +267,7 @@ peer_worker(boost::asio::any_io_executor ex,
           break;   // 同源重下该块 (next_block_for_parts 会再取到 requeue 的块或下一可服务块)
         }
       }
-      auto w = st.pf.write_block(b.start, b.end, b.data);
+      auto w = co_await st.pf.write_block_async(b.start, b.end, b.data, st.disk_ex);
       if(!w){ st.alloc.requeue_block(part_index, block_in_part); finish(w.error()); co_return; }
       if(st.alloc.mark_block_done(part_index, block_in_part)){ st.complete = true; break; }
       retry = 0;   // 成功一块, 重置同源重试计数
@@ -295,7 +296,7 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   BlockAllocator alloc(size_, fr.part_hashes, aich_, pf);
   std::size_t n_workers = sources_.size() - setup_idx;
   SharedState st{std::move(pf), std::move(alloc), std::nullopt, aich_, hash_, size_,
-                 false, n_workers, std::nullopt};
+                 disk_ex_, false, n_workers, std::nullopt};
   if(aich_) st.checker.emplace(*aich_, size_);
 
   // 阶段二: raccoon — N worker 并发。worker[setup_idx] 复用 setup 连接, 其余全新连接。

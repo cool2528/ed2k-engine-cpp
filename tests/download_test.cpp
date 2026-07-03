@@ -3,10 +3,13 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -652,6 +655,46 @@ TEST(Download, MultiSourceSingleSubsetFails){
     co_return;
   });
   std::filesystem::remove_all(dir);
+}
+
+// === P4c-3 M3 验收 (异步磁盘 I/O) ===
+// 功能: set_disk_executor 注入真实 disk 线程池 → write_block_async 走卸载路径 (状态/I/O 分离)。
+// 断言多源并发 + 异步磁盘路径下文件完整 + part-MD4 通过 (无竞态/腐败)。
+TEST(Download, MultiSourceAsyncDiskOffload){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_ms_async_disk"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  IoRuntime rt;
+  ed2k::test::MockPeer peerA(rt.context());
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return; });
+  ed2k::test::MockPeer peerB(rt.context());
+  peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
+      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
+    dl.set_disk_executor(rt.disk_executor());   // M3: 启用 disk 卸载 (真实 disk 线程)
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+// 结构: disk_executor 运行于独立线程 (≠ io_context::run 网络线程) → 磁盘 I/O/MD4 不阻塞网络线程。
+// spec §5.6 心跳断言的更稳健替代 (非时序, 不 flaky): 证 disk 卸载架构成立。
+TEST(Download, DiskExecutorRunsOnSeparateThread){
+  IoRuntime rt;
+  std::thread::id net_id, disk_id;
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    net_id = std::this_thread::get_id();                              // io_context::run (网络) 线程
+    co_await asio::post(rt.disk_executor(), asio::bind_executor(rt.disk_executor(), asio::use_awaitable));
+    disk_id = std::this_thread::get_id();                             // disk_pool 线程
+    co_return;
+  });
+  EXPECT_NE(net_id, disk_id) << "disk_executor 必须运行于独立线程 (M3 卸载前提)";
 }
 
 TEST(Download, LowIdSourceViaCallback){
