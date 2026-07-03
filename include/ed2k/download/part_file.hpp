@@ -23,6 +23,7 @@ class PartFile {
   std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps() const;
  private:
   std::filesystem::path path_;
+  std::filesystem::path met_path_;   // path_ + ".part.met" (P4c-3 M2 续传持久化)
   std::uint64_t size_;
   FileHash file_hash_;
   std::vector<PartHash> part_hashes_;
@@ -40,5 +41,9 @@ class PartFile {
   std::size_t blocks_in_part(std::size_t part) const {
     return static_cast<std::size_t>((part_size(part) + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
   }
+  // P4c-3 M2: .part.met 续传。met-first 恢复 (避整文件重哈希, D1); 失败/陈旧回退 rehash_all。
+  bool try_load_met();           // 解析 .part.met → 恢复 part_done_/block_done_; 返回是否成功应用
+  void rehash_all();             // 回退路径: 逐 part 回读 + MD4 校验 (P4a 原续传逻辑)
+  void save_met() const;         // 把当前 gaps() 落盘 .part.met (part 完成时调用)
 };
 }

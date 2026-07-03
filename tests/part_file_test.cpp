@@ -190,3 +190,89 @@ TEST(PartFile, PartBoundaryBlock){
   }
   std::filesystem::remove_all(dir);
 }
+
+// === P4c-3 M2: .part.met 续传 ===
+// met-first 路径区分测试: 有效 met → 恢复 part_done_ 无需重哈希。三测试覆盖 met 与 rehash
+// 分歧场景 (数据有效时两者一致, 故需构造分歧):
+//   1) 有效 met + 盘上数据损坏 → met 受信 (rehash 会取消 done) → 证 met-first 生效
+//   2) 损坏 met (bad magic) + 有效数据 → 回退 rehash → 恢复 done
+//   3) 陈旧 met (part_hashes 不符) + 有效数据 → 忽略 met → rehash (rehash 与 met 分歧)
+
+// (1) met 受信优先于盘上数据。设计权衡: met 仅在 part MD4 校验通过时写盘故受信,
+//     牺牲盘上数据事后损坏的检测换 D1 性能 (避整文件重哈希)。
+TEST(PartFile, ResumeFromPartMetTrustedOverCorruptData){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_met_trust"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto d0 = make_part_data(0x11, PART);
+  auto h0 = md4_of(d0), h1 = md4_of(make_part_data(0x22, PART));
+  auto fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  { PartFile pf(path, PART*2, fh, {h0,h1});                      // 写完 part0 → met 落盘 (part0 done, part1 gap)
+    std::size_t nb = static_cast<std::size_t>((PART + AICH_BLK - 1) / AICH_BLK);
+    for(std::size_t b=0;b<nb;++b){
+      std::uint64_t s=b*AICH_BLK, e=std::min(s+AICH_BLK, PART);
+      (void)pf.write_block(static_cast<std::uint32_t>(s), static_cast<std::uint32_t>(e),
+                     std::span(d0).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)));
+    }
+    EXPECT_TRUE(pf.is_block_done(0,0));
+    EXPECT_FALSE(pf.complete());
+  }
+  { std::fstream z(path, std::ios::binary | std::ios::in | std::ios::out);  // 破坏 part0 数据 (大小不变 → 防截断不触发)
+    std::vector<char> zero(static_cast<std::size_t>(PART), 0); z.seekp(0); z.write(zero.data(), static_cast<std::streamsize>(PART)); }
+  { PartFile pf(path, PART*2, fh, {h0,h1});                      // 重开: met 标 part0 done → 受信 (rehash 读零→md4≠h0→取消)
+    EXPECT_TRUE(pf.is_block_done(0,0)) << "met-first 应受信 part0 done (不重哈希)";
+    EXPECT_FALSE(pf.is_block_done(1,0));
+    auto pend = pf.pending_blocks();
+    EXPECT_EQ(pend.size(), 53u);
+    for(auto [p,b] : pend) EXPECT_EQ(p, 1u);
+  }
+  std::filesystem::remove_all(dir);
+}
+// (2) .part.met 损坏 (bad magic) → 回退 rehash_all (P4a 安全网)。数据有效 → rehash 恢复 part0 done。
+TEST(PartFile, CorruptPartMetFallsBackToRehash){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_met_corrupt"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto d0 = make_part_data(0x11, PART);
+  auto h0 = md4_of(d0), h1 = md4_of(make_part_data(0x22, PART));
+  auto fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  { PartFile pf(path, PART*2, fh, {h0,h1});
+    std::size_t nb = static_cast<std::size_t>((PART + AICH_BLK - 1) / AICH_BLK);
+    for(std::size_t b=0;b<nb;++b){
+      std::uint64_t s=b*AICH_BLK, e=std::min(s+AICH_BLK, PART);
+      (void)pf.write_block(static_cast<std::uint32_t>(s), static_cast<std::uint32_t>(e),
+                     std::span(d0).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)));
+    }
+  }
+  auto met = path; met += ".part.met";
+  { std::ofstream m(met, std::ios::binary | std::ios::trunc); std::array<char,1> bad{'\x99'}; m.write(bad.data(), 1); }
+  { PartFile pf(path, PART*2, fh, {h0,h1});                      // met 解析失败 → rehash → part0 数据有效 → done
+    EXPECT_TRUE(pf.is_block_done(0,0)) << "met 损坏 → rehash 回退 → part0 (数据有效) done";
+    EXPECT_FALSE(pf.is_block_done(1,0));
+  }
+  std::filesystem::remove_all(dir);
+}
+// (3) 陈旧 .part.met (part_hashes 不匹配本文件) → 忽略 → rehash。分歧点: met gaps 空 → 误用会标 part0 done;
+//     rehash 读 d0 → md4(d0)=h0≠h0_wrong → part0 not done。断言 not done → 证陈旧 met 被忽略 + rehash 执行。
+TEST(PartFile, StalePartMetHashMismatchIgnored){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_met_stale"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto d0 = make_part_data(0x11, PART);
+  auto h0 = md4_of(d0), h1 = md4_of(make_part_data(0x22, PART));
+  auto h0_wrong = md4_of(make_part_data(0xFF, PART));            // 不同于 d0 的 part hash
+  auto fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  { PartFile pf(path, PART*2, fh, {h0,h1});                      // 写完 part0 → met 落盘 (part_hashes=[h0,h1])
+    std::size_t nb = static_cast<std::size_t>((PART + AICH_BLK - 1) / AICH_BLK);
+    for(std::size_t b=0;b<nb;++b){
+      std::uint64_t s=b*AICH_BLK, e=std::min(s+AICH_BLK, PART);
+      (void)pf.write_block(static_cast<std::uint32_t>(s), static_cast<std::uint32_t>(e),
+                     std::span(d0).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)));
+    }
+  }
+  // 重开为 "不同文件": part0 hash 不符 → met 陈旧 → 忽略 → rehash。
+  // rehash: part0 读 d0→md4=h0≠h0_wrong→not done; part1 无数据→not done。pending=106。
+  { PartFile pf(path, PART*2, fh, {h0_wrong,h1});
+    EXPECT_FALSE(pf.is_block_done(0,0)) << "陈旧 met 应忽略, rehash 读 d0≠h0_wrong → part0 not done";
+    EXPECT_FALSE(pf.is_block_done(1,0));
+    EXPECT_EQ(pf.pending_blocks().size(), 106u);
+  }
+  std::filesystem::remove_all(dir);
+}

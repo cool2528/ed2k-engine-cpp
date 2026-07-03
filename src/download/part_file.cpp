@@ -1,8 +1,10 @@
 #include "ed2k/download/part_file.hpp"
+#include "ed2k/metfile/known_part_met.hpp"
 #include "crypto/md4.hpp"
 namespace ed2k::download {
 PartFile::PartFile(const std::filesystem::path& path, std::uint64_t size, const FileHash& file_hash, std::vector<PartHash> part_hashes)
-  : path_(path), size_(size), file_hash_(file_hash), part_hashes_(std::move(part_hashes)) {
+  : path_(path), met_path_(path), size_(size), file_hash_(file_hash), part_hashes_(std::move(part_hashes)) {
+  met_path_ += ".part.met";
   if(part_hashes_.empty()) part_hashes_.push_back(file_hash_);
   part_done_.assign(part_hashes_.size(), false);
   part_filled_.assign(part_hashes_.size(), 0);
@@ -12,7 +14,40 @@ PartFile::PartFile(const std::filesystem::path& path, std::uint64_t size, const 
     block_done_[p].assign(blocks_in_part(p), false);
   if(!std::filesystem::exists(path_)) { std::ofstream c(path_, std::ios::binary); }
   f_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
-  // 逐 part 回读 + MD4 校验(续传: 已校验的 part 标 done)
+  // P4c-3 M2: met-first 续传。.part.met 有效 → 恢复 part_done_ 无需重哈希 (D1 性能);
+  //          缺失/损坏/陈旧 (hash 不匹配) → 回退 rehash_all (P4a 安全网)。
+  if(!try_load_met()) rehash_all();
+}
+// .part.met 解析恢复。仅当 magic 有效且 hash/part_hashes 与本文件一致时应用 (否则视为陈旧)。
+// 信任模型: met 标 done 的 part 直接受信 (写盘时已 MD4 校验); 仅以 file_size(data) >= part_end
+// 防截断, 不再回读重哈希。partial part (met 中为 gap) → 重下整 part (块级不持久化, 与 P4a 一致)。
+bool PartFile::try_load_met(){
+  if(!std::filesystem::exists(met_path_)) return false;
+  std::ifstream m(met_path_, std::ios::binary);
+  if(!m.is_open()) return false;
+  std::vector<char> raw((std::istreambuf_iterator<char>(m)), std::istreambuf_iterator<char>());
+  std::vector<std::byte> buf(raw.size());
+  for(std::size_t i=0;i<raw.size();++i) buf[i] = std::byte(static_cast<unsigned char>(raw[i]));
+  auto r = ed2k::parse_part_met(buf);
+  if(!r) return false;
+  if(!(r->hash == file_hash_) || r->part_hashes != part_hashes_) return false;   // 陈旧 met (异文件)
+  std::uint64_t data_sz = std::filesystem::exists(path_) ? std::filesystem::file_size(path_) : 0;
+  for(std::size_t i=0;i<part_hashes_.size();++i){
+    std::uint64_t pstart = static_cast<std::uint64_t>(i)*PART_SIZE;
+    std::uint64_t pend = std::min(static_cast<std::uint64_t>(pstart+PART_SIZE), size_);
+    bool gap_overlaps = false;
+    for(auto& g : r->gaps){
+      if(g.first < pend && g.second > pstart){ gap_overlaps = true; break; }
+    }
+    if(!gap_overlaps && data_sz >= pend){
+      part_done_[i] = true; part_filled_[i] = pend - pstart;
+      block_done_[i].assign(blocks_in_part(i), true);
+    }   // else: 保持 init 的 false (partial/截断 part → 重下)
+  }
+  return true;
+}
+// 回退路径 (P4a 原续传): 逐 part 回读 + MD4 校验。met 缺失/损坏/陈旧时使用。
+void PartFile::rehash_all(){
   for(std::size_t i=0;i<part_hashes_.size();++i){
     std::uint64_t pstart = i*PART_SIZE;
     std::uint64_t pend = std::min((i+1)*PART_SIZE, size_);
@@ -30,10 +65,20 @@ PartFile::PartFile(const std::filesystem::path& path, std::uint64_t size, const 
     f_.clear();
   }
   // 推导 per-part block_done_: 一个 part 的 MD4 校验通过 → 该 part 所有块均 done。
-  // (块不跨 part: 无需跨界联合判定。)
   for(std::size_t p=0;p<part_hashes_.size();++p){
     if(part_done_[p]) block_done_[p].assign(blocks_in_part(p), true);
   }
+}
+// 落盘 .part.met: gaps() 为缺失整 part 区间 (与 part 粒度状态模型一致)。
+void PartFile::save_met() const {
+  ed2k::PartFileState st;
+  st.hash = file_hash_;
+  st.part_hashes = part_hashes_;
+  st.gaps = gaps();
+  auto bytes = ed2k::write_part_met(st);
+  std::ofstream m(met_path_, std::ios::binary | std::ios::trunc);
+  if(!m.is_open()) return;
+  m.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 }
 bool PartFile::open_for_write() const noexcept { return f_.is_open(); }
 std::vector<std::uint32_t> PartFile::missing_parts_peer_has(const std::vector<bool>& peer_parts) const {
@@ -45,7 +90,7 @@ std::vector<std::uint32_t> PartFile::missing_parts_peer_has(const std::vector<bo
 // 写入一个 per-part 块 [start, end)。块绝不跨 part 边界(per-part 模型):
 //   part = start/PART_SIZE, block_in_part = (start%PART_SIZE)/AICH_BLOCK_SIZE。
 // 一次连续写盘, 然后按 part 边界累计 part_filled_ (per-part 块恒落单 part, 循环退化为单段),
-// 该 part 字节满即回读整 part 做 MD4 校验。
+// 该 part 字节满即回读整 part 做 MD4 校验。part 完成时落盘 .part.met (M2 续传持久化)。
 tl::expected<void,std::error_code> PartFile::write_block(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data){
   std::size_t part = static_cast<std::size_t>(start / PART_SIZE);
   std::size_t bip  = static_cast<std::size_t>((start % PART_SIZE) / AICH_BLOCK_SIZE);
@@ -77,6 +122,7 @@ tl::expected<void,std::error_code> PartFile::write_block(std::uint64_t start, st
       if(PartHash::from_bytes(m.finish()) != part_hashes_[p])
         return tl::unexpected(make_error_code(errc::block_corrupt));
       part_done_[p] = true;
+      save_met();   // M2: part 完成 → 持久化 .part.met (崩溃后此 part 无需重哈希)
     }
   }
   return {};
