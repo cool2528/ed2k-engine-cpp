@@ -526,6 +526,134 @@ TEST(Download, AICHMasterMismatchDegrades){
   std::filesystem::remove_all(dir);
 }
 
+// === P4c-3 raccoon 多源并发 e2e (S4) ===
+// serve_subset_peer: 报告 have_parts 位图 (FILESTATUS 只标己有 part), 服务任意请求块
+// (worker 经 next_block_for_parts 只请求对端有该 part 的块, 故仅会请求己有 part 的块)。
+// 复用 serve_full_peer(full,...) 的握手/分派序列, 仅 FILESTATUS 位图按 have_parts 编码。
+static asio::awaitable<void> serve_subset_peer(tcp::socket s, const std::vector<std::byte>& full,
+                                               const FileHash& fhash, const std::vector<PartHash>& parts,
+                                               const std::vector<bool>& have_parts,
+                                               bool send_hello_first = false){
+  using namespace ed2k::peer;
+  HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+  if(send_hello_first){
+    co_await send_pkt(s, op::HELLO, encode_hello(h));
+    (void)co_await read_frame(s);
+  } else {
+    (void)co_await read_frame(s);
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h));
+  }
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(fhash);
+    w.u16(static_cast<std::uint16_t>(parts.size()));
+    std::size_t nbytes = (parts.size() + 7) / 8;
+    for(std::size_t i=0;i<nbytes;++i){
+      std::uint8_t b=0;
+      for(std::size_t bit=0; bit<8 && i*8+bit < have_parts.size(); ++bit)
+        if(have_parts[i*8+bit]) b |= static_cast<std::uint8_t>(1u << bit);
+      w.u8(b);
+    }
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.u16(static_cast<std::uint16_t>(parts.size()));
+    for(const auto& p : parts) w.hash16(p);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
+    (void)r.hash16();
+    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
+    (void)s1;(void)s2;(void)e1;(void)e2;
+    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+    std::size_t off = static_cast<std::size_t>(s0);
+    std::size_t len = static_cast<std::size_t>(e0 - s0);
+    codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
+    w.blob(std::span<const std::byte>(full).subspan(off, len));
+    co_await send_pkt(s, op::SENDINGPART, w.take());
+    co_await send_pkt(s, op::OUTOFPARTREQS, {});
+  }
+  co_await keep_alive(s); co_return;
+}
+
+// raccoon 多源带宽聚合: 两个满文件源并发, 块来自 ≥2 源 (无块丢失/重复)。
+// 单源也能完成, 故此测试主要验证 2 worker 并发共享 alloc 的正确性 (竞态安全网)。
+TEST(Download, MultiSourceBothFull){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_ms_full"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  IoRuntime rt;
+  ed2k::test::MockPeer peerA(rt.context());
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return; });
+  ed2k::test::MockPeer peerB(rt.context());
+  peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
+      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
+// raccoon 多源 per-part 聚合: A 持 part0, B 持 part1 (互补 per-part 子集)。双源并发完成
+// 整文件 → 证 per-part 块模型下多源聚合语义正确。单源 (A 或 B) 各缺一半 part →
+// next_block_for_parts 源耗尽退出 + active_workers<=1 → io_error, 必然失败; 双源成功即证聚合。
+TEST(Download, MultiSourceAggregates){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_ms_agg"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  IoRuntime rt;
+  ed2k::test::MockPeer peerA(rt.context());
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_subset_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}, {true, false}); co_return; });   // A: part0
+  ed2k::test::MockPeer peerB(rt.context());
+  peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_subset_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}, {false, true}); co_return; });   // B: part1
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
+      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
+// 反证: 单源 (A, 仅 part0) 无法完成 → io_error。补强 MultiSourceAggregates 的聚合断言
+// (单源必然失败, 双源才成功)。
+TEST(Download, MultiSourceSingleSubsetFails){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_ms_subset_fail"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  IoRuntime rt;
+  ed2k::test::MockPeer peerA(rt.context());
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_subset_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}, {true, false}); co_return; });   // A: part0 only
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
+      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}});
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_FALSE(r.has_value());   // 单源仅 part0 → part1 永远缺 → 源耗尽 → io_error
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
 TEST(Download, LowIdSourceViaCallback){
   // M3 capstone: LowID source via server callback. MockServer 登录后读到客户端发来的
   // CALLBACKREQUEST(source.id=0x100), 即刻 spawn 一个 MockPeer 主动连 InboundListener
