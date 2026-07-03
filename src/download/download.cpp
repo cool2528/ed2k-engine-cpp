@@ -123,14 +123,24 @@ peer_worker(boost::asio::any_io_executor ex,
   bool aich_active = false;
   // part_index 在线协议为 u16 (FILESTATUS part 计数即 u16, ≤65535 part≈580TiB) —— 自然有界,
   // 旧 flat 块索引的 num_blocks<=65535 守卫已删 (G10)。M4 per-part 块不跨 part, 叶序与两级树一致。
-  if(aich.has_value()){
-    checker.emplace(*aich, size);
-    aich_active = true;
-  }
 
   (void)co_await conn.request_filename(hash, timeout);   // 可选,忽略
   auto up = co_await conn.start_upload(hash, timeout);
   if(!up) co_return tl::unexpected(up.error());
+
+  // M4c: AICH master-hash 协商 + 降级。先向 peer 请求 AICH master hash
+  // (OP_AICHFILEHASHREQ→ANS), 与我方可信根 *aich 比对: 匹配才启用两级 verify_block;
+  // 不匹配或 peer 不支持 AICH(超时/无应答) 则降级为无 AICH 下载(part-hash MD4 仍为兜底)。
+  // 对照 aMule: 仅向 master 匹配的 source 请求 AICH proof。协商置于 start_upload 之后,
+  // 使 AICHFILEHASHREQ 落入 peer 主分派循环(其握手序列逐帧读取,不会误吞此帧)。
+  if(aich.has_value()){
+    auto mh = co_await conn.request_aich_master_hash(hash, timeout);
+    if(mh && *mh == *aich){
+      checker.emplace(*aich, size);
+      aich_active = true;
+    }
+    // else: degrade —— aich_active 保持 false
+  }
 
   // per-part 块分解(M4): next_block 返回 (part_index, block_in_part, start, end), 块绝不跨 part。
   // start = part_index*PART_SIZE + block_in_part*AICH_BLOCK_SIZE, end 按 part 边界截断。

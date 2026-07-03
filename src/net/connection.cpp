@@ -27,6 +27,8 @@ Connection::connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeo
     if(ec == asio::error::operation_aborted) co_return tl::unexpected(make_error_code(errc::timed_out));
     co_return tl::unexpected(make_error_code(errc::connect_failed));
   }
+  // TCP_NODELAY: 禁用 Nagle —— 请求-应答短帧 (AICH proof 等) 不被小帧合并延迟 (client 侧)。
+  { boost::system::error_code ndc; socket_.set_option(tcp::no_delay(true), ndc); }
   co_return tl::expected<void,std::error_code>{};
 }
 

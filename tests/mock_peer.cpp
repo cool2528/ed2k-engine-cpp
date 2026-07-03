@@ -15,6 +15,7 @@ void MockPeer::serve(std::function<asio::awaitable<void>(tcp::socket)> handler){
     [this, handler = std::move(handler)]() -> asio::awaitable<void> {
       auto [ec, sock] = co_await acceptor_.async_accept(asio::as_tuple(asio::use_awaitable));
       if(ec) co_return;
+      { boost::system::error_code ndc; sock.set_option(tcp::no_delay(true), ndc); }   // 禁 Nagle: 测试请求-应答短帧不延迟
       try { co_await handler(std::move(sock)); } catch(...) {}
       co_return;
     }, asio::detached);

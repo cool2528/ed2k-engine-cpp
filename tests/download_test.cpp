@@ -81,44 +81,73 @@ static MockFile make_mock_file(std::uint8_t f0, std::uint8_t f1){
   m = {}; m.update(mf.h0.bytes()); m.update(mf.h1.bytes()); mf.fhash = FileHash::from_bytes(m.finish());
   return mf;
 }
-// FLAT whole-file AICH leaf computation: 184320-B blocks from offset 0, matching
-// aich_hash_bytes and AICHChecker::verify_block exactly. Leaves MAY span part
-// boundaries (PART_SIZE=9728000 is not a multiple of AICH_BLOCK_SIZE=184320:
-// 9728000/184320=52.777), so the flat single-layer Merkle tree differs from any
-// per-part decomposition. The download path (PartFile/BlockAllocator/peer_worker)
-// now uses the same flat blocks, so aich_hash_bytes(file) is the verifiable root.
-static std::vector<std::array<std::byte,20>> compute_flat_leaves(const std::vector<std::byte>& full){
-  std::vector<std::array<std::byte,20>> leaves;
-  std::size_t off=0, n=full.size();
-  while(off < n){
-    std::size_t take = std::min(static_cast<std::size_t>(AICH_BLOCK_SIZE), n-off);
-    leaves.push_back(crypto::sha1(std::span<const std::byte>(full).subspan(off, take)));
-    off += take;
-  }
-  return leaves;
+// === V2 两级 AICH 恢复数据生成 (对照 aMule SHAHashSet::CreatePartRecoveryData) ===
+// 标识符: 根=1(不出现在 proof); 左子=(ident<<1)|1, 右子=ident<<1。左偏 split
+//   nLeft=((is_left?nBlocks+1:nBlocks)/2)*base; 子 base=(nSide<=PART)?AICH_BLOCK_SIZE:PART。
+// recovery_for(full, part) = (nLevel-1) 兄弟 part-root + 该 part 全部 L 叶, 各带标识符。
+namespace {
+using Digest = std::array<std::byte, 20>;
+struct Split { std::uint64_t n_left, n_right, base_left, base_right; };
+Split split_children(std::uint64_t n, std::uint64_t base, bool is_left) {
+  std::uint64_t nBlocks = n / base + ((n % base) != 0 ? 1 : 0);
+  std::uint64_t nLeft  = ((is_left ? nBlocks + 1 : nBlocks) / 2) * base;
+  std::uint64_t nRight = n - nLeft;
+  std::uint64_t bl = (nLeft  <= PART) ? static_cast<std::uint64_t>(AICH_BLOCK_SIZE) : PART;
+  std::uint64_t br = (nRight <= PART) ? static_cast<std::uint64_t>(AICH_BLOCK_SIZE) : PART;
+  return {nLeft, nRight, bl, br};
 }
-// lone-child Merkle proof path for flat leaf `idx` in a tree of `leaves`.
-// Sibling omitted on lone layers (sibling >= level.size), matching verify_block.
-static std::vector<std::array<std::byte,20>> compute_flat_proof(std::size_t idx, std::vector<std::array<std::byte,20>> leaves){
-  std::vector<std::array<std::byte,20>> path;
-  std::size_t i = idx;
-  while(leaves.size() > 1){
-    std::size_t sib = i ^ 1;
-    if(sib < leaves.size()) path.push_back(leaves[sib]);
-    std::vector<std::array<std::byte,20>> nxt;
-    for(std::size_t k = 0; k < leaves.size(); k += 2){
-      if(k+1 < leaves.size()){
-        std::array<std::byte,40> b;
-        for(int t=0;t<20;++t){ b[t]=leaves[k][t]; b[20+t]=leaves[k+1][t]; }
-        nxt.push_back(crypto::sha1(b));
-      } else {
-        nxt.push_back(leaves[k]);
-      }
-    }
-    leaves.swap(nxt); i /= 2;
-  }
-  return path;
+Digest sha1_cat(const Digest& l, const Digest& r) {
+  crypto::SHA1 h; h.update(l); h.update(r); return h.finish();
 }
+// 子树根 (aich_hasher build_subtree 的独立复刻; 亦用于兄弟 part-root hash)。
+Digest subtree_root(std::span<const std::byte> d, std::uint64_t n, std::uint64_t base, bool is_left) {
+  if (n <= base) return crypto::sha1(d.first(static_cast<std::size_t>(n)));
+  auto s = split_children(n, base, is_left);
+  return sha1_cat(subtree_root(d.first(static_cast<std::size_t>(s.n_left)),  s.n_left,  s.base_left,  true),
+                  subtree_root(d.subspan(static_cast<std::size_t>(s.n_left)), s.n_right, s.base_right, false));
+}
+// WriteLowestLevelHashs 对偶: 收集子树所有叶 (ident, SHA1(叶数据)), 左→右序。
+void collect_leaves(std::span<const std::byte> d, std::uint64_t n, std::uint64_t base, bool is_left,
+                    std::uint32_t ident, std::vector<AICHProofHash>& out) {
+  if (n <= base) {
+    AICHProofHash p; p.identifier = ident; p.hash = crypto::sha1(d.first(static_cast<std::size_t>(n)));
+    out.push_back(p); return;
+  }
+  auto s = split_children(n, base, is_left);
+  collect_leaves(d.first(static_cast<std::size_t>(s.n_left)),  s.n_left,  s.base_left,  true,  (ident << 1) | 1, out);
+  collect_leaves(d.subspan(static_cast<std::size_t>(s.n_left)), s.n_right, s.base_right, false, ident << 1,       out);
+}
+// CreatePartRecoveryData 对偶: part_off/part_size = part 在当前节点数据内的 [偏移, 大小)。
+void collect_recovery(std::span<const std::byte> d, std::uint64_t n, std::uint64_t base, bool is_left,
+                      std::uint32_t ident, std::uint64_t part_off, std::uint64_t part_size,
+                      std::vector<AICHProofHash>& out) {
+  if (part_off == 0 && part_size == n) { collect_leaves(d, n, base, is_left, ident, out); return; }
+  auto s = split_children(n, base, is_left);
+  std::uint32_t left_ident = (ident << 1) | 1, right_ident = ident << 1;
+  if (part_off < s.n_left) {
+    AICHProofHash p; p.identifier = right_ident;
+    p.hash = subtree_root(d.subspan(static_cast<std::size_t>(s.n_left)), s.n_right, s.base_right, false);
+    out.push_back(p);
+    collect_recovery(d.first(static_cast<std::size_t>(s.n_left)), s.n_left, s.base_left, true,
+                     left_ident, part_off, part_size, out);
+  } else {
+    AICHProofHash p; p.identifier = left_ident;
+    p.hash = subtree_root(d.first(static_cast<std::size_t>(s.n_left)), s.n_left, s.base_left, true);
+    out.push_back(p);
+    collect_recovery(d.subspan(static_cast<std::size_t>(s.n_left)), s.n_right, s.base_right, false,
+                     right_ident, part_off - s.n_left, part_size, out);
+  }
+}
+std::vector<AICHProofHash> recovery_for(const std::vector<std::byte>& full, std::size_t part_index) {
+  std::uint64_t n = full.size();
+  std::uint64_t root_base = (n <= PART) ? static_cast<std::uint64_t>(AICH_BLOCK_SIZE) : PART;
+  std::uint64_t pstart = static_cast<std::uint64_t>(part_index) * PART;
+  std::uint64_t psize = std::min(PART, n - pstart);
+  std::vector<AICHProofHash> out;
+  collect_recovery(std::span<const std::byte>(full), n, root_base, true, 1, pstart, psize, out);
+  return out;
+}
+}  // namespace
 // peer 响应 Download 的请求序列:HELLO→FILESTATUS→HASHSET→FILENAME→ACCEPT→
 // 循环处理 REQUESTPARTS:解析请求范围,回送对应字节切片 + OUTOFPARTREQS 终止多响应循环。
 // 请求范围 [s0,e0) 是 flat 整文件块, 可能跨越 part 边界: 从 full=d0||d1 切片即可。
@@ -209,10 +238,10 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<st
   }
   co_await keep_alive(s); co_return;
 }
-// AICH-aware mock peer: like serve_full_peer but also answers AICHREQUEST with a
-// correct FLAT lone-child Merkle proof path over the whole file. Proof is always
-// computed from the CLEAN full file; data corruption (corrupt_block_n) only affects
-// SENDINGPART, so verify_block fails on tampered data while the proof stays valid.
+// AICH-aware mock peer (两级 V2): 回 OP_AICHFILEHASHANS(真实两级 master) + 对任意 part 回
+// OP_AICHANSWER(V2 恢复数据 = 兄弟 part-root + 该 part 全部叶, 带标识符)。数据损坏
+// (corrupt_block_n) 只影响 SENDINGPART —— proof 恒取自 clean full, 故 verify_block 对
+// 篡改数据失败而对干净数据通过。
 static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, bool corrupt_block_n = false, std::size_t corrupt_idx = 0){
   using namespace ed2k::peer;
   (void)co_await read_frame(s);   // HELLO
@@ -229,24 +258,41 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
     co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
   (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
 
-  // Build full file + FLAT AICH leaves (whole-file 184320-B blocks, matching
-  // aich_hash_bytes and AICHChecker::verify_block; leaves may span part boundaries).
+  // 两级 AICH root 取自 clean full (aich_hash_bytes); 损坏只作用于 SENDINGPART。
   std::vector<std::byte> full;
   full.insert(full.end(), mf.d0.begin(), mf.d0.end());
   full.insert(full.end(), mf.d1.begin(), mf.d1.end());
-  auto leaves = compute_flat_leaves(full);
+  AICHHash master = aich_hash_bytes(full);
+  // 预计算每 part 的 V2 恢复数据 (recovery_for 重算 53 叶 SHA1, 逐块重算会拖慢测试 ~50×);
+  // peer 按 part_index 回送缓存, 与生产端 "part 级 proof" 语义一致 (一 part 一份恢复数据)。
+  std::array<std::vector<AICHProofHash>, 2> rec_cache;
+  rec_cache[0] = recovery_for(full, 0);
+  rec_cache[1] = recovery_for(full, 1);
 
   for(;;){
     auto body = co_await read_frame(s);
     if(body.empty()){ co_await keep_alive(s); co_return; }
     std::uint8_t opcode = std::to_integer<std::uint8_t>(body[0]);
     std::span<const std::byte> pl(body.data()+1, body.size()-1);
+    if(opcode == op::AICHFILEHASHREQ){
+      // OP_AICHFILEHASHANS = file_hash(16) + master_hash(20)
+      codec::ByteWriter w; w.hash16(mf.fhash); w.hash20(master.bytes());
+      co_await send_pkt(s, op::AICHFILEHASHANS, w.take());
+      continue;
+    }
     if(opcode == op::AICHREQUEST){
-      codec::ByteReader r(pl); (void)r.hash16();   // file hash (already validated by caller)
-      std::uint16_t idx = r.u16();                  // flat global AICH block index
-      auto path = compute_flat_proof(idx, leaves);
-      codec::ByteWriter w; w.hash16(mf.fhash); w.u16(static_cast<std::uint16_t>(path.size()));
-      for(auto& h : path){ w.blob(std::span<const std::byte>(h)); }
+      // 请求帧 = file_hash(16) + part_index(u16) + master_hash(20); 回显请求方 master_hash
+      // (客户端 request_aich_proof 校验 echoed==requested)。V2 data = count16 + [ident16+hash]
+      // + count32(=0, 非大文件路径)。
+      codec::ByteReader r(pl); (void)r.hash16();
+      std::uint16_t part_index = r.u16();
+      auto echoed_master = r.hash20();
+      if(part_index >= rec_cache.size()){ co_await keep_alive(s); co_return; }
+      const auto& rec = rec_cache[part_index];
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u16(part_index); w.hash20(echoed_master);
+      w.u16(static_cast<std::uint16_t>(rec.size()));
+      for(const auto& p : rec){ w.u16(static_cast<std::uint16_t>(p.identifier)); w.hash20(p.hash); }
+      w.u16(0);   // count32
       co_await send_pkt(s, op::AICHANSWER, w.take());
       continue;
     }
@@ -259,7 +305,8 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
       std::size_t len = e0 - s0;
       std::vector<std::byte> d(full.begin()+off, full.begin()+off+len);
       if(corrupt_block_n){
-        // corrupt_idx is the flat global block index (s0/AICH_BLOCK_SIZE == global).
+        // corrupt_idx 为 part 内块号; part0 起始偏移 0 → s0/AICH_BLOCK_SIZE == part0 块号。
+        // part1 块号 = (s0-PART)/AICH_BLOCK_SIZE, 不会等于 part0 的 corrupt_idx。
         std::size_t blkidx = s0 / AICH_BLOCK_SIZE;
         if(blkidx == corrupt_idx) std::fill(d.begin(), d.end(), std::byte(0xFF));
       }
@@ -343,11 +390,11 @@ TEST(Download, BlockLevelSingleSource){
   std::filesystem::remove_all(dir);
 }
 
-// 以下 3 个 flat-model AICH 下载用例在 M1（aich_hash_bytes 回两级）后失效：flat 块模型的叶
-// 跨 part 边界（184320-B 从 offset 0 切），与两级 per-part 叶（每 part 重置）不一致 → flat 证明
-// 无法重建两级 root。须待 M4（P4c-2-6）per-part BlockAllocator 落地后改写为两级用例恢复。
-TEST(Download, DISABLED_AICHCorruptionRecovers){
-  // Block-level AICH recovery: peer A always serves a corrupted flat block 5;
+// M4c 两级 per-part AICH 损坏恢复。client 可信根 = aich_hash_bytes(full); peer A 回匹配
+// master(取自 clean full)但 SENDINGPART 对 part0 块5 供 0xFF → verify_block 叶校验失败 →
+// 同源重试耗尽 → block_corrupt; peer B(clean) 续传完成。C2 先验证后写入: 块5 坏数据从未落盘。
+TEST(Download, AICHCorruptionRecovers){
+  // Block-level AICH recovery: peer A always serves a corrupted part0 block 5;
   // peer_worker exhausts same-peer retries -> block_corrupt. Then peer B (clean)
   // resumes from the on-disk PartFile and completes the file.
   //
@@ -361,12 +408,12 @@ TEST(Download, DISABLED_AICHCorruptionRecovers){
   auto path = dir/"out";
   std::filesystem::remove(path);   // 从干净盘开始(隔离上次运行残留)
   auto mf = make_mock_file(0x11, 0x22);
-  // C1: root 来自生产 hasher aich_hash_bytes(整文件), 与 AICHChecker::verify_block 的
-  // flat 单层 Merkle 完全一致 —— 不再用任何 part-respecting 合成根。
+  // C1: root 来自生产 hasher aich_hash_bytes(整文件) —— 两级 Merkle 根, 与
+  // AICHChecker::verify_block 的 rebuild==root 完全一致。
   std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
   AICHHash root = aich_hash_bytes(full);
 
-  // 被损坏的 flat 块索引 5: 字节区 [5*AICH_BLOCK_SIZE, 6*AICH_BLOCK_SIZE)。
+  // 被损坏的 part0 块5: 字节区 [5*AICH_BLOCK_SIZE, 6*AICH_BLOCK_SIZE)。
   constexpr std::size_t corrupt_blk = 5;
   const std::size_t corrupt_off = corrupt_blk * AICH_BLOCK_SIZE;
 
@@ -377,41 +424,40 @@ TEST(Download, DISABLED_AICHCorruptionRecovers){
   peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, false); co_return; });
 
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    // Phase 1: peer A 单源 —— 块 5 持续供坏数据 -> 同源重试耗尽 -> block_corrupt。
+    // Phase 1: peer A 单源 —— 块5 持续供坏数据 -> 同源重试耗尽 -> block_corrupt。
     download::MultiSourceDownload dlA(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
       std::vector{SourceEndpoint{0x7F000001u, peerA.port()}});
-    auto rA = co_await dlA.run(10s, 3);
+    auto rA = co_await dlA.run(15s, 3);
     EXPECT_FALSE(rA.has_value());
     if(rA.has_value()) co_return;
     EXPECT_EQ(rA.error(), make_error_code(errc::block_corrupt));
 
-    // C2 (between peers): peer A 的坏块 5 (uniform 0xFF) 必须从未落盘 —— 先验证后写入生效。
-    // 块 5 未写 -> 区间为洞(零); 若 C2 失效(先写后校验) -> 区间为全 0xFF, std::equal 命中 ->
-    // EXPECT_FALSE 失败 -> 暴露 C2 回归。
+    // C2 (between peers): peer A 的坏块5 (uniform 0xFF) 必须从未落盘 —— 先验证后写入生效。
+    // PartFile 不预分配(按 write_block 增长): 块5 未写 → 该区在 EOF(短读) → 绝非 0xFF;
+    // 若 C2 失效(先写后校验) → 块5 = 全 0xFF (满读命中) -> is_corrupt=true -> 暴露 C2 回归。
     {
       std::ifstream f(path, std::ios::binary);
       EXPECT_TRUE(f.is_open());
       if(!f.is_open()) co_return;
-      std::vector<std::byte> buf(AICH_BLOCK_SIZE);
+      std::vector<std::byte> buf(AICH_BLOCK_SIZE, std::byte(0));
       f.seekg(static_cast<std::streamoff>(corrupt_off));
       f.read(reinterpret_cast<char*>(buf.data()), AICH_BLOCK_SIZE);
-      EXPECT_EQ(static_cast<std::size_t>(f.gcount()), AICH_BLOCK_SIZE);
-      if(static_cast<std::size_t>(f.gcount()) != AICH_BLOCK_SIZE) co_return;
+      auto got = static_cast<std::size_t>(f.gcount());
       std::vector<std::byte> corrupt_fill(AICH_BLOCK_SIZE, std::byte(0xFF));
-      EXPECT_FALSE(std::equal(buf.begin(), buf.end(), corrupt_fill.begin()))
-        << "peer A persisted corrupt 0xFF block to disk before AICH verify (C2 broken)";
+      bool is_corrupt = (got == AICH_BLOCK_SIZE) && std::equal(buf.begin(), buf.end(), corrupt_fill.begin());
+      EXPECT_FALSE(is_corrupt) << "peer A persisted corrupt 0xFF block 5 before AICH verify (C2 broken)";
     }
 
-    // Phase 2: peer B (clean) —— 从盘上 PartFile 恢复, 补齐块 5 及其余, 完成文件。
+    // Phase 2: peer B (clean) —— 从盘上 PartFile 恢复, 补齐块5 及其余, 完成文件。
     download::MultiSourceDownload dlB(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
       std::vector{SourceEndpoint{0x7F000001u, peerB.port()}});
-    auto rB = co_await dlB.run(10s, 3);
+    auto rB = co_await dlB.run(15s, 3);
     EXPECT_TRUE(rB.has_value()); if(!rB) co_return;
 
     download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
     EXPECT_TRUE(pf.complete());
 
-    // C2 (after completion): 块 5 区间最终等于正确文件数据 -> 坏数据从未存活。
+    // C2 (after completion): 块5 区间最终等于正确文件数据 -> 坏数据从未存活。
     {
       std::ifstream f(path, std::ios::binary);
       EXPECT_TRUE(f.is_open());
@@ -430,8 +476,9 @@ TEST(Download, DISABLED_AICHCorruptionRecovers){
   std::filesystem::remove_all(dir);
 }
 
-// DISABLED 待 M4（P4c-2-6）per-part 两级改写：flat 块模型与两级 AICH 叶不一致（见上注）。
-TEST(Download, DISABLED_BlockLevelAICHSingleSource){
+// M4c 两级 per-part AICH 单源下载: client 可信根 = aich_hash_bytes(full), peer 回匹配
+// master + 正确 V2 恢复数据 → master 协商通过 → AICH 启用 → 逐块 verify 通过 → 完成。
+TEST(Download, BlockLevelAICHSingleSource){
   // AICH-enabled block-level download, single clean source -> file completes and verifies.
   auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_aich_ok"; std::filesystem::create_directories(dir);
   auto path = dir/"out";
@@ -443,7 +490,7 @@ TEST(Download, DISABLED_BlockLevelAICHSingleSource){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
       std::vector{SourceEndpoint{0x7F000001u, peer.port()}});
-    auto r = co_await dl.run(10s, 3);
+    auto r = co_await dl.run(15s, 3);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
     EXPECT_TRUE(pf.complete());
@@ -452,11 +499,11 @@ TEST(Download, DISABLED_BlockLevelAICHSingleSource){
   std::filesystem::remove_all(dir);
 }
 
-// DISABLED 待 M4（P4c-2-6）per-part 两级改写：M1 后 good/bad root 均因 flat≠两级而失败，
-// 用例退化为空洞通过（无法区分 good/bad root）。per-part 两级校验落地后恢复语义。
-TEST(Download, DISABLED_AICHWrongRootFails){
-  // C1 mutation: 正确 root = aich_hash_bytes(full) 时下载通过; 翻转 root 后 verify_block
-  // 拒绝每个块 -> 同源重试耗尽 -> block_corrupt -> 失败。证明 verify_block 是真校验而非桩。
+// M4c master-hash 协商降级: client 可信根为错误 root(bad_root), peer 回正确 master(good_root)
+// → 不匹配 → 降级为无 AICH 下载 → peer 供正确数据 → 完成。成功即证明降级生效: 若未降级
+// (AICH 仍以 bad_root 启用), verify_block 对每块 rebuild!=bad_root 失败 → block_corrupt → 失败。
+// (verify_block 真校验本身由 AICHCorruptionRecovers 覆盖: 匹配 master + 坏数据 → 失败。)
+TEST(Download, AICHMasterMismatchDegrades){
   auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_aich_badroot"; std::filesystem::create_directories(dir);
   auto path = dir/"out";
   auto mf = make_mock_file(0x11, 0x22);
@@ -469,9 +516,11 @@ TEST(Download, DISABLED_AICHWrongRootFails){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(bad_root),
       std::vector{SourceEndpoint{0x7F000001u, peer.port()}});
-    auto r = co_await dl.run(10s, 3);
-    EXPECT_FALSE(r.has_value());
-    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::block_corrupt));
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value());   // master 不匹配 → 降级 → 无 AICH 下载 → 成功
+    if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
     co_return;
   });
   std::filesystem::remove_all(dir);
