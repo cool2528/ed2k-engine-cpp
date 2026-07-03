@@ -10,10 +10,13 @@ find_package(tl-expected CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(boost_asio CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+include(GNUInstallDirs)
 
 add_library(ed2k_core)
 target_include_directories(ed2k_core
-  PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ed2k_core PUBLIC spdlog::spdlog tl::expected Boost::asio Threads::Threads)
 target_link_libraries(ed2k_core PRIVATE ZLIB::ZLIB)
@@ -55,6 +58,22 @@ target_sources(ed2k_core PRIVATE src/app/server_session.cpp)
 
 add_executable(ed2k-tool apps/cli/main.cpp)
 target_link_libraries(ed2k-tool PRIVATE ed2k_core)
+
+# --- 安装/打包 (R0-5) ---
+# 交付形态: 可嵌入静态库 ed2k_core + CLI ed2k-tool + 公共头 include/ed2k/
+install(TARGETS ed2k_core ed2k-tool
+  EXPORT ed2kTargets
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ed2k
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  FILES_MATCHING PATTERN "*.hpp")
+install(EXPORT ed2kTargets
+  FILE ed2kTargets.cmake
+  NAMESPACE ed2k::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ed2k)
 
 if(ED2K_BUILD_TESTS)
   enable_testing()
