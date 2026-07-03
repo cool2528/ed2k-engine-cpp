@@ -18,6 +18,8 @@
 #include <boost/asio/buffer.hpp>
 #include "ed2k/download/download.hpp"
 #include "ed2k/download/part_file.hpp"
+#include "ed2k/download/block_allocator.hpp"
+#include "ed2k/metfile/known_part_met.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/framing.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
@@ -747,8 +749,92 @@ TEST(Download, LowIdSourceViaCallback){
   std::filesystem::remove(tmp);
 }
 
-TEST(Download, RequestPartsI64RoundTrip){
-  // test I64 encoding works
-  // Already covered by c2c_messages_test
-  GTEST_SKIP() << "I64 encoding covered by C2CMessages tests";
+// P4c-3 M4: >4GiB 边界集成测试。file_size = 4GiB + 2*PART → part 442 整个位于 4GiB 之外
+// (442*PART = 4301952000 > 4294967296)。验证 u64 偏移在 BlockAllocator→encode_request_parts_i64
+// →PartFile.seekp/write/readback/MD4 全路径不发生 u32 窄化 (D3 根因, P4c-3 spec §3.1)。
+// 仅下载 part 442 (满 part 53 块, ~9.7MB); PartFile 稀疏创建 (空文件 rehash_all 快速失败),
+// 不实际写 4.3GiB 数据。替代原 RequestPartsI64RoundTrip skip (i64 round-trip 在此真实执行)。
+TEST(Download, Beyond4GiBBoundaryRoundTrip){
+  constexpr std::uint64_t GIB = std::uint64_t(4)*1024*1024*1024;          // 4 GiB = 4294967296
+  std::uint64_t size = GIB + 2*PART;                                       // ~4.31 GiB → 444 parts
+  std::size_t boundary_part = static_cast<std::size_t>(GIB / PART) + 1;    // 442, 起点 > 4GiB
+  ASSERT_GT(static_cast<std::uint64_t>(boundary_part) * PART, GIB);        // 该 part 起点已超 4GiB
+  std::size_t nparts = static_cast<std::size_t>((size + PART - 1) / PART); // 444
+
+  // part 442 真实内容 (满 PART 字节) → MD4 即其 part hash; 其余 part hash 占位 (本测试不下载)。
+  std::vector<std::byte> content(PART, std::byte{0x5A});
+  crypto::MD4 m; m.update(content); PartHash boundary_hash = PartHash::from_bytes(m.finish());
+  std::vector<PartHash> part_hashes(nparts, boundary_hash);
+  // file_hash = MD4(所有 part hash 串联) — eD2k 规范; 仅 PartFile 构造需要, 不参与本测试校验。
+  m = {}; for(auto& h : part_hashes) m.update(h.bytes());
+  FileHash fhash = FileHash::from_bytes(m.finish());
+
+  auto tmp = std::filesystem::temp_directory_path() / "ed2k_beyond4gib";
+  auto met_path = std::filesystem::path(tmp.string() + ".part.met");
+  std::filesystem::remove(tmp);
+  std::filesystem::remove(met_path);
+  // 预写 .part.met: 全文件为 gap → try_load_met 成功跳过 rehash_all (否则 444 part × 9.7MB
+  // 分配开销 ~18s); 各 part 仍标未完成 (整文件 gap 覆盖每个 part) → 不影响下载/校验路径。
+  {
+    ed2k::PartFileState st; st.hash = fhash; st.part_hashes = part_hashes;
+    st.gaps = {{0, size}};
+    auto met_bytes = ed2k::write_part_met(st);
+    std::ofstream m(met_path, std::ios::binary | std::ios::trunc);
+    m.write(reinterpret_cast<const char*>(met_bytes.data()), static_cast<std::streamsize>(met_bytes.size()));
+  }
+
+  std::size_t blocks = 0;
+  std::uint64_t last_end = boundary_part * PART;
+  bool boundary_in_gaps = true;   // 默认假设未完成, 循环内由 gaps() 判定
+  {
+    PartFile pf(tmp, size, fhash, part_hashes);
+    ASSERT_TRUE(pf.open_for_write());
+    BlockAllocator alloc(size, part_hashes, std::nullopt, pf);
+    std::vector<bool> has_part(nparts, false);
+    has_part[boundary_part] = true;
+
+    while(auto b = alloc.next_block_for_parts(has_part)){
+      auto [part, bip, start, end] = *b;
+      EXPECT_EQ(part, boundary_part);
+      EXPECT_GT(start, GIB) << "块起始偏移必须 > 4GiB (u32 会溢出为低 32 位)";
+      EXPECT_LT(start, end);
+      EXPECT_LE(end, (boundary_part + 1) * PART);   // 块绝不跨 part 边界
+      EXPECT_GE(start, last_end);                   // 块序单调不减
+      last_end = end;
+
+      // 1) I64 编解码 round-trip (原 skip 的承诺): u64 偏移不窄化。
+      //    wire 布局 = file_hash(16) + 3×u64 starts(LE) + 3×u64 ends(LE)。
+      auto wire = encode_request_parts_i64(fhash, {start,0,0}, {end,0,0});
+      ASSERT_GE(wire.size(), 16u + 48u);
+      auto rd = [&](std::size_t off){
+        std::uint64_t v = 0;
+        for(int i=0;i<8;++i) v |= std::uint64_t(std::to_integer<std::uint8_t>(wire[off+i])) << (8*i);
+        return v;
+      };
+      EXPECT_EQ(rd(16), start);        // 第一个 start 原样 (>4GiB 高位非零)
+      EXPECT_EQ(rd(16 + 24), end);     // 第一个 end 原样
+
+      // 2) 切片 + 同步写盘 (seekp >4GiB, 稀疏); 内容正确 → part 满时 MD4 通过。
+      std::uint64_t off_in_part = start - boundary_part * PART;
+      std::vector<std::byte> slice(content.begin() + off_in_part,
+                                   content.begin() + off_in_part + (end - start));
+      auto wr = pf.write_block(start, end, slice);
+      EXPECT_TRUE(wr.has_value()) << (wr ? "" : wr.error().message());
+      blocks++;
+    }
+
+    // part 442 (>4GiB) 完成 → 不在 gaps() (write_block part 满时 MD4 通过即置 part_done_)。
+    auto g = pf.gaps();
+    boundary_in_gaps = false;
+    std::uint64_t bp_start = boundary_part * PART, bp_end = (boundary_part + 1) * PART;
+    for(auto& [gs, ge] : g) if(gs < bp_end && ge > bp_start) boundary_in_gaps = true;
+  }  // pf/alloc 析构 → f_ 关闭落盘 (Windows 下 remove 前必须关闭)
+
+  std::size_t expected_blocks = (PART + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;  // 满 part = 53
+  EXPECT_EQ(blocks, expected_blocks);
+  EXPECT_FALSE(boundary_in_gaps) << "part 442 (>4GiB) 必须已完成且 MD4 通过";
+  EXPECT_GT(std::filesystem::file_size(tmp), GIB) << "文件必须已扩展到 4GiB 之外 (稀疏)";
+
+  std::filesystem::remove(tmp);
+  std::filesystem::remove(met_path);
 }
