@@ -145,7 +145,7 @@ TEST(UdpConnection, ServerListRoundTrip){
   IoRuntime rt;
   ed2k::test::MockUdpServer srv(rt.context());
   srv.serve([](udp::socket& s, const Packet&, const udp::endpoint& from) -> asio::awaitable<void>{
-    codec::ByteWriter w; w.u8(1); w.u32(0x01020304u); w.u16(0x1234u);
+    codec::ByteWriter w; w.u8(1); w.u32_be(0x01020304u); w.u16(0x1234u);
     co_await ed2k::test::send_packet_to(s, from, udpop::SERVER_LIST_RES, w.take());
     co_return;
   });

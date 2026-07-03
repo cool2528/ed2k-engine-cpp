@@ -79,7 +79,7 @@ TEST(ServerMessages, DecodeServerMessage){
   EXPECT_EQ(*out, "hello");
 }
 TEST(ServerMessages, DecodeServerList){
-  auto out = decode_server_list(bytes({2, 4,3,2,1, 0x34,0x12, 8,7,6,5, 0x78,0x56}));
+  auto out = decode_server_list(bytes({2, 1,2,3,4, 0x34,0x12, 5,6,7,8, 0x78,0x56}));
   ASSERT_TRUE(out.has_value());
   ASSERT_EQ(out->size(), 2u);
   EXPECT_EQ((*out)[0].first.value, 0x01020304u);
@@ -87,7 +87,7 @@ TEST(ServerMessages, DecodeServerList){
   EXPECT_EQ((*out)[1].first.value, 0x05060708u);
 }
 TEST(ServerMessages, DecodeCallbackRequested){
-  auto out = decode_callback_requested(bytes({1,0,0,0x7F, 0x34,0x12}));
+  auto out = decode_callback_requested(bytes({0x7F,0,0,1, 0x34,0x12}));
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(out->ip.value, 0x7F000001u);
   EXPECT_EQ(out->port, 0x1234u);
@@ -143,7 +143,7 @@ TEST(ServerMessages, LoginRoundTrip){
 TEST(ServerMessages, DecodeServerIdent){
   std::vector<std::byte> d = hex("00112233445566778899aabbccddeeff");   // MD4Hash(16)
   auto app=[&](std::initializer_list<int> xs){ for(int x:xs) d.push_back(std::byte(x)); };
-  app({1,0,0,0x7F});                                                       // ip 0x7F000001 LE
+  app({0x7F,0,0,1});                                                       // ip 127.0.0.1 线序 (a.b.c.d)
   app({0x34,0x12});                                                        // port 0x1234 LE
   app({2,0,0,0});                                                          // tagcount = 2
   app({0x82,tag::ST_SERVERNAME,  0x04,0x00,'n','a','m','e'});             // string tag "name"

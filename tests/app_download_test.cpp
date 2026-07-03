@@ -131,10 +131,10 @@ TEST(AppDownload, EndToEndHighIdMockDownload){
       co_await send_pkt(s, server::op::IDCHANGE, w.take()); }
     (void)co_await read_frame(s);   // GETSOURCES
     // FOUNDSOURCES: file_hash(16) + u8 count(1) + src(id=127.0.0.1 HighID, port=peer.port)
-    // count is u8 (decode_found_sources reads u8); source id MUST be 127.0.0.1 (0x7F000001)
-    // so MultiSourceDownload connects to the local MockPeer (peer_worker does IPv4{source.id}).
+    // count is u8 (decode_found_sources reads u8); source id MUST be 127.0.0.1
+    // wire a-低位 = 0x0100007F; peer_worker does IPv4::from_wire(source.id) → 127.0.0.1.
     codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
-    w.u32(0x7F000001u); w.u16(peer.port());
+    w.u32(0x0100007Fu); w.u16(peer.port());
     co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
     co_await keep_alive(s);
     co_return;
@@ -195,7 +195,7 @@ TEST(AppDownload, HighIdOnlySucceedsWhenClientPortBound){
     (void)co_await read_frame(s);   // GETSOURCES
     // HighID-only source: 127.0.0.1 (0x7F000001, id >= 0x1000000) -> !low_id().
     codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
-    w.u32(0x7F000001u); w.u16(peer.port());
+    w.u32(0x0100007Fu); w.u16(peer.port());
     co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
     co_await keep_alive(s);
     co_return;
@@ -258,7 +258,7 @@ TEST(AppDownload, LowIdSourceSkipsGracefullyWhenClientPortBound){
     //   skipped path is exercised before the completing HighID source.
     codec::ByteWriter w; w.hash16(mf.fhash); w.u8(2);
     w.u32(0x00000100u); w.u16(0);              // LowID source (callback path, skipped)
-    w.u32(0x7F000001u); w.u16(peer.port());    // HighID source (completes the download)
+    w.u32(0x0100007Fu); w.u16(peer.port());    // HighID source (completes the download)
     co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
     co_await keep_alive(s);
     co_return;

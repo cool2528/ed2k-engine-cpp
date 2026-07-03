@@ -56,7 +56,7 @@ tl::expected<ServerIdent,std::error_code> decode_server_ident(std::span<const st
   ByteReader r(data);
   ServerIdent si;
   si.hash = r.hash16();
-  si.ip = IPv4{r.u32()};
+  si.ip = IPv4{r.u32_be()};
   si.port = r.u16();
   std::uint32_t tc = r.u32();
   auto tags = codec::read_taglist(r, tc);
@@ -76,7 +76,7 @@ decode_server_list(std::span<const std::byte> data){
   std::uint8_t count = r.u8();
   std::vector<std::pair<IPv4,std::uint16_t>> out; out.reserve(count);
   for(std::uint8_t i=0;i<count && r.ok();++i){
-    IPv4 ip{r.u32()};
+    IPv4 ip{r.u32_be()};
     std::uint16_t port = r.u16();
     out.emplace_back(ip, port);
   }
@@ -86,7 +86,7 @@ decode_server_list(std::span<const std::byte> data){
 tl::expected<CallbackRequested,std::error_code> decode_callback_requested(std::span<const std::byte> data){
   ByteReader r(data);
   CallbackRequested cr;
-  cr.ip = IPv4{r.u32()};
+  cr.ip = IPv4{r.u32_be()};
   cr.port = r.u16();
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return cr;

@@ -20,6 +20,8 @@ class ByteReader {
     |(std::uint16_t(std::to_integer<std::uint8_t>(buf_[pos_+1]))<<8); pos_+=2; return v; }
   std::uint32_t u32(){ if(!need(4))return 0; std::uint32_t v=0; for(int i=0;i<4;++i)
     v|=std::uint32_t(std::to_integer<std::uint8_t>(buf_[pos_+i]))<<(8*i); pos_+=4; return v; }
+  std::uint32_t u32_be(){ if(!need(4))return 0; std::uint32_t v=0; for(int i=0;i<4;++i)
+    v=(v<<8)|std::to_integer<std::uint8_t>(buf_[pos_+i]); pos_+=4; return v; }   // 网络序 IP（a.b.c.d，a 在高位）
   std::uint64_t u64(){ if(!need(8))return 0; std::uint64_t v=0; for(int i=0;i<8;++i)
     v|=std::uint64_t(std::to_integer<std::uint8_t>(buf_[pos_+i]))<<(8*i); pos_+=8; return v; }
   std::string string16(){ std::uint16_t n=u16(); if(!need(n))return {};
@@ -37,6 +39,7 @@ class ByteWriter {
   void u8(std::uint8_t v){ out_.push_back(std::byte(v)); }
   void u16(std::uint16_t v){ for(int i=0;i<2;++i) out_.push_back(std::byte((v>>(8*i))&0xff)); }
   void u32(std::uint32_t v){ for(int i=0;i<4;++i) out_.push_back(std::byte((v>>(8*i))&0xff)); }
+  void u32_be(std::uint32_t v){ for(int i=3;i>=0;--i) out_.push_back(std::byte((v>>(8*i))&0xff)); } // 网络序 IP（a.b.c.d）
   void u64(std::uint64_t v){ for(int i=0;i<8;++i) out_.push_back(std::byte((v>>(8*i))&0xff)); }
   void string16(std::string_view s){ u16(std::uint16_t(s.size()));
     for(char c:s) out_.push_back(std::byte((unsigned char)c)); }

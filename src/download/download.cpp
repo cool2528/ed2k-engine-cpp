@@ -20,7 +20,7 @@ Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path&
 
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 Download::run(std::chrono::milliseconds timeout){
-  IPv4 ip{source_.id};
+  IPv4 ip = IPv4::from_wire(source_.id);
   auto cr = co_await conn_.connect(ip, source_.port, timeout);
   if(!cr) co_return tl::unexpected(cr.error());
   ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
@@ -106,7 +106,7 @@ fetch_hashset(boost::asio::any_io_executor ex,
     accepted = true;
   } else {
     ed2k::peer::C2CConnection c(ex);
-    auto cr = co_await c.connect(IPv4{source.id}, source.port, timeout);
+    auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
     if(!cr) co_return tl::unexpected(cr.error());
     conn_opt.emplace(std::move(c));
     accepted = false;
@@ -186,7 +186,7 @@ peer_worker(boost::asio::any_io_executor ex,
       accepted = true;
     } else {
       ed2k::peer::C2CConnection c(ex);
-      auto cr = co_await c.connect(IPv4{source.id}, source.port, timeout);
+      auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
       if(!cr){ finish(cr.error()); co_return; }
       conn_opt.emplace(std::move(c));
       accepted = false;

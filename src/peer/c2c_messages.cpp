@@ -50,7 +50,7 @@ tl::expected<HelloInfo,std::error_code> decode_hello_answer(std::span<const std:
     if(t.name_id == tag::CT_NAME && std::holds_alternative<std::string>(t.value)) h.nickname = std::get<std::string>(t.value);
     else if(t.name_id == tag::CT_VERSION && std::holds_alternative<std::uint64_t>(t.value)) h.version = static_cast<std::uint32_t>(std::get<std::uint64_t>(t.value));
   }
-  if(r.remaining() >= 6){ h.server_ip = IPv4{r.u32()}; h.server_port = r.u16(); }
+  if(r.remaining() >= 6){ h.server_ip = IPv4{r.u32_be()}; h.server_port = r.u16(); }
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return h;
 }

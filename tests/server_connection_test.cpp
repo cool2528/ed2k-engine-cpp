@@ -50,7 +50,7 @@ static asio::awaitable<void> keep_alive(tcp::socket& s){
 static std::vector<std::byte> msg_payload(std::string_view s){ codec::ByteWriter w; w.string16(s); return w.take(); }
 static std::vector<std::byte> status_payload(std::uint32_t u, std::uint32_t f){ codec::ByteWriter w; w.u32(u); w.u32(f); return w.take(); }
 static std::vector<std::byte> idchange_payload(std::uint32_t id, std::uint32_t flags){ codec::ByteWriter w; w.u32(id); w.u32(flags); return w.take(); }
-static std::vector<std::byte> cb_payload(std::uint32_t ip, std::uint16_t port){ codec::ByteWriter w; w.u32(ip); w.u16(port); return w.take(); }
+static std::vector<std::byte> cb_payload(std::uint32_t ip, std::uint16_t port){ codec::ByteWriter w; w.u32_be(ip); w.u16(port); return w.take(); }
 
 TEST(ServerConnection, LoginHighId){
   IoRuntime rt;

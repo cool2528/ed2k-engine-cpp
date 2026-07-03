@@ -71,7 +71,7 @@ TEST(ServerMet, UnsupportedTagTypeErrorsNoCrash){
   w.u32(0x0100007F);     // ip
   w.u16(4661);           // port
   w.u32(1);              // 1 tag
-  w.u8(0x84);            // type 0x04 (Float, unsupported) | NameFlag 0x80
+  w.u8(0x8A);            // type 0x0A (undefined, unsupported) | NameFlag 0x80
   w.u8(0x01);            // name_id
   w.u32(0);              // some payload bytes
   auto bytes=w.take();

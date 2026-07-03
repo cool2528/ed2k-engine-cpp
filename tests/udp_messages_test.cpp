@@ -22,7 +22,7 @@ TEST(UdpMessages, EncodeServerStatusReq){
 }
 TEST(UdpMessages, EncodeServerListReq){
   EXPECT_EQ(encode_server_list_req(IPv4{0x01020304u}, 0x1234u),
-            bytes({0x04,0x03,0x02,0x01, 0x34,0x12}));
+            bytes({0x01,0x02,0x03,0x04, 0x34,0x12}));
 }
 TEST(UdpMessages, EncodeServerDescReq){
   EXPECT_EQ(encode_server_desc_req(0xF0FF1234u), bytes({0x34,0x12,0xFF,0xF0}));
@@ -100,8 +100,8 @@ TEST(UdpMessages, DecodeServerStatChallengeMismatch){
 }
 TEST(UdpMessages, DecodeServerList){
   ByteWriter w; w.u8(2);
-  w.u32(0x01020304u); w.u16(0x1234u);
-  w.u32(0x05060708u); w.u16(0x5678u);
+  w.u32_be(0x01020304u); w.u16(0x1234u);
+  w.u32_be(0x05060708u); w.u16(0x5678u);
   auto out = decode_server_list(w.take());
   ASSERT_TRUE(out.has_value());
   ASSERT_EQ(out->size(), 2u);

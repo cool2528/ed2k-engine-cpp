@@ -331,7 +331,7 @@ TEST(Download, EndToEndSingleSource){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x7F000001u, peer.port()});
+    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x0100007Fu, peer.port()});
     auto r = co_await dl.run(5s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     // 校验文件
@@ -349,7 +349,7 @@ TEST(Download, ResumeSkipsCompletedParts){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x7F000001u, peer.port()});
+    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x0100007Fu, peer.port()});
     auto r = co_await dl.run(5s);
     EXPECT_TRUE(r.has_value());                          // part0 已校验跳过,只下 part1
     co_return;
@@ -367,7 +367,7 @@ TEST(Download, BlockCorruptFails){
     co_await serve_full_peer(std::move(s), bad); co_return;
   });
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x7F000001u, peer.port()});
+    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x0100007Fu, peer.port()});
     auto r = co_await dl.run(5s);
     EXPECT_FALSE(r.has_value());
     if(!r) EXPECT_EQ(r.error(), make_error_code(errc::block_corrupt));
@@ -385,7 +385,7 @@ TEST(Download, BlockLevelSingleSource){
   peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
-      std::vector{SourceEndpoint{0x7F000001u, peer.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peer.port()}});
     auto r = co_await dl.run(5s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
@@ -431,7 +431,7 @@ TEST(Download, AICHCorruptionRecovers){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     // Phase 1: peer A 单源 —— 块5 持续供坏数据 -> 同源重试耗尽 -> block_corrupt。
     download::MultiSourceDownload dlA(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
-      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}});
     auto rA = co_await dlA.run(15s, 3);
     EXPECT_FALSE(rA.has_value());
     if(rA.has_value()) co_return;
@@ -455,7 +455,7 @@ TEST(Download, AICHCorruptionRecovers){
 
     // Phase 2: peer B (clean) —— 从盘上 PartFile 恢复, 补齐块5 及其余, 完成文件。
     download::MultiSourceDownload dlB(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
-      std::vector{SourceEndpoint{0x7F000001u, peerB.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peerB.port()}});
     auto rB = co_await dlB.run(15s, 3);
     EXPECT_TRUE(rB.has_value()); if(!rB) co_return;
 
@@ -494,7 +494,7 @@ TEST(Download, BlockLevelAICHSingleSource){
   peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, false); co_return; });
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(root),
-      std::vector{SourceEndpoint{0x7F000001u, peer.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peer.port()}});
     auto r = co_await dl.run(15s, 3);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
@@ -520,7 +520,7 @@ TEST(Download, AICHMasterMismatchDegrades){
   peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_aich_peer(std::move(s), mf, false); co_return; });
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::optional<AICHHash>(bad_root),
-      std::vector{SourceEndpoint{0x7F000001u, peer.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peer.port()}});
     auto r = co_await dl.run(15s, 3);
     EXPECT_TRUE(r.has_value());   // master 不匹配 → 降级 → 无 AICH 下载 → 成功
     if(!r) co_return;
@@ -599,7 +599,7 @@ TEST(Download, MultiSourceBothFull){
   peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return; });
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
-      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}, SourceEndpoint{0x0100007Fu, peerB.port()}});
     auto r = co_await dl.run(15s, 3);
     EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
     if(!r) co_return;
@@ -627,7 +627,7 @@ TEST(Download, MultiSourceAggregates){
     co_await serve_subset_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}, {false, true}); co_return; });   // B: part1
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
-      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}, SourceEndpoint{0x0100007Fu, peerB.port()}});
     auto r = co_await dl.run(15s, 3);
     EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
     if(!r) co_return;
@@ -651,7 +651,7 @@ TEST(Download, MultiSourceSingleSubsetFails){
     co_await serve_subset_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}, {true, false}); co_return; });   // A: part0 only
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
-      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}});
     auto r = co_await dl.run(15s, 3);
     EXPECT_FALSE(r.has_value());   // 单源仅 part0 → part1 永远缺 → 源耗尽 → io_error
     co_return;
@@ -674,7 +674,7 @@ TEST(Download, MultiSourceAsyncDiskOffload){
   peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return; });
   run_coro(rt, [&]() -> asio::awaitable<void>{
     download::MultiSourceDownload dl(rt.executor(), path, mf.fhash, PART*2, std::nullopt,
-      std::vector{SourceEndpoint{0x7F000001u, peerA.port()}, SourceEndpoint{0x7F000001u, peerB.port()}});
+      std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}, SourceEndpoint{0x0100007Fu, peerB.port()}});
     dl.set_disk_executor(rt.disk_executor());   // M3: 启用 disk 卸载 (真实 disk 线程)
     auto r = co_await dl.run(15s, 3);
     EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());

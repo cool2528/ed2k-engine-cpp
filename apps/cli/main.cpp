@@ -124,7 +124,7 @@ int main(int argc,char** argv){
       auto gs = co_await lg->conn.get_sources(f->hash, f->size, std::chrono::milliseconds(15000));
       if(!gs){ std::printf("error: %s\n", gs.error().message().c_str()); rc=1; rt.stop(); co_return; }
       for(const auto& s : gs->sources)
-        std::printf("%s  id=0x%08X  port=%u  %s\n", IPv4{s.id}.to_dotted().c_str(), s.id, s.port, s.low_id()?"LowID":"HighID");
+        std::printf("%s  id=0x%08X  port=%u  %s\n", IPv4::from_wire(s.id).to_dotted().c_str(), s.id, s.port, s.low_id()?"LowID":"HighID");
       std::printf("(%zu sources)\n", gs->sources.size());
       rt.stop(); co_return;
     }, asio::detached);

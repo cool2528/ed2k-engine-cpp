@@ -10,7 +10,7 @@ tl::expected<ServerList,std::error_code> parse_server_met(std::span<const std::b
   if(count>1000000) return tl::unexpected(make_error_code(errc::count_too_large));
   ServerList list; list.servers.reserve(count);
   for(std::uint32_t i=0;i<count;++i){
-    ServerEntry e; e.ip=IPv4{r.u32()}; e.port=r.u16();
+    ServerEntry e; e.ip=IPv4{r.u32_be()}; e.port=r.u16();
     std::uint32_t tagc=r.u32();
     auto tags=read_taglist(r,tagc); if(!tags) return tl::unexpected(tags.error());
     for(auto& t:*tags){
@@ -27,7 +27,7 @@ tl::expected<ServerList,std::error_code> parse_server_met(std::span<const std::b
 std::vector<std::byte> write_server_met(const ServerList& list){
   ByteWriter w; w.u8(0xE0); w.u32(std::uint32_t(list.servers.size()));
   for(auto& e:list.servers){
-    w.u32(e.ip.value); w.u16(e.port);
+    w.u32_be(e.ip.value); w.u16(e.port);
     std::vector<codec::Tag> tags;
     if(!e.name.empty()){ codec::Tag t; t.name_id=stag::Name; t.value=e.name; tags.push_back(t); }
     if(!e.description.empty()){ codec::Tag t; t.name_id=stag::Description; t.value=e.description; tags.push_back(t); }

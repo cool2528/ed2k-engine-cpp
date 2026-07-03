@@ -23,13 +23,22 @@ tl::expected<Tag,std::error_code> read_tag(ByteReader& r){
   std::uint8_t type=r.u8(); Tag t;
   if(type & tagtype::NameFlag){ type&=~tagtype::NameFlag; t.name_id=r.u8(); }
   else { t.name_str=r.string16(); }
-  switch(type){
+  if(type >= tagtype::Str1 && type <= tagtype::Str16){
+    // eMule 短字符串优化：type 即长度(1..16)，无长度前缀
+    std::uint8_t n = static_cast<std::uint8_t>(type - tagtype::Str1 + 1);
+    auto b = r.blob(n);
+    t.value = std::string(reinterpret_cast<const char*>(b.data()), b.size());
+  } else switch(type){
     case tagtype::String: t.value=r.string16(); break;
     case tagtype::Hash16: t.value=r.hash16(); break;
     case tagtype::Uint32: t.value=std::uint64_t(r.u32()); break;
     case tagtype::Uint16: t.value=std::uint64_t(r.u16()); break;
     case tagtype::Uint8:  t.value=std::uint64_t(r.u8()); break;
+    case tagtype::Uint64: t.value=r.u64(); break;
+    case tagtype::Float32: t.value=std::uint64_t(r.u32()); break; // 4 字节，位模式消费
     case tagtype::Blob: { std::uint32_t n=r.u32(); auto b=r.blob(n);
+      t.value=std::vector<std::byte>(b.begin(),b.end()); } break;
+    case tagtype::BSOB: { std::uint8_t n=r.u8(); auto b=r.blob(n);
       t.value=std::vector<std::byte>(b.begin(),b.end()); } break;
     default: return tl::unexpected(make_error_code(errc::unsupported_version));
   }

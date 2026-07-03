@@ -9,7 +9,10 @@
 #include "ed2k/util/error.hpp"
 namespace ed2k::codec {
 namespace tagtype {
-constexpr std::uint8_t Hash16=0x01, String=0x02, Uint32=0x03, Blob=0x07, Uint16=0x08, Uint8=0x09;
+// 对照 aMule MetaDefs.h EMetaTagTypes（字节级锁定）
+constexpr std::uint8_t Hash16=0x01, String=0x02, Uint32=0x03, Float32=0x04, Blob=0x05, Uint16=0x06, Uint8=0x07, BSOB=0x08, Uint64=0x09;
+// eMule 短字符串优化：type 即长度(1..16)，无 2 字节长度前缀（对照 eMule Tags.cpp TAGTYPE_STR1..STR16）
+constexpr std::uint8_t Str1=0x11, Str16=0x20;
 constexpr std::uint8_t NameFlag=0x80;
 }
 struct Tag {

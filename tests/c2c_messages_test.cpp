@@ -105,7 +105,7 @@ TEST(C2CMessages, DecodeHelloAnswer){
   w.u8(0x83);
   w.u8(tag::CT_VERSION);
   w.u32(0x3C);
-  w.u32(0x7F000001u);
+  w.u32(0x0100007Fu);
   w.u16(0x4662u);
   auto out=decode_hello_answer(w.take());
   ASSERT_TRUE(out.has_value());
