@@ -63,6 +63,27 @@ BlockAllocator::next_block() {
   return std::make_tuple(part, bip, start, end);
 }
 
+// raccoon: 扫描 pending_ 一轮, 跳过对端无该 part 的块(重入队尾), 取首个可服务块。
+// 全轮无可服务块 → nullopt (源耗尽)。单网络线程 → initial 在扫描期稳定。
+std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>>
+BlockAllocator::next_block_for_parts(const std::vector<bool>& has_part) {
+  std::size_t initial = pending_.size();
+  for (std::size_t i = 0; i < initial; ++i) {
+    if (pending_.empty()) break;
+    auto [part, bip] = pending_.front();
+    pending_.pop();
+    if (part < has_part.size() && has_part[part]) {
+      std::uint64_t pstart = static_cast<std::uint64_t>(part) * PART_SIZE;
+      std::uint64_t start = pstart + static_cast<std::uint64_t>(bip) * AICH_BLOCK_SIZE;
+      std::uint64_t pend = pstart + part_size(part);
+      std::uint64_t end = std::min(static_cast<std::uint64_t>(start) + AICH_BLOCK_SIZE, pend);
+      return std::make_tuple(part, bip, start, end);
+    }
+    pending_.push({part, bip});   // 对端无此 part → 重入队尾, 试下一块
+  }
+  return std::nullopt;
+}
+
 bool BlockAllocator::complete() const {
   for (const auto& pv : done_) {
     for (bool b : pv) {

@@ -4,7 +4,15 @@
 #include "ed2k/download/aich_checker.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/util/error.hpp"
-#include <atomic>
+#include <optional>
+#include <tuple>
+#include <utility>
+#include <vector>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/experimental/channel.hpp>
 namespace ed2k::download {
 Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
                    const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source)
@@ -67,25 +75,26 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
   : ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich),
     sources_(std::move(sources)), server_conn_(server_conn), listener_(listener) {}
 
-// 单源 worker:连接 source,握手+拉 hashset,初始化 BlockAllocator(从 PartFile 恢复),
-// 按 BlockAllocator 分配的 AICH 小块逐块请求。
-// AICH 启用时:先向 peer 请求 proof,verify_block 校验通过才 write_block(先验证后写入)。
-// 校验失败:requeue + 同源重试,超过 max_retries 返回 block_corrupt 让 MultiSourceDownload 切源。
-// 连接阶段按 source.low_id() 分支(M3):
-//   LowID(+server_conn+listener): callback_request -> listener.accept -> C2CConnection(socket&&)
-//   LowID(缺 server_conn/listener): 防御性 connect_failed(M2 已 filter 掉 LowID)
-//   HighID: 直连 conn.connect(IPv4{source.id}, source.port) —— 现状不变
-static boost::asio::awaitable<tl::expected<void,std::error_code>>
-peer_worker(boost::asio::any_io_executor ex,
-            const std::filesystem::path& out,
-            const FileHash& hash, std::uint64_t size,
-            const std::optional<AICHHash>& aich,
-            const ed2k::server::SourceEndpoint& source,
-            std::chrono::milliseconds timeout,
-            std::size_t max_retries,
-            ed2k::server::ServerConnection* server_conn,
-            ed2k::peer::InboundListener* listener){
-  bool accepted = false;   // LowID 回调路径下我方是 TCP acceptor,握手角色随之翻转
+// === raccoon 多源并发 (P4c-3) ===
+// 设计 spec §3: 单 io_context/单网络线程 + co_spawn 多 worker + 共享无锁状态。
+// 块分发 = 同步 next_block_for_parts(has_part) (非阻塞 pop, 按对端 part 位图过滤);
+// 完成信号 = asio::experimental::channel (awaitable, 不阻塞线程)。禁用 condition_variable
+// (会阻塞唯一网络线程 → 死锁)。PartFile/BlockAllocator/SharedState 仅网络线程访问 → 无 mutex。
+//
+// fetch_hashset: setup 阶段顺序从首个可用源拿 hashset (鸡生蛋: 共享 PartFile/BlockAllocator
+// 构造依赖 part_hashes)。其连接复用给该源 worker (设计 spec §1.4: 连接复用, 免重连)。
+struct FetchResult {
+  std::vector<PartHash> part_hashes;
+  std::vector<bool> fs_parts;                     // 对端 part 可用位图 (FILESTATUS)
+  std::optional<ed2k::peer::C2CConnection> conn;  // setup 连接, 复用给该源 worker
+};
+static boost::asio::awaitable<tl::expected<FetchResult,std::error_code>>
+fetch_hashset(boost::asio::any_io_executor ex,
+              const ed2k::server::SourceEndpoint& source, const FileHash& hash,
+              std::chrono::milliseconds timeout,
+              ed2k::server::ServerConnection* server_conn,
+              ed2k::peer::InboundListener* listener){
+  bool accepted = false;   // LowID 回调路径下我方是 TCP acceptor, 握手角色随之翻转
   std::optional<ed2k::peer::C2CConnection> conn_opt;
   if(source.low_id()){
     if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
@@ -102,113 +111,211 @@ peer_worker(boost::asio::any_io_executor ex,
     conn_opt.emplace(std::move(c));
     accepted = false;
   }
-  auto& conn = *conn_opt;
   ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
-  // 握手角色:acceptor(我方接收 HELLO 再回 HELLOANSWER) vs initiator(我方先发 HELLO)。
-  // 不用 co_await 三目运算(parser-fragile),显式 if/else;HighID 路径与改前逐字节一致。
   tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
-  if(accepted) hr = co_await conn.handshake_acceptor(mine, timeout);
-  else         hr = co_await conn.handshake(mine, timeout);
+  if(accepted) hr = co_await conn_opt->handshake_acceptor(mine, timeout);
+  else         hr = co_await conn_opt->handshake(mine, timeout);
   if(!hr) co_return tl::unexpected(hr.error());
-  auto fs = co_await conn.request_file(hash, timeout);
+  auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
-  auto hs = co_await conn.request_hashset(hash, timeout);
+  auto hs = co_await conn_opt->request_hashset(hash, timeout);
   if(!hs) co_return tl::unexpected(hs.error());
+  FetchResult r;
+  r.part_hashes = std::move(*hs);
+  r.fs_parts = std::move(fs->parts);
+  r.conn = std::move(conn_opt);
+  co_return r;
+}
 
-  // 用真实 part hashes 打开 PartFile（构造时即校验已存在的 part 实现续传）
-  PartFile pf(out, size, hash, *hs);
-  // 从 PartFile 已有块状态恢复 BlockAllocator:已完成的块不入 pending 队列
-  BlockAllocator alloc{size, *hs, aich, pf};
+// 共享状态 (仅网络线程访问 → 无锁)。PartFile/BlockAllocator 跨 worker 共享; AICHChecker
+// 无状态, setup 后构造一次共享; aich_active 为 per-worker (每 worker 与己方 peer 协商 master)。
+struct SharedState {
+  PartFile pf;
+  BlockAllocator alloc;
   std::optional<AICHChecker> checker;
-  bool aich_active = false;
-  // part_index 在线协议为 u16 (FILESTATUS part 计数即 u16, ≤65535 part≈580TiB) —— 自然有界,
-  // 旧 flat 块索引的 num_blocks<=65535 守卫已删 (G10)。M4 per-part 块不跨 part, 叶序与两级树一致。
+  std::optional<AICHHash> aich;
+  FileHash hash;
+  std::uint64_t size;
+  bool complete = false;
+  std::size_t active_workers = 0;
+  std::optional<std::error_code> first_err;
+};
+// 完成信号 channel: worker 退出时 try_send 发一个 token; run() 收 N 个 token。
+// 签名 void(boost::system::error_code, int): 首参 error_code 被 use_awaitable 当操作状态
+// (始终 success), int 为可忽略的 token。错误经 st.first_err 传递 (worker 在 finish 内写入,
+// 单网络线程无竞争)。对照 boost asio experimental::channel 文档示例。
+using ResultCh = boost::asio::experimental::channel<void(boost::system::error_code, int)>;
 
-  (void)co_await conn.request_filename(hash, timeout);   // 可选,忽略
-  auto up = co_await conn.start_upload(hash, timeout);
-  if(!up) co_return tl::unexpected(up.error());
+// raccoon worker: 连接 source → (复用 setup 连接或全新连接) → start_upload → AICH master
+// 协商 (per-worker) → 按 next_block_for_parts(has_part) 取块 (仅请求对端有该 part 的块) →
+// request_blocks → AICH verify (若启用) → write_block → mark_done。源耗尽 (无对端可服务块)
+// 或失败 → finally_send 退出; 整文件完成由 st.complete 判定 (最后一块 mark_done 置位)。
+static boost::asio::awaitable<void>
+peer_worker(boost::asio::any_io_executor ex,
+            const ed2k::server::SourceEndpoint& source,
+            std::optional<ed2k::peer::C2CConnection> pre_conn,
+            std::vector<bool> pre_parts,
+            SharedState& st,
+            std::chrono::milliseconds timeout, std::size_t max_retries,
+            ed2k::server::ServerConnection* server_conn,
+            ed2k::peer::InboundListener* listener,
+            ResultCh& done_ch){
+  auto finish = [&](std::error_code ec){
+    if(ec && !st.first_err) st.first_err = ec;   // 首个失败错误 (单网络线程 → 无竞争)
+    if(st.active_workers > 0) --st.active_workers;
+    done_ch.try_send(boost::system::error_code{}, 0);   // capacity=N, 永不阻塞; 纯完成信号
+  };
 
-  // M4c: AICH master-hash 协商 + 降级。先向 peer 请求 AICH master hash
-  // (OP_AICHFILEHASHREQ→ANS), 与我方可信根 *aich 比对: 匹配才启用两级 verify_block;
-  // 不匹配或 peer 不支持 AICH(超时/无应答) 则降级为无 AICH 下载(part-hash MD4 仍为兜底)。
-  // 对照 aMule: 仅向 master 匹配的 source 请求 AICH proof。协商置于 start_upload 之后,
-  // 使 AICHFILEHASHREQ 落入 peer 主分派循环(其握手序列逐帧读取,不会误吞此帧)。
-  if(aich.has_value()){
-    auto mh = co_await conn.request_aich_master_hash(hash, timeout);
-    if(mh && *mh == *aich){
-      checker.emplace(*aich, size);
-      aich_active = true;
+  std::optional<ed2k::peer::C2CConnection> conn_opt;
+  std::vector<bool> fs_parts;
+  if(pre_conn.has_value()){
+    // 复用 setup 连接 (已 HELLO+SETREQFILEID+HASHSETREQUEST); 直接进 REQUESTFILENAME。
+    conn_opt = std::move(pre_conn);
+    fs_parts = std::move(pre_parts);
+  } else {
+    // 全新连接: connect + handshake + request_file + request_hashset(同步 mock 序列; 共享 st 已有 hashset, 丢弃)
+    bool accepted = false;
+    if(source.low_id()){
+      if(!server_conn || !listener){ finish(make_error_code(errc::connect_failed)); co_return; }
+      auto cb = co_await server_conn->callback_request(source.id, timeout);
+      if(!cb){ finish(cb.error()); co_return; }
+      auto acc = co_await listener->accept(timeout);
+      if(!acc){ finish(acc.error()); co_return; }
+      conn_opt.emplace(std::move(*acc));
+      accepted = true;
+    } else {
+      ed2k::peer::C2CConnection c(ex);
+      auto cr = co_await c.connect(IPv4{source.id}, source.port, timeout);
+      if(!cr){ finish(cr.error()); co_return; }
+      conn_opt.emplace(std::move(c));
+      accepted = false;
     }
-    // else: degrade —— aich_active 保持 false
+    ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
+    tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
+    if(accepted) hr = co_await conn_opt->handshake_acceptor(mine, timeout);
+    else         hr = co_await conn_opt->handshake(mine, timeout);
+    if(!hr){ finish(hr.error()); co_return; }
+    auto fs = co_await conn_opt->request_file(st.hash, timeout);
+    if(!fs){ finish(fs.error()); co_return; }
+    fs_parts = std::move(fs->parts);
+    auto hs = co_await conn_opt->request_hashset(st.hash, timeout);   // mock 序列要求; 结果丢弃
+    if(!hs){ finish(hs.error()); co_return; }
+  }
+  auto& conn = *conn_opt;
+
+  (void)co_await conn.request_filename(st.hash, timeout);   // 文件名可选, 忽略失败
+  auto up = co_await conn.start_upload(st.hash, timeout);
+  if(!up){ finish(up.error()); co_return; }
+
+  // M4c: AICH master-hash 协商 + 降级 (per-worker)。匹配才启用两级 verify_block;
+  // 不匹配/不支持 AICH → 降级无 AICH 下载 (part-hash MD4 仍兜底)。
+  bool aich_active = false;
+  if(st.aich.has_value()){
+    auto mh = co_await conn.request_aich_master_hash(st.hash, timeout);
+    if(mh && *mh == *st.aich) aich_active = true;
   }
 
-  // per-part 块分解(M4): next_block 返回 (part_index, block_in_part, start, end), 块绝不跨 part。
-  // start = part_index*PART_SIZE + block_in_part*AICH_BLOCK_SIZE, end 按 part 边界截断。
-  bool large_file = size > (std::uint64_t(1) << 32);
+  // servable = 对端可服务 part 集合 (初始 = FILESTATUS), 空响应时收缩 (防部分 part 死循环)。
+  std::vector<bool> servable = fs_parts;
+  bool large_file = st.size > (std::uint64_t(1) << 32);
   std::size_t retry = 0;
-  while(!alloc.complete()){
-    auto nb = alloc.next_block();
-    if(!nb.has_value()) break;
+  while(!st.alloc.complete()){
+    if(st.complete) break;
+    auto nb = st.alloc.next_block_for_parts(servable);
+    if(!nb){
+      // 无对端可服务块 = 源耗尽。若已完成 → 成功退出; 仅剩我一人且未完成 → io_error;
+      // 否则正常退出, 余块由兄弟 worker 处理。
+      if(st.complete){ finish({}); co_return; }
+      if(st.active_workers <= 1){ finish(make_error_code(errc::io_error)); co_return; }
+      finish({}); co_return;
+    }
     auto [part_index, block_in_part, start_byte, end_byte] = *nb;
 
     std::vector<ed2k::peer::Block> blocks;
     if(large_file){
-      auto r = co_await conn.request_blocks_i64(hash,
+      auto r = co_await conn.request_blocks_i64(st.hash,
         std::array<std::uint64_t,3>{start_byte,0,0}, std::array<std::uint64_t,3>{end_byte,0,0}, timeout);
-      if(!r) co_return tl::unexpected(r.error());
+      if(!r){ st.alloc.requeue_block(part_index, block_in_part); finish(r.error()); co_return; }
       blocks = std::move(*r);
     } else {
-      auto r = co_await conn.request_blocks(hash,
+      auto r = co_await conn.request_blocks(st.hash,
         std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start_byte),0,0},
         std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end_byte),0,0}, timeout);
-      if(!r) co_return tl::unexpected(r.error());
+      if(!r){ st.alloc.requeue_block(part_index, block_in_part); finish(r.error()); co_return; }
       blocks = std::move(*r);
     }
-    if(blocks.empty()) co_return tl::unexpected(make_error_code(errc::io_error));
+    if(blocks.empty()){
+      // 对端声称有该 part 但未供块 (部分 part) → 标该 part 不可服务 + requeue, 试别块。
+      servable[part_index] = false;
+      st.alloc.requeue_block(part_index, block_in_part);
+      continue;
+    }
 
     for(auto& b : blocks){
-      // C2 先验证后写入:AICH 启用时,先拉 proof + verify_block,通过才写盘;
-      // 校验失败 requeue 同源重试,超过 max_retries 返回 block_corrupt 让上层切源。
+      // C2 先验证后写入: AICH 启用时先拉 proof + verify_block, 通过才写盘;
+      // 校验失败 requeue 同源重试, 超 max_retries 返回 block_corrupt 让该源退出 (块回队列, 他源可取)。
       if(aich_active){
-        // M4b: request_aich_proof 发真实 u16 part_index → AICHRecoveryData (V2 恢复数据)。
-        //   verify_block(part_index, block_in_part, data, span<AICHProofHash>) 两步安全验证:
-        //   叶 hash == SHA1(data) + rebuild(file)==master (标识符重建, 对照 aMule SHAHashSet)。
-        auto rd = co_await conn.request_aich_proof(hash, *aich, static_cast<std::uint16_t>(part_index), timeout);
+        auto rd = co_await conn.request_aich_proof(st.hash, *st.aich,
+                                                   static_cast<std::uint16_t>(part_index), timeout);
         bool ok = false;
-        if(rd) ok = checker->verify_block(part_index, block_in_part, b.data,
-                                           std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
+        if(rd) ok = st.checker->verify_block(part_index, block_in_part, b.data,
+                                             std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
         if(!ok){
-          alloc.requeue_block(part_index, block_in_part);
-          if(++retry > max_retries) co_return tl::unexpected(make_error_code(errc::block_corrupt));
-          break;   // 同源重下该块(重新 next_block 会取到 requeue 的块或下一块)
+          st.alloc.requeue_block(part_index, block_in_part);
+          if(++retry > max_retries){ finish(make_error_code(errc::block_corrupt)); co_return; }
+          break;   // 同源重下该块 (next_block_for_parts 会再取到 requeue 的块或下一可服务块)
         }
       }
-      auto w = pf.write_block(b.start, b.end, b.data);
-      if(!w) co_return tl::unexpected(w.error());
-      alloc.mark_block_done(part_index, block_in_part);
-      retry = 0;   // 成功一块,重置同源重试计数
+      auto w = st.pf.write_block(b.start, b.end, b.data);
+      if(!w){ st.alloc.requeue_block(part_index, block_in_part); finish(w.error()); co_return; }
+      if(st.alloc.mark_block_done(part_index, block_in_part)){ st.complete = true; break; }
+      retry = 0;   // 成功一块, 重置同源重试计数
     }
   }
-
-  if(!alloc.complete()) co_return tl::unexpected(make_error_code(errc::io_error));
-  co_return tl::expected<void,std::error_code>{};
+  finish({});
 }
 
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
                          std::size_t max_retries){
-  // MVP：顺序尝试每个 source，第一个成功的 source 完成整文件块级下载。
-  // 多源并发编排（raccoon 算法）留待后续：需要跨 source 共享 BlockAllocator
-  // 状态与异步并发 worker，单线程 io_context 下用 condition_variable 会死锁。
-  std::error_code last_err = make_error_code(errc::connect_failed);
-  for(const auto& source : sources_){
-    auto r = co_await peer_worker(ex_, out_, hash_, size_, aich_, source, total_timeout, max_retries,
-                                  server_conn_, listener_);
-    if(r.has_value()) co_return tl::expected<void,std::error_code>{};
-    last_err = r.error();
-    // 失败则尝试下一个 source
+  // 阶段一: setup — 顺序从首个可用源拿 hashset (失败顺次尝试下一源), 连接复用给该源 worker。
+  FetchResult fr;
+  std::size_t setup_idx = 0;
+  std::error_code setup_err = make_error_code(errc::connect_failed);
+  for(; setup_idx < sources_.size(); ++setup_idx){
+    auto r = co_await fetch_hashset(ex_, sources_[setup_idx], hash_, total_timeout,
+                                    server_conn_, listener_);
+    if(r){ fr = std::move(*r); break; }
+    setup_err = r.error();
   }
-  co_return tl::unexpected(last_err);
+  if(setup_idx == sources_.size()) co_return tl::unexpected(setup_err);
+
+  // 共享状态 (仅网络线程访问 → 无锁)。pf 为空 (M1 不接 .part.met); alloc 从 pf 恢复 (全 pending)。
+  PartFile pf(out_, size_, hash_, fr.part_hashes);
+  BlockAllocator alloc(size_, fr.part_hashes, aich_, pf);
+  std::size_t n_workers = sources_.size() - setup_idx;
+  SharedState st{std::move(pf), std::move(alloc), std::nullopt, aich_, hash_, size_,
+                 false, n_workers, std::nullopt};
+  if(aich_) st.checker.emplace(*aich_, size_);
+
+  // 阶段二: raccoon — N worker 并发。worker[setup_idx] 复用 setup 连接, 其余全新连接。
+  ResultCh done_ch(ex_, n_workers);      // capacity = N
+  for(std::size_t i = setup_idx; i < sources_.size(); ++i){
+    std::optional<ed2k::peer::C2CConnection> pre_conn;
+    std::vector<bool> pre_parts;
+    if(i == setup_idx){ pre_conn = std::move(fr.conn); pre_parts = std::move(fr.fs_parts); }
+    boost::asio::co_spawn(ex_,
+      peer_worker(ex_, sources_[i], std::move(pre_conn), std::move(pre_parts), st,
+                  total_timeout, max_retries, server_conn_, listener_, done_ch),
+      boost::asio::detached);
+  }
+  // 收集 N 个完成信号 (worker 退出即 try_send; run 挂起在 async_receive, 网络线程跑 worker)。
+  // 错误经 st.first_err 传递 (worker 在 finish 内写入, 单网络线程无竞争)。
+  for(std::size_t i = 0; i < n_workers; ++i){
+    (void)co_await done_ch.async_receive(boost::asio::use_awaitable);
+  }
+  if(st.alloc.complete()) co_return tl::expected<void,std::error_code>{};
+  co_return tl::unexpected(st.first_err.value_or(make_error_code(errc::io_error)));
 }
 
 } // namespace ed2k::download

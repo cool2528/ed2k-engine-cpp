@@ -29,6 +29,12 @@ class BlockAllocator {
   // 块绝不跨 part：end = min(start+AICH_BLOCK_SIZE, part_end, size)。
   std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>> next_block();
 
+  // raccoon 多源: 取下一个对端「有该 part」的块。扫描 pending_ 队列(最多一轮 initial 个),
+  // 跳过 has_part[part]==false 的块(重入队尾), 返回首个可服务块(出队); 全轮无可服务块
+  // → nullopt(该源贡献耗尽)。单网络线程访问 → 无锁(与 next_block 同)。
+  std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>>
+    next_block_for_parts(const std::vector<bool>& has_part);
+
   // Is entire file complete?
   bool complete() const;
 
