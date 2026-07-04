@@ -121,7 +121,7 @@ TEST(C2CConnection, RequestHashset){
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{
     (void)co_await read_frame(s); co_await send_pkt(s, op::HELLOANSWER, encode_hello(peer_hello()));
     (void)co_await read_frame(s);
-    codec::ByteWriter w; w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
+    codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
     co_await send_pkt(s, op::HASHSETANSWER, w.take());
     co_await keep_alive(s); co_return;
   });
@@ -143,7 +143,7 @@ TEST(C2CConnection, StartUploadAccepted){
     { codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u16(1); w.u8(0x01);
       co_await send_pkt(s, op::FILESTATUS, w.take()); }
     (void)co_await read_frame(s);                       // HASHSETREQUEST
-    { codec::ByteWriter w; w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
+    { codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
       co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
     (void)co_await read_frame(s);                       // STARTUPLOADREQ
     co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});
@@ -169,7 +169,7 @@ TEST(C2CConnection, StartUploadQueued){
     { codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u16(1); w.u8(0x01);
       co_await send_pkt(s, op::FILESTATUS, w.take()); }
     (void)co_await read_frame(s);                       // HASHSETREQUEST
-    { codec::ByteWriter w; w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
+    { codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
       co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
     (void)co_await read_frame(s);                       // STARTUPLOADREQ
     { codec::ByteWriter w; w.u16(5);
@@ -196,13 +196,12 @@ TEST(C2CConnection, RequestBlocksRoundTrip){
     { codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u16(1); w.u8(0x01);
       co_await send_pkt(s, op::FILESTATUS, w.take()); }
     (void)co_await read_frame(s);                       // HASHSETREQUEST
-    { codec::ByteWriter w; w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
+    { codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u16(1); w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
       co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
     (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});   // STARTUPLOADREQ + ACCEPT
     (void)co_await read_frame(s);                       // REQUESTPARTS
     { codec::ByteWriter w; w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff")); w.u32(0); w.u32(10); w.blob(bytes({1,2,3,4,5,6,7,8,9,10}));
       co_await send_pkt(s, op::SENDINGPART, w.take()); }
-    co_await send_pkt(s, op::OUTOFPARTREQS, {});        // 告知无更多块 → 终止多响应循环
     co_await keep_alive(s); co_return;
   });
   run_coro(rt, [&]() -> asio::awaitable<void>{

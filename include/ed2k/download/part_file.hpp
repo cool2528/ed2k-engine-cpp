@@ -40,7 +40,11 @@ class PartFile {
   std::vector<std::vector<bool>> block_done_;  // block_done_[part][block_in_part]; 块不跨 part 边界
   std::fstream f_;
 
-  std::size_t num_parts() const { return part_hashes_.size(); }
+  // 数据 part 数 = ceil(size/PART_SIZE)。aMule GetPartCount() 同此 (块分配/完成判定基准)。
+  // part_hashes_ 可能多 1 (Red 变体: 文件恰为 PART_SIZE 整数倍时 aMule 追加空尾 part MD4(""),
+  // 见 ed2k_hasher HashVariant::Red + aMule SendHashsetPacket)。空尾 part 无数据, 不参与块分配/
+  // 完成判定, 仅存于 part_hashes_ 供 hashset/.met 保真。故 num_parts 取 size_ 而非 hash 计数。
+  std::size_t num_parts() const { return (size_ + PART_SIZE - 1) / PART_SIZE; }
   std::uint64_t part_size(std::size_t part) const {
     std::uint64_t base = static_cast<std::uint64_t>(part) * PART_SIZE;
     if (base >= size_) return 0;

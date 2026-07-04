@@ -24,7 +24,13 @@ struct HelloInfo {
 };
 
 // C→C 编码：返回 payload（opcode 由调用方设入 net::Packet）
-std::vector<std::byte> encode_hello(const HelloInfo&);
+// aMule 线格式(BYTE-COMPARE 锁定自 BaseClient.cpp SendHelloPacket/SendHelloAnswer/SendHelloTypePacket):
+//   - OP_HELLO     payload = [0x10 hashsize][hash:16][client_id:4][port:2][tagcount:4][tags][server_ip:4 BE][server_port:2]
+//   - OP_HELLOANSWER payload = [hash:16][client_id:4][port:2][tagcount:4][tags][server_ip:4 BE][server_port:2]   (无 0x10 前导)
+// 即 HELLO 比 HELLOANSWER 多一个 0x10 前导字节；二者 body 末尾均含 server_ip+server_port(0/0 若未连服务器)。
+// 发 OP_HELLO 用 encode_hello_packet；发 OP_HELLOANSWER 用 encode_hello。解码同理(decode_hello / decode_hello_answer)。
+std::vector<std::byte> encode_hello(const HelloInfo&);          // HELLOANSWER body(无 0x10 前导)/HELLO body
+std::vector<std::byte> encode_hello_packet(const HelloInfo&);   // OP_HELLO payload = [0x10] + encode_hello(h)
 std::vector<std::byte> encode_set_req_file(const FileHash&);
 std::vector<std::byte> encode_hashset_request(const FileHash&);
 std::vector<std::byte> encode_request_filename(const FileHash&);
@@ -38,9 +44,10 @@ struct FileStatus { FileHash hash; std::vector<bool> parts; };
 struct FileNameAnswer { FileHash hash; std::string name; };
 struct Block { FileHash hash; std::uint64_t start=0, end=0; std::vector<std::byte> data; };
 
-tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>);
+tl::expected<HelloInfo,std::error_code>          decode_hello(std::span<const std::byte>);        // OP_HELLO(校验并跳过 0x10 前导)
+tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>); // OP_HELLOANSWER(无前导)
 tl::expected<FileStatus,std::error_code>         decode_file_status(std::span<const std::byte>);
-tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(std::span<const std::byte>);
+tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(const FileHash& expected, std::span<const std::byte>);
 tl::expected<FileNameAnswer,std::error_code>     decode_req_filename_answer(std::span<const std::byte>);
 tl::expected<std::uint16_t,std::error_code>      decode_queue_ranking(std::span<const std::byte>);
 tl::expected<Block,std::error_code>              decode_sending_part(std::span<const std::byte>);

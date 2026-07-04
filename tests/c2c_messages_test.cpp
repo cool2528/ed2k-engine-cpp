@@ -41,7 +41,23 @@ TEST(C2CMessages, EncodeHello){
   app(bytes({2,0,0,0}));
   app(bytes({0x82,tag::CT_NAME, 0x01,0x00,'u'}));
   app(bytes({0x83,tag::CT_VERSION, 0x3c,0x00,0x00,0x00}));
+  // 尾部 server_ip(4 BE)+server_port(2 LE),未连服务器为 0(aMule SendHelloTypePacket 末尾无条件写入)。
+  app(bytes({0,0,0,0, 0,0}));
   EXPECT_EQ(out, want);
+}
+TEST(C2CMessages, EncodeHelloPacket){
+  // OP_HELLO payload = [0x10 hashsize] + encode_hello body(aMule SendHelloPacket: WriteUInt8(16) 后 SendHelloTypePacket)。
+  HelloInfo h;
+  h.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  h.client_id=0x01020304u;
+  h.port=0x1234u;
+  h.nickname="u";
+  h.version=0x3C;
+  auto body=encode_hello(h);
+  auto out=encode_hello_packet(h);
+  ASSERT_GE(out.size(), 1u);
+  EXPECT_EQ(std::to_integer<int>(out[0]), 0x10);
+  EXPECT_EQ(std::vector<std::byte>(out.begin()+1, out.end()), body);
 }
 TEST(C2CMessages, EncodeSetReqFile){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
@@ -115,6 +131,34 @@ TEST(C2CMessages, DecodeHelloAnswer){
   EXPECT_EQ(out->server_ip->value, 0x7F000001u);
   EXPECT_EQ(out->server_port, 0x4662u);
 }
+TEST(C2CMessages, DecodeHello){
+  // OP_HELLO 帧 = [0x10] + body(hash+id+port+tagcount+tags+server_ip+server_port)。
+  ByteWriter w;
+  w.u8(0x10);
+  w.hash16(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
+  w.u32(0x01020304u);
+  w.u16(0x1234u);
+  w.u32(2);
+  w.u8(0x82); w.u8(tag::CT_NAME); w.string16("peer");
+  w.u8(0x83); w.u8(tag::CT_VERSION); w.u32(0x3C);
+  w.u32(0x0100007Fu);   // server_ip 127.0.0.1: aMule WriteUInt32(LE of a-LOW-byte 0x0100007F) → 线字节 [7F,00,00,01]
+  w.u16(0x4662u);
+  auto out=decode_hello(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->nickname, "peer");
+  EXPECT_EQ(out->version, 0x3Cu);
+  EXPECT_TRUE(out->server_ip.has_value());
+  EXPECT_EQ(out->server_ip->value, 0x7F000001u);
+  EXPECT_EQ(out->server_port, 0x4662u);
+}
+TEST(C2CMessages, DecodeHelloRejectsBadHashsize){
+  // 首字节非 0x10 → aMule ProcessHelloPacket 抛出(if(16!=hashsize));我们返回 unsupported_version。
+  ByteWriter w;
+  w.u8(0x11);
+  w.hash16(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
+  auto out=decode_hello(w.take());
+  EXPECT_FALSE(out.has_value());
+}
 TEST(C2CMessages, DecodeFileStatus){
   ByteWriter w;
   w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
@@ -128,19 +172,34 @@ TEST(C2CMessages, DecodeFileStatus){
 }
 TEST(C2CMessages, DecodeHashsetAnswer){
   ByteWriter w;
+  auto fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  w.hash16(fh);                       // aMule SendHashsetPacket 前导文件 hash
   w.u16(2);
   w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
   w.hash16(*PartHash::from_hex("22222222222222222222222222222222"));
-  auto out=decode_hashset_answer(w.take());
+  auto out=decode_hashset_answer(fh, w.take());
   ASSERT_TRUE(out.has_value());
   ASSERT_EQ(out->size(), 2u);
 }
 TEST(C2CMessages, DecodeHashsetAnswerSinglePart){
   ByteWriter w;
+  auto fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  w.hash16(fh);
   w.u16(0);
-  auto out=decode_hashset_answer(w.take());
+  auto out=decode_hashset_answer(fh, w.take());
   ASSERT_TRUE(out.has_value());
   EXPECT_TRUE(out->empty());
+}
+TEST(C2CMessages, DecodeHashsetAnswerHashMismatch){
+  // aMule ProcessHashsetAnswer: 前导 file_hash 与请求不符即丢弃。引擎返回 hash_mismatch。
+  ByteWriter w;
+  w.hash16(*FileHash::from_hex("ffffffffffffffffffffffffffffffff"));
+  w.u16(1);
+  w.hash16(*PartHash::from_hex("11111111111111111111111111111111"));
+  auto expected = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=decode_hashset_answer(expected, w.take());
+  ASSERT_FALSE(out.has_value());
+  EXPECT_EQ(out.error(), make_error_code(errc::hash_mismatch));
 }
 TEST(C2CMessages, DecodeReqFilenameAnswer){
   ByteWriter w;

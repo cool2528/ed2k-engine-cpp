@@ -23,18 +23,33 @@ Download::run(std::chrono::milliseconds timeout){
   IPv4 ip = IPv4::from_wire(source_.id);
   auto cr = co_await conn_.connect(ip, source_.port, timeout);
   if(!cr) co_return tl::unexpected(cr.error());
-  ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
+  ed2k::peer::HelloInfo mine;
+  mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  mine.nickname = "ed2k"; mine.version = 0x3C; mine.port = 4662;
   auto hr = co_await conn_.handshake(mine, timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_.request_file(hash_, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
-  auto hs = co_await conn_.request_hashset(hash_, timeout);
-  if(!hs) co_return tl::unexpected(hs.error());
-  PartFile pf(out_, size_, hash_, std::move(*hs));
+  // 单 part 文件跳过 hashset (aMule 不应答); 传空 part_hashes, PartFile 自合成 {file_hash}。
+  std::vector<PartHash> part_hashes;
+  if(size_ > PART_SIZE){
+    auto hs = co_await conn_.request_hashset(hash_, timeout);
+    if(!hs) co_return tl::unexpected(hs.error());
+    part_hashes = std::move(*hs);
+  }
+  PartFile pf(out_, size_, hash_, std::move(part_hashes));
   (void)co_await conn_.request_filename(hash_, timeout);   // 文件名可选,忽略失败
   auto up = co_await conn_.start_upload(hash_, timeout);
   if(!up) co_return tl::unexpected(up.error());
-  auto missing = pf.missing_parts_peer_has(fs->parts);
+  // aMule 对完整共享文件发 FILESTATUS count=0 (无 part 位图): ClientTCPSocket.cpp OP_SETREQFILEID
+  // 处理 `if(reqfile->IsPartFile()) WritePartStatus else WriteUInt16(0)`。语义 = 对端拥有整文件
+  // (所有 part 可用), 不是 "0 part"。故 fs->parts 空 (count=0) 时视为全部 part 可用;
+  // 非空 (PartFile 不完整源发真实位图) 按位图过滤。单 part 文件 num_parts=1, 同此规则覆盖。
+  std::vector<bool> peer_parts = fs->parts;
+  if(peer_parts.empty()){
+    peer_parts.assign(static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE), true);
+  }
+  auto missing = pf.missing_parts_peer_has(peer_parts);
   // 缺失 part 位图: 用于跳过对端没有 / 已完成的 part。
   std::vector<bool> need_part(static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE), false);
   for(std::uint32_t p : missing) need_part[p] = true;
@@ -91,6 +106,7 @@ struct FetchResult {
 static boost::asio::awaitable<tl::expected<FetchResult,std::error_code>>
 fetch_hashset(boost::asio::any_io_executor ex,
               const ed2k::server::SourceEndpoint& source, const FileHash& hash,
+              std::uint64_t size,
               std::chrono::milliseconds timeout,
               ed2k::server::ServerConnection* server_conn,
               ed2k::peer::InboundListener* listener){
@@ -111,17 +127,27 @@ fetch_hashset(boost::asio::any_io_executor ex,
     conn_opt.emplace(std::move(c));
     accepted = false;
   }
-  ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
+  ed2k::peer::HelloInfo mine;
+  mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  mine.nickname = "ed2k"; mine.version = 0x3C; mine.port = 4662;
   tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
   if(accepted) hr = co_await conn_opt->handshake_acceptor(mine, timeout);
   else         hr = co_await conn_opt->handshake(mine, timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
-  auto hs = co_await conn_opt->request_hashset(hash, timeout);
-  if(!hs) co_return tl::unexpected(hs.error());
+  // 单 part 文件 (size <= PARTSIZE): aMule GetHashCount()==0 → SendHashsetPacket 静默不发
+  // OP_HASHSETANSWER (UploadClient.cpp SendHashsetPacket 守卫: !file->GetHashCount() 即 return)。
+  // 协议正确语义: 单 part 文件无独立 part-hashset, 文件 hash 即唯一 part hash。跳过请求,
+  // 传空 part_hashes 让 PartFile 构造器自合成 {file_hash} (part_file.cpp:13)。多 part 文件照常请求。
+  std::vector<PartHash> part_hashes;
+  if(size > PART_SIZE){
+    auto hs = co_await conn_opt->request_hashset(hash, timeout);
+    if(!hs) co_return tl::unexpected(hs.error());
+    part_hashes = std::move(*hs);
+  }
   FetchResult r;
-  r.part_hashes = std::move(*hs);
+  r.part_hashes = std::move(part_hashes);
   r.fs_parts = std::move(fs->parts);
   r.conn = std::move(conn_opt);
   co_return r;
@@ -170,11 +196,11 @@ peer_worker(boost::asio::any_io_executor ex,
   std::optional<ed2k::peer::C2CConnection> conn_opt;
   std::vector<bool> fs_parts;
   if(pre_conn.has_value()){
-    // 复用 setup 连接 (已 HELLO+SETREQFILEID+HASHSETREQUEST); 直接进 REQUESTFILENAME。
+    // 复用 setup 连接 (已 HELLO+SETREQFILEID; 多 part 还含 HASHSETREQUEST); 直接进 REQUESTFILENAME。
     conn_opt = std::move(pre_conn);
     fs_parts = std::move(pre_parts);
   } else {
-    // 全新连接: connect + handshake + request_file + request_hashset(同步 mock 序列; 共享 st 已有 hashset, 丢弃)
+    // 全新连接: connect + handshake + request_file (+ request_hashset 仅多 part; 共享 st 已有 hashset, 丢弃)
     bool accepted = false;
     if(source.low_id()){
       if(!server_conn || !listener){ finish(make_error_code(errc::connect_failed)); co_return; }
@@ -191,7 +217,9 @@ peer_worker(boost::asio::any_io_executor ex,
       conn_opt.emplace(std::move(c));
       accepted = false;
     }
-    ed2k::peer::HelloInfo mine; mine.nickname = "ed2k"; mine.version = 0x3C;
+    ed2k::peer::HelloInfo mine;
+    mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
+    mine.nickname = "ed2k"; mine.version = 0x3C; mine.port = 4662;
     tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
     if(accepted) hr = co_await conn_opt->handshake_acceptor(mine, timeout);
     else         hr = co_await conn_opt->handshake(mine, timeout);
@@ -199,8 +227,11 @@ peer_worker(boost::asio::any_io_executor ex,
     auto fs = co_await conn_opt->request_file(st.hash, timeout);
     if(!fs){ finish(fs.error()); co_return; }
     fs_parts = std::move(fs->parts);
-    auto hs = co_await conn_opt->request_hashset(st.hash, timeout);   // mock 序列要求; 结果丢弃
-    if(!hs){ finish(hs.error()); co_return; }
+    // 单 part 文件跳过 hashset (aMule 不应答); 多 part 文件仍请求 (mock 序列要求, 结果丢弃)。
+    if(st.size > PART_SIZE){
+      auto hs = co_await conn_opt->request_hashset(st.hash, timeout);
+      if(!hs){ finish(hs.error()); co_return; }
+    }
   }
   auto& conn = *conn_opt;
 
@@ -218,6 +249,12 @@ peer_worker(boost::asio::any_io_executor ex,
 
   // servable = 对端可服务 part 集合 (初始 = FILESTATUS), 空响应时收缩 (防部分 part 死循环)。
   std::vector<bool> servable = fs_parts;
+  // aMule 完整共享文件 FILESTATUS count=0 (无位图, 见 ClientTCPSocket.cpp OP_SETREQFILEID:
+  // !IsPartFile() → WriteUInt16(0)) = 拥有整文件 → 空位图视为全部 part 可服务。
+  // 非空位图 (PartFile 不完整源) 按实际 have-part 过滤。
+  if(servable.empty()){
+    servable.assign(static_cast<std::size_t>((st.size + PART_SIZE - 1) / PART_SIZE), true);
+  }
   bool large_file = st.size > (std::uint64_t(1) << 32);
   std::size_t retry = 0;
   while(!st.alloc.complete()){
@@ -284,7 +321,7 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   std::size_t setup_idx = 0;
   std::error_code setup_err = make_error_code(errc::connect_failed);
   for(; setup_idx < sources_.size(); ++setup_idx){
-    auto r = co_await fetch_hashset(ex_, sources_[setup_idx], hash_, total_timeout,
+    auto r = co_await fetch_hashset(ex_, sources_[setup_idx], hash_, size_, total_timeout,
                                     server_conn_, listener_);
     if(r){ fr = std::move(*r); break; }
     setup_err = r.error();

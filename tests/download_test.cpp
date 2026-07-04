@@ -168,7 +168,7 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
   { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
     co_await send_pkt(s, op::FILESTATUS, w.take()); }
   (void)co_await read_frame(s);                          // HASHSETREQUEST
-  { codec::ByteWriter w; w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
     co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
   (void)co_await read_frame(s);                          // REQUESTFILENAME
   { codec::ByteWriter w; w.hash16(mf.fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
@@ -189,7 +189,6 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
     codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
     w.blob(std::span<const std::byte>(full).subspan(off, len));
     co_await send_pkt(s, op::SENDINGPART, w.take());
-    co_await send_pkt(s, op::OUTOFPARTREQS, {});         // 终止 request_blocks 多响应循环
   }
   co_await keep_alive(s); co_return;
 }
@@ -205,7 +204,7 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<st
   HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
   if(send_hello_first){
     // initiator: 先发 HELLO,再等对端(acceptor)回 HELLOANSWER。复用同一 HelloInfo。
-    co_await send_pkt(s, op::HELLO, encode_hello(h));
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(h));
     (void)co_await read_frame(s);                        // HELLOANSWER
   } else {
     (void)co_await read_frame(s);                        // HELLO
@@ -218,7 +217,7 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<st
     for(std::size_t i=0;i<nbytes;++i) w.u8(0xFF);        // 所有 part 均可用
     co_await send_pkt(s, op::FILESTATUS, w.take()); }
   (void)co_await read_frame(s);                          // HASHSETREQUEST
-  { codec::ByteWriter w; w.u16(static_cast<std::uint16_t>(parts.size()));
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(static_cast<std::uint16_t>(parts.size()));
     for(const auto& p : parts) w.hash16(p);
     co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
   (void)co_await read_frame(s);                          // REQUESTFILENAME
@@ -239,7 +238,6 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<st
     codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
     w.blob(std::span<const std::byte>(full).subspan(off, len));
     co_await send_pkt(s, op::SENDINGPART, w.take());
-    co_await send_pkt(s, op::OUTOFPARTREQS, {});         // 终止 request_blocks 多响应循环
   }
   co_await keep_alive(s); co_return;
 }
@@ -256,7 +254,7 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
   { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);
     co_await send_pkt(s, op::FILESTATUS, w.take()); }
   (void)co_await read_frame(s);   // HASHSETREQUEST
-  { codec::ByteWriter w; w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
     co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
   (void)co_await read_frame(s);   // REQUESTFILENAME
   { codec::ByteWriter w; w.hash16(mf.fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
@@ -317,7 +315,6 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
       }
       codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0); w.blob(std::span<const std::byte>(d));
       co_await send_pkt(s, op::SENDINGPART, w.take());
-      co_await send_pkt(s, op::OUTOFPARTREQS, {});
       continue;
     }
     // other opcodes ignored
@@ -542,7 +539,7 @@ static asio::awaitable<void> serve_subset_peer(tcp::socket s, const std::vector<
   using namespace ed2k::peer;
   HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
   if(send_hello_first){
-    co_await send_pkt(s, op::HELLO, encode_hello(h));
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(h));
     (void)co_await read_frame(s);
   } else {
     (void)co_await read_frame(s);
@@ -560,7 +557,7 @@ static asio::awaitable<void> serve_subset_peer(tcp::socket s, const std::vector<
     }
     co_await send_pkt(s, op::FILESTATUS, w.take()); }
   (void)co_await read_frame(s);                          // HASHSETREQUEST
-  { codec::ByteWriter w; w.u16(static_cast<std::uint16_t>(parts.size()));
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(static_cast<std::uint16_t>(parts.size()));
     for(const auto& p : parts) w.hash16(p);
     co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
   (void)co_await read_frame(s);                          // REQUESTFILENAME
@@ -580,7 +577,6 @@ static asio::awaitable<void> serve_subset_peer(tcp::socket s, const std::vector<
     codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
     w.blob(std::span<const std::byte>(full).subspan(off, len));
     co_await send_pkt(s, op::SENDINGPART, w.take());
-    co_await send_pkt(s, op::OUTOFPARTREQS, {});
   }
   co_await keep_alive(s); co_return;
 }

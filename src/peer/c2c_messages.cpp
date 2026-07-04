@@ -22,7 +22,16 @@ std::vector<std::byte> encode_hello(const HelloInfo& h){
   tags.push_back(u32_tag(tag::CT_VERSION, h.version));
   w.u32(static_cast<std::uint32_t>(tags.size()));
   codec::write_taglist(w, tags);
+  // 尾部 server_ip(4 BE)+server_port(2 LE) — aMule SendHelloTypePacket 末尾无条件写入(0/0 若未连服务器)。
+  w.u32_be(h.server_ip ? h.server_ip->value : 0);
+  w.u16(h.server_port ? *h.server_port : 0);
   return w.take();
+}
+std::vector<std::byte> encode_hello_packet(const HelloInfo& h){
+  // OP_HELLO payload = [0x10 hashsize] + body(aMule SendHelloPacket: data.WriteUInt8(16) 后 SendHelloTypePacket)。
+  auto body = encode_hello(h);
+  body.insert(body.begin(), std::byte{0x10});
+  return body;
 }
 std::vector<std::byte> encode_set_req_file(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_hashset_request(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
@@ -37,6 +46,12 @@ std::vector<std::byte> encode_request_parts(const FileHash& h, std::array<std::u
 std::vector<std::byte> encode_end_of_download(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_cancel_transfer(){ return {}; }
 
+tl::expected<HelloInfo,std::error_code> decode_hello(std::span<const std::byte> data){
+  // OP_HELLO payload 首字节 = 0x10 hashsize(aMule ProcessHelloPacket: ReadUInt8(); if(16!=hashsize) throw)。
+  if(data.empty() || std::to_integer<std::uint8_t>(data.front()) != 0x10)
+    return tl::unexpected(make_error_code(errc::unsupported_version));
+  return decode_hello_answer(data.subspan(1));
+}
 tl::expected<HelloInfo,std::error_code> decode_hello_answer(std::span<const std::byte> data){
   ByteReader r(data);
   HelloInfo h;
@@ -68,12 +83,16 @@ tl::expected<FileStatus,std::error_code> decode_file_status(std::span<const std:
   }
   return fs;
 }
-tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(std::span<const std::byte> data){
+// aMule SendHashsetPacket (UploadClient.cpp) 线序: [file_hash:16][part_count:2 LE][part_hash:16]×count。
+// 对照 aMule ProcessHashsetAnswer: 先读 file_hash 校验 == 请求 hash (不符即丢弃), 再读 count + 各 part hash。
+tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(const FileHash& expected, std::span<const std::byte> data){
   ByteReader r(data);
+  FileHash got = r.hash16();              // 前导 16 字节文件 hash
   std::uint16_t count = r.u16();
   std::vector<PartHash> out; out.reserve(count);
   for(std::uint16_t i=0;i<count && r.ok();++i) out.push_back(r.hash16());
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  if(!(got == expected)) return tl::unexpected(make_error_code(errc::hash_mismatch));
   return out;
 }
 tl::expected<FileNameAnswer,std::error_code> decode_req_filename_answer(std::span<const std::byte> data){

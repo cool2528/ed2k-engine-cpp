@@ -11,11 +11,13 @@ PartFile::PartFile(const std::filesystem::path& path, std::uint64_t size, const 
   : path_(path), met_path_(path), size_(size), file_hash_(file_hash), part_hashes_(std::move(part_hashes)) {
   met_path_ += ".part.met";
   if(part_hashes_.empty()) part_hashes_.push_back(file_hash_);
-  part_done_.assign(part_hashes_.size(), false);
-  part_filled_.assign(part_hashes_.size(), 0);
+  // 状态向量按数据 part 数 (num_parts) 分配, 非 hash 计数 (Red 变体空尾 part 不占数据 part 槽)。
+  const std::size_t np = num_parts();
+  part_done_.assign(np, false);
+  part_filled_.assign(np, 0);
   // per-part 块位图: 每 part ceil(part_size/AICH_BLOCK_SIZE) 块, 块不跨 part 边界。
-  block_done_.resize(part_hashes_.size());
-  for(std::size_t p=0;p<part_hashes_.size();++p)
+  block_done_.resize(np);
+  for(std::size_t p=0;p<np;++p)
     block_done_[p].assign(blocks_in_part(p), false);
   if(!std::filesystem::exists(path_)) { std::ofstream c(path_, std::ios::binary); }
   f_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
@@ -37,7 +39,7 @@ bool PartFile::try_load_met(){
   if(!r) return false;
   if(!(r->hash == file_hash_) || r->part_hashes != part_hashes_) return false;   // 陈旧 met (异文件)
   std::uint64_t data_sz = std::filesystem::exists(path_) ? std::filesystem::file_size(path_) : 0;
-  for(std::size_t i=0;i<part_hashes_.size();++i){
+  for(std::size_t i=0;i<part_done_.size();++i){   // 仅数据 part (空尾 part 不在 part_done_)
     std::uint64_t pstart = static_cast<std::uint64_t>(i)*PART_SIZE;
     std::uint64_t pend = std::min(static_cast<std::uint64_t>(pstart+PART_SIZE), size_);
     bool gap_overlaps = false;
@@ -53,7 +55,7 @@ bool PartFile::try_load_met(){
 }
 // 回退路径 (P4a 原续传): 逐 part 回读 + MD4 校验。met 缺失/损坏/陈旧时使用。
 void PartFile::rehash_all(){
-  for(std::size_t i=0;i<part_hashes_.size();++i){
+  for(std::size_t i=0;i<part_done_.size();++i){   // 仅数据 part (空尾 part 无数据不重哈希)
     std::uint64_t pstart = i*PART_SIZE;
     std::uint64_t pend = std::min((i+1)*PART_SIZE, size_);
     std::uint64_t plen = pend-pstart;
@@ -63,14 +65,14 @@ void PartFile::rehash_all(){
     f_.read(reinterpret_cast<char*>(buf.data()), plen);
     if(static_cast<std::uint64_t>(f_.gcount()) == plen){
       crypto::MD4 m; m.update(buf);
-      if(PartHash::from_bytes(m.finish()) == part_hashes_[i]){
+      if(i < part_hashes_.size() && PartHash::from_bytes(m.finish()) == part_hashes_[i]){
         part_done_[i] = true; part_filled_[i] = plen;
       }
     }
     f_.clear();
   }
   // 推导 per-part block_done_: 一个 part 的 MD4 校验通过 → 该 part 所有块均 done。
-  for(std::size_t p=0;p<part_hashes_.size();++p){
+  for(std::size_t p=0;p<part_done_.size();++p){
     if(part_done_[p]) block_done_[p].assign(blocks_in_part(p), true);
   }
 }
@@ -123,6 +125,7 @@ tl::expected<void,std::error_code> PartFile::write_block(std::uint64_t start, st
       f_.read(reinterpret_cast<char*>(buf.data()), pend - pstart);
       f_.clear();
       if(static_cast<std::uint64_t>(f_.gcount()) != (pend - pstart)) return tl::unexpected(make_error_code(errc::io_error));
+      if(p >= part_hashes_.size()) return tl::unexpected(make_error_code(errc::block_corrupt));  // 对端 hashset 不足
       crypto::MD4 m; m.update(buf);
       if(PartHash::from_bytes(m.finish()) != part_hashes_[p])
         return tl::unexpected(make_error_code(errc::block_corrupt));
@@ -180,8 +183,9 @@ PartFile::write_block_async(std::uint64_t start, std::uint64_t end, std::span<co
     f_.clear();
     bool iofail = (static_cast<std::uint64_t>(f_.gcount()) != (pend - pstart));
     bool corrupt = false;
-    if(!iofail){ crypto::MD4 m; m.update(buf);
-                 if(PartHash::from_bytes(m.finish()) != part_hashes_[p]) corrupt = true; }
+    if(!iofail){ if(p >= part_hashes_.size()) corrupt = true;          // 对端 hashset 不足
+                 else { crypto::MD4 m; m.update(buf);
+                        if(PartHash::from_bytes(m.finish()) != part_hashes_[p]) corrupt = true; } }
     co_await boost::asio::post(net_ex, boost::asio::bind_executor(net_ex, boost::asio::use_awaitable));    // 回网络线程
     if(iofail) co_return tl::unexpected(make_error_code(errc::io_error));
     if(corrupt) co_return tl::unexpected(make_error_code(errc::block_corrupt));

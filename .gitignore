@@ -4,3 +4,9 @@ vcpkg_installed/
 *.user
 .cache/
 /Testing/
+
+# live-test / debug scratch (never tracked)
+.tmp_*
+amule_*.cpp
+login.out
+server.met

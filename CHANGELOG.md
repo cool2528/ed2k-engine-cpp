@@ -5,6 +5,33 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
 ## [Unreleased] — toward 1.0.0
 
+### Fixed — live protocol fidelity vs aMule 2.3.3 (R0-1)
+Discovered by byte-comparison against aMule source while validating
+`LiveDownload.LocalPeerCompletes` against a local aMule peer (single-part 5.57MB +
+multi-part 29MB, both MD4-verified):
+- **`request_blocks` multi-subframe accumulation**: aMule `CreateStandardPackets` splits each
+  requested range into ~10240B sub-frames (not one frame per range). Replaced the
+  `while(blocks.size()<3)` loop with `accumulate_blocks` (per-range buffer, byte-offset stitching
+  until each active range is continuously covered).
+- **Single-part files skip `request_hashset`**: aMule silently drops the answer when
+  `GetHashCount()==0`; `size <= PART_SIZE` now skips the request and `PartFile` synthesizes
+  `{file_hash}`.
+- **HELLO/HELLOANSWER asymmetry**: HELLO carries a leading `0x10` hashsize byte, HELLOANSWER
+  does not. Split `encode_hello_packet` (adds 0x10) / `decode_hello` (validates & skips it).
+- **HELLO body trailing server_ip/server_port**: `SendHelloTypePacket` always appends
+  `server_ip:4 BE` + `server_port:2` (0/0 when not server-connected); was missing.
+- **HASHSETANSWER leading file_hash**: `[file_hash:16][count:2][part_hashes]`; `ProcessHashsetAnswer`
+  validates the prefix against the requested hash. `decode_hashset_answer` now takes `expected`.
+- **ed2k file hash Red variant default**: aMule appends an empty trailing part `MD4("")` for files
+  that are an exact multiple of PART_SIZE; `hash_bytes`/`hash_file` default switched Blue → Red.
+- **FILESTATUS count=0 = complete file**: aMule sends `[hash:16][count=0]` (no bitset) for complete
+  shared files (`!IsPartFile() → WriteUInt16(0)`), meaning all parts available — not "0 parts".
+  Empty `fs->parts` now maps to "all parts servable" at both download sites.
+- `PartFile::num_parts` now derives from `ceil(size/PART_SIZE)` (the Red empty trailing part holds
+  no data and must not occupy a `part_done_`/`block_done_` slot); bounds-guarded hash lookups.
+- Removed per-batch `OP_OUTOFPARTREQS` from 6 mock peers (aMule sends it only on upload-slot
+  reclamation, not per batch). Added 4 unit tests (HELLO packet/decode, hashset hash-mismatch).
+
 ### Added — multi-source download & resume (P4c-3)
 - **raccoon multi-source concurrent download**: `MultiSourceDownload` spawns N `peer_worker`
   coroutines sharing one `BlockAllocator`/`PartFile`; per-part bitmap block dispatch
@@ -39,8 +66,9 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
   single-source 57s → 2.9s, corruption recovery 91s → 6.3s.
 
 ### Tests
-- 225 pass, 4 skip (live-gated only). Previously-skipped `RequestPartsI64RoundTrip` placeholder
-  replaced by the real `Beyond4GiBBoundaryRoundTrip`.
+- 229 pass, 5 skip (live-gated only). `LiveDownload.LocalPeerCompletes` green vs local aMule 2.3.3
+  peer (single-part + multi-part 29MB, MD4 verified). Previously-skipped `RequestPartsI64RoundTrip`
+  placeholder replaced by the real `Beyond4GiBBoundaryRoundTrip`.
 
 ## [0.1.0] — initial
 
