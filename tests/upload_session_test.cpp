@@ -583,3 +583,46 @@ TEST(UploadSession, AnswersRequestSources2WithEmptySourceList){
     co_return;
   });
 }
+
+TEST(UploadSession, StoresFileDescForCurrentRequestedFile){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "shared.bin";
+  f.size = 1;
+  db.add(f);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    EXPECT_EQ((co_await read_packet(s)).opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::SETREQFILEID, encode_set_req_file(f.hash));
+    EXPECT_EQ((co_await read_packet(s)).opcode, op::FILESTATUS);
+    co_await send_pkt(s, op::FILEDESC, encode_file_desc(4, "verified source"));
+    asio::steady_timer timer(rt.context());
+    for(int i = 0; i < 20; ++i) {
+      if(const auto* updated = db.find(f.hash); updated && updated->comment == "verified source") break;
+      timer.expires_after(10ms);
+      co_await timer.async_wait(asio::use_awaitable);
+    }
+    boost::system::error_code ignored;
+    s.shutdown(tcp::socket::shutdown_send, ignored);
+    co_return;
+  });
+
+  const auto* updated = db.find(f.hash);
+  ASSERT_NE(updated, nullptr);
+  EXPECT_EQ(updated->rating, 4u);
+  EXPECT_EQ(updated->comment, "verified source");
+}

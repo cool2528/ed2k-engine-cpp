@@ -17,25 +17,25 @@ namespace ed2k::share {
 class UploadSession {
  public:
   UploadSession(boost::asio::ip::tcp::socket&& socket,
-                const KnownFileDB& files,
+                KnownFileDB& files,
                 ed2k::peer::HelloInfo self);
   UploadSession(boost::asio::ip::tcp::socket&& socket,
-                const KnownFileDB& files,
+                KnownFileDB& files,
                 ed2k::peer::HelloInfo self,
                 boost::asio::any_io_executor disk_executor);
   UploadSession(boost::asio::ip::tcp::socket&& socket,
-                const KnownFileDB& files,
+                KnownFileDB& files,
                 ed2k::peer::HelloInfo self,
                 boost::asio::any_io_executor disk_executor,
                 UploadQueue* queue);
   UploadSession(boost::asio::ip::tcp::socket&& socket,
-                const KnownFileDB& files,
+                KnownFileDB& files,
                 ed2k::peer::HelloInfo self,
                 boost::asio::any_io_executor disk_executor,
                 UploadQueue* queue,
                 UploadBandwidthThrottler* throttler);
   UploadSession(boost::asio::ip::tcp::socket&& socket,
-                const KnownFileDB& files,
+                KnownFileDB& files,
                 ed2k::peer::HelloInfo self,
                 boost::asio::any_io_executor disk_executor,
                 UploadQueue* queue,
@@ -58,9 +58,10 @@ class UploadSession {
     send_requested_parts(const KnownFile& file, const ed2k::peer::RequestParts& req);
 
   ed2k::net::Connection conn_;
-  const KnownFileDB& files_;
+  KnownFileDB& files_;
   ed2k::peer::HelloInfo self_;
   std::optional<ed2k::peer::HelloInfo> peer_;
+  std::optional<ed2k::FileHash> current_file_;
   boost::asio::any_io_executor disk_executor_;
   UploadQueue* queue_ = nullptr;
   UploadBandwidthThrottler* throttler_ = nullptr;

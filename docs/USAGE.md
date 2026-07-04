@@ -49,6 +49,34 @@ used.
 Login, ask the server for sources of the given file link, print them
 (`IP  id=0x...  port=...  HighID/LowID`).
 
+## `publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]`
+
+Scan a local share directory, build the known-file index in memory, login to a server, and publish
+the files with `OP_OFFERFILES`.
+
+- `--server:server.met` — server list to login through. Omit to use the internal fallback list.
+- `--ip` / `--port` — pin a specific server instead of rotating.
+
+```bash
+ed2k-tool publish D:\share --server:server.met
+# published 3 files
+```
+
+## `comment <ed2k-link> --rating:n --comment:text [--peer:ip:port]`
+
+Encode or send a file rating/comment (`OP_FILEDESC`). Ratings are `0..5`.
+
+Without `--peer`, the command validates the link and prints the exact payload bytes, which is useful
+for protocol inspection:
+
+```bash
+ed2k-tool comment "ed2k://|file|shared.bin|1|00112233445566778899aabbccddeeff|/" --rating:5 --comment:verified
+# file=00112233445566778899aabbccddeeff rating=5 comment=verified payload=05080000007665726966696564
+```
+
+With `--peer`, the command connects to the peer, performs the C2C handshake, sets the requested file
+context, and sends `OP_FILEDESC` over the eMule protocol.
+
 ## `download <ed2k-link> [--out:PATH] [--server:server.met]`
 
 Download a file. Multi-source: the engine gathers sources from the server and downloads from
@@ -75,3 +103,6 @@ ed2k-tool download "ed2k://|file|ubuntu.iso|...|/" --out:ubuntu.iso --server:ser
 ## Environment
 
 - `ED2K_LIVE=1` — enable live tests (see README). Not used by the CLI.
+- `ED2K_SOURCE=ip:port` — live-test local aMule peer for direct download / SourceExchange checks.
+- `ED2K_UPLOAD_FILE=PATH` and optional `ED2K_UPLOAD_PORT=n` — live upload-session harness: the test
+  listens and waits for a real peer to request the file.

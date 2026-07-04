@@ -153,6 +153,14 @@ void KnownFileDB::add(KnownFile file) {
   }
 }
 
+bool KnownFileDB::set_file_desc(const FileHash& hash, std::uint8_t rating, std::string comment) {
+  auto it = by_hash_.find(hash);
+  if(it == by_hash_.end()) return false;
+  files_[it->second].rating = rating;
+  files_[it->second].comment = std::move(comment);
+  return true;
+}
+
 const KnownFile* KnownFileDB::find(const FileHash& hash) const {
   auto it = by_hash_.find(hash);
   if(it == by_hash_.end()) return nullptr;

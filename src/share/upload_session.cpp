@@ -96,18 +96,18 @@ recovery_for(std::span<const std::byte> full, std::uint16_t part_index) {
 }
 
 UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
-                             const KnownFileDB& files,
+                             KnownFileDB& files,
                              ed2k::peer::HelloInfo self)
   : conn_(std::move(socket)), files_(files), self_(std::move(self)), disk_executor_(conn_.executor()) {}
 
 UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
-                             const KnownFileDB& files,
+                             KnownFileDB& files,
                              ed2k::peer::HelloInfo self,
                              asio::any_io_executor disk_executor)
   : conn_(std::move(socket)), files_(files), self_(std::move(self)), disk_executor_(std::move(disk_executor)) {}
 
 UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
-                             const KnownFileDB& files,
+                             KnownFileDB& files,
                              ed2k::peer::HelloInfo self,
                              asio::any_io_executor disk_executor,
                              UploadQueue* queue)
@@ -118,7 +118,7 @@ UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
     queue_(queue) {}
 
 UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
-                             const KnownFileDB& files,
+                             KnownFileDB& files,
                              ed2k::peer::HelloInfo self,
                              asio::any_io_executor disk_executor,
                              UploadQueue* queue,
@@ -131,7 +131,7 @@ UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
     throttler_(throttler) {}
 
 UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
-                             const KnownFileDB& files,
+                             KnownFileDB& files,
                              ed2k::peer::HelloInfo self,
                              asio::any_io_executor disk_executor,
                              UploadQueue* queue,
@@ -202,6 +202,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
   if(pkt.opcode == ed2k::peer::op::FILEDESC) {
     auto decoded = ed2k::peer::decode_file_desc(pkt.payload);
     if(!decoded) co_return tl::unexpected(decoded.error());
+    if(current_file_) files_.set_file_desc(*current_file_, decoded->rating, std::move(decoded->comment));
     co_return tl::expected<void, std::error_code>{};
   }
 
@@ -278,6 +279,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
   const auto& hash = *decoded;
   const KnownFile* file = files_.find(hash);
   if(!file) co_return co_await send_not_found(hash);
+  current_file_ = hash;
 
   ed2k::net::Packet ans;
   ans.protocol = ed2k::net::proto::eDonkey;

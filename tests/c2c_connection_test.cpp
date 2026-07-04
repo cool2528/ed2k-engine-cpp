@@ -324,6 +324,29 @@ TEST(C2CConnection, RequestSources2RoundTrip){
     c.close(); co_return;
   });
 }
+
+TEST(C2CConnection, SendsFileDesc){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    auto [proto_byte, body] = co_await read_frame_proto(s);
+    EXPECT_EQ(proto_byte, proto::eMule);
+    EXPECT_FALSE(body.empty()); if(body.empty()) co_return;
+    EXPECT_EQ(body[0], std::byte(op::FILEDESC));
+    auto desc = decode_file_desc(std::span<const std::byte>(body).subspan(1));
+    EXPECT_TRUE(desc.has_value()); if(!desc) co_return;
+    EXPECT_EQ(desc->rating, 5u);
+    EXPECT_EQ(desc->comment, "solid release");
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto r = co_await c.send_file_desc(5, "solid release");
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, RequestAichProofMasterMismatch){
   // 回显的 master_hash 与请求不一致 → hash_mismatch (aMule DownloadClient.cpp:1634 守卫)
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());

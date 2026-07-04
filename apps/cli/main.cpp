@@ -6,6 +6,7 @@
 #include <fstream>
 #include <chrono>
 #include <optional>
+#include <cstddef>
 #include "ed2k/version.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
@@ -13,6 +14,8 @@
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/app/server_session.hpp"
 #include "ed2k/net/runtime.hpp"
+#include "ed2k/peer/c2c_connection.hpp"
+#include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/server/connection.hpp"
 #include "ed2k/server/search_query.hpp"
 #include "ed2k/share/known_file.hpp"
@@ -27,11 +30,38 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool search <server.met> <keyword>\n"
   "       ed2k-tool sources <server.met> <ed2k-link>\n"
   "       ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]\n"
+  "       ed2k-tool comment <ed2k-link> --rating:n --comment:text [--peer:ip:port]\n"
   "       ed2k-tool download <ed2k-link> [--out:PATH] [--server:server.met]"); return 2; }
 static std::vector<std::byte> read_all(const char* p){
   std::ifstream f(p,std::ios::binary); std::vector<std::byte> v;
   f.seekg(0,std::ios::end); auto n=f.tellg(); f.seekg(0);
   if(n>0){ v.resize(std::size_t(n)); f.read(reinterpret_cast<char*>(v.data()),n); } return v;
+}
+static std::string hex_bytes(std::span<const std::byte> data){
+  static constexpr char d[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(data.size() * 2);
+  for(auto b : data){
+    auto v = std::to_integer<unsigned>(b);
+    out.push_back(d[(v >> 4) & 0x0f]);
+    out.push_back(d[v & 0x0f]);
+  }
+  return out;
+}
+static std::optional<std::pair<IPv4, std::uint16_t>> parse_peer(std::string_view s){
+  auto colon = s.rfind(':');
+  if(colon == std::string_view::npos) return std::nullopt;
+  auto ip = IPv4::from_dotted(s.substr(0, colon));
+  if(!ip) return std::nullopt;
+  return std::pair{*ip, static_cast<std::uint16_t>(std::stoi(std::string(s.substr(colon + 1))))};
+}
+static ed2k::peer::HelloInfo cli_hello(){
+  ed2k::peer::HelloInfo h;
+  h.nickname = "ed2k-tool";
+  h.version = 0x3C;
+  h.port = 4662;
+  h.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  return h;
 }
 int main(int argc,char** argv){
   if(argc<2) return usage();
@@ -164,6 +194,48 @@ int main(int argc,char** argv){
       if(!pr){ std::printf("error: %s\n", pr.error().message().c_str()); rc=1; }
       else std::printf("published %zu files\n", db.files().size());
       lg->conn.close();
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
+  }
+  if(cmd=="comment"){
+    if(argc<3) return usage();
+    auto pl = parse_link(argv[2]);
+    if(!pl){ std::printf("error: %s\n", pl.error().message().c_str()); return 1; }
+    auto* f = std::get_if<Ed2kFileLink>(&*pl);
+    if(!f){ std::printf("error: not a file link\n"); return 1; }
+    std::optional<unsigned> rating;
+    std::string comment;
+    std::optional<std::pair<IPv4, std::uint16_t>> peer;
+    for(int i=3;i<argc;++i){
+      std::string a=argv[i];
+      if(a=="--rating" && i+1<argc) rating = static_cast<unsigned>(std::stoul(argv[++i]));
+      else if(a.rfind("--rating:",0)==0) rating = static_cast<unsigned>(std::stoul(a.substr(9)));
+      else if(a=="--comment" && i+1<argc) comment = argv[++i];
+      else if(a.rfind("--comment:",0)==0) comment = a.substr(10);
+      else if(a.rfind("--peer:",0)==0) peer = parse_peer(a.substr(7));
+    }
+    if(!rating || *rating > 5){ std::printf("error: rating must be 0..5\n"); return 1; }
+    if(comment.empty()){ std::printf("error: comment required\n"); return 1; }
+    auto payload = ed2k::peer::encode_file_desc(static_cast<std::uint8_t>(*rating), comment);
+    if(!peer){
+      std::printf("file=%s rating=%u comment=%s payload=%s\n",
+        f->hash.to_hex().c_str(), *rating, comment.c_str(), hex_bytes(payload).c_str());
+      return 0;
+    }
+    ed2k::net::IoRuntime rt; int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::peer::C2CConnection c(rt.executor());
+      auto cr = co_await c.connect(peer->first, peer->second, std::chrono::milliseconds(15000));
+      if(!cr){ std::printf("error: %s\n", cr.error().message().c_str()); rc=1; rt.stop(); co_return; }
+      auto hs = co_await c.handshake(cli_hello(), std::chrono::milliseconds(15000));
+      if(!hs){ std::printf("error: %s\n", hs.error().message().c_str()); rc=1; rt.stop(); co_return; }
+      auto fs = co_await c.request_file(f->hash, std::chrono::milliseconds(15000));
+      if(!fs){ std::printf("error: %s\n", fs.error().message().c_str()); rc=1; rt.stop(); co_return; }
+      auto sr = co_await c.send_file_desc(static_cast<std::uint8_t>(*rating), comment);
+      if(!sr){ std::printf("error: %s\n", sr.error().message().c_str()); rc=1; }
+      else std::printf("sent comment for %s\n", f->hash.to_hex().c_str());
+      c.close();
       rt.stop(); co_return;
     }, asio::detached);
     rt.run(); return rc;

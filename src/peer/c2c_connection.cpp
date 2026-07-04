@@ -217,6 +217,15 @@ C2CConnection::request_sources2(const FileHash& h, std::chrono::milliseconds tim
   co_return std::move(*ans);
 }
 
+asio::awaitable<tl::expected<void,std::error_code>>
+C2CConnection::send_file_desc(std::uint8_t rating, std::string_view comment){
+  ed2k::net::Packet req;
+  req.protocol = ed2k::net::proto::eMule;
+  req.opcode = op::FILEDESC;
+  req.payload = encode_file_desc(rating, comment);
+  co_return co_await conn_.send(req);
+}
+
 asio::awaitable<tl::expected<AICHRecoveryData,std::error_code>>
 C2CConnection::request_aich_proof(const FileHash& h, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::AICHREQUEST;

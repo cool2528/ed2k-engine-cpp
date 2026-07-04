@@ -20,6 +20,8 @@ struct KnownFile {
   std::string name;
   std::uint64_t size = 0;
   std::uint32_t date = 0;
+  std::uint8_t rating = 0;
+  std::string comment;
   auto operator<=>(const KnownFile&) const = default;
 };
 
@@ -40,6 +42,7 @@ class KnownFileDB {
  public:
   tl::expected<void, std::error_code> scan_dir(const std::filesystem::path& dir);
   void add(KnownFile file);
+  bool set_file_desc(const FileHash& hash, std::uint8_t rating, std::string comment);
   const KnownFile* find(const FileHash& hash) const;
   const std::vector<KnownFile>& files() const noexcept { return files_; }
 
