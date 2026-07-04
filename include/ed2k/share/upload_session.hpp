@@ -15,6 +15,10 @@ class UploadSession {
   UploadSession(boost::asio::ip::tcp::socket&& socket,
                 const KnownFileDB& files,
                 ed2k::peer::HelloInfo self);
+  UploadSession(boost::asio::ip::tcp::socket&& socket,
+                const KnownFileDB& files,
+                ed2k::peer::HelloInfo self,
+                boost::asio::any_io_executor disk_executor);
 
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     run(std::chrono::milliseconds timeout);
@@ -26,10 +30,15 @@ class UploadSession {
     handle(const ed2k::net::Packet& pkt);
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     send_not_found(const ed2k::FileHash& hash);
+  boost::asio::awaitable<tl::expected<std::vector<std::byte>, std::error_code>>
+    read_range(const KnownFile& file, std::uint64_t start, std::uint64_t end);
+  boost::asio::awaitable<tl::expected<void, std::error_code>>
+    send_requested_parts(const KnownFile& file, const ed2k::peer::RequestParts& req);
 
   ed2k::net::Connection conn_;
   const KnownFileDB& files_;
   ed2k::peer::HelloInfo self_;
+  boost::asio::any_io_executor disk_executor_;
 };
 
 } // namespace ed2k::share

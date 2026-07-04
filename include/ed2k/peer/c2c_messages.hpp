@@ -41,6 +41,9 @@ std::vector<std::byte> encode_file_status(const FileHash&, std::span<const bool>
 std::vector<std::byte> encode_hashset_answer(const FileHash&, std::span<const PartHash> part_hashes);
 std::vector<std::byte> encode_start_upload(const FileHash&);
 std::vector<std::byte> encode_request_parts(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends);
+struct RequestParts { FileHash hash; std::array<std::uint64_t,3> starts{}, ends{}; };
+tl::expected<RequestParts,std::error_code> decode_request_parts(std::span<const std::byte>);
+std::vector<std::byte> encode_sending_part(const FileHash&, std::uint64_t start, std::span<const std::byte> data);
 std::vector<std::byte> encode_end_of_download(const FileHash&);
 std::vector<std::byte> encode_cancel_transfer();
 
@@ -71,7 +74,10 @@ struct AICHRecoveryData {
 
 // OP_AICHFILEHASHREQ(0x9E) -> OP_AICHFILEHASHANS(0x9D): 交换文件 AICH master hash (根)
 std::vector<std::byte> encode_aich_file_hash_req(const FileHash&);
+std::vector<std::byte> encode_aich_file_hash_ans(const FileHash&, const AICHHash& master);
 tl::expected<AICHHash, std::error_code> decode_aich_file_hash_ans(std::span<const std::byte>);
+std::vector<std::byte> encode_aich_answer(const FileHash&, const AICHHash& master, std::uint16_t part_index,
+                                          std::span<const AICHProofHash> proof);
 
 // OP_AICHREQUEST(0x9B) -> OP_AICHANSWER(0x9C): 请求/返回某 part 的 V2 恢复数据
 //   请求帧 = file_hash(16) + part_index(u16) + master_hash(20) = 38B (aMule SendAICHRequest 顺序)

@@ -28,6 +28,7 @@ class Connection {
     send(const Packet& p);
   boost::asio::awaitable<tl::expected<Packet,std::error_code>>
     recv(std::chrono::milliseconds timeout);
+  boost::asio::any_io_executor executor() { return socket_.get_executor(); }
   void close() noexcept;
   bool is_open() const noexcept;
  private:

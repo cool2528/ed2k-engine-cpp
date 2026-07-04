@@ -129,6 +129,51 @@ TEST(C2CMessages, EncodeRequestParts){
   }
   EXPECT_EQ(out, want);
 }
+TEST(C2CMessages, DecodeRequestParts){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=decode_request_parts(encode_request_parts(h, {100,200,300}, {150,250,350}));
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->hash, h);
+  EXPECT_EQ(out->starts, (std::array<std::uint64_t,3>{100,200,300}));
+  EXPECT_EQ(out->ends, (std::array<std::uint64_t,3>{150,250,350}));
+}
+TEST(C2CMessages, EncodeSendingPart){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto data=bytes({1,2,3});
+  auto out=encode_sending_part(h, 100, data);
+  ByteWriter w;
+  w.hash16(h);
+  w.u32(100);
+  w.u32(103);
+  w.blob(data);
+  EXPECT_EQ(out, w.take());
+}
+TEST(C2CMessages, EncodeAichFileHashAns){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  AICHHash master = AICHHash::from_bytes(sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+  auto out=encode_aich_file_hash_ans(h, master);
+  ByteWriter w;
+  w.hash16(h);
+  w.hash20(master.bytes());
+  EXPECT_EQ(out, w.take());
+}
+TEST(C2CMessages, EncodeAichAnswerV2RecoveryData){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  AICHHash master = AICHHash::from_bytes(sha1_from_hex("00112233445566778899aabbccddeeff00112233"));
+  AICHProofHash p;
+  p.identifier = 7;
+  p.hash = sha1_from_hex("aabbccddeeff00112233445566778899aabbccdd");
+  auto out=encode_aich_answer(h, master, 2, std::array{p});
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(2);
+  w.hash20(master.bytes());
+  w.u16(1);
+  w.u16(7);
+  w.hash20(p.hash);
+  w.u16(0);
+  EXPECT_EQ(out, w.take());
+}
 TEST(C2CMessages, EncodeEndOfDownload){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   EXPECT_EQ(encode_end_of_download(h), hex("00112233445566778899aabbccddeeff"));

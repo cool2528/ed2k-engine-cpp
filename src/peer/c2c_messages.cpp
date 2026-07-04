@@ -78,6 +78,23 @@ std::vector<std::byte> encode_request_parts(const FileHash& h, std::array<std::u
   for(auto e : ends) w.u32(e);
   return w.take();
 }
+tl::expected<RequestParts,std::error_code> decode_request_parts(std::span<const std::byte> data){
+  ByteReader r(data);
+  RequestParts req;
+  req.hash = r.hash16();
+  for(auto& s : req.starts) s = r.u32();
+  for(auto& e : req.ends) e = r.u32();
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return req;
+}
+std::vector<std::byte> encode_sending_part(const FileHash& h, std::uint64_t start, std::span<const std::byte> data){
+  ByteWriter w;
+  w.hash16(h);
+  w.u32(static_cast<std::uint32_t>(start));
+  w.u32(static_cast<std::uint32_t>(start + data.size()));
+  w.blob(data);
+  return w.take();
+}
 std::vector<std::byte> encode_end_of_download(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_cancel_transfer(){ return {}; }
 
@@ -177,12 +194,43 @@ std::vector<std::byte> encode_aich_file_hash_req(const FileHash& h){
   w.hash16(h);
   return w.take();                       // file_hash(16) — aMule CPacket(OP_AICHFILEHASHREQ,16,OP_EMULEPROT)
 }
+std::vector<std::byte> encode_aich_file_hash_ans(const FileHash& h, const AICHHash& master){
+  ByteWriter w;
+  w.hash16(h);
+  w.hash20(master.bytes());
+  return w.take();
+}
 tl::expected<AICHHash,std::error_code> decode_aich_file_hash_ans(std::span<const std::byte> data){
   ByteReader r(data);
   r.hash16();                            // file_hash(16) — 调用方已知请求的文件,此处丢弃
   auto master = r.hash20();              // aich_master_hash(20)
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return AICHHash::from_bytes(master);
+}
+std::vector<std::byte> encode_aich_answer(const FileHash& h, const AICHHash& master, std::uint16_t part_index,
+                                          std::span<const AICHProofHash> proof){
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(part_index);
+  w.hash20(master.bytes());
+  std::uint16_t count16 = 0, count32 = 0;
+  for(const auto& p : proof) {
+    if(p.identifier <= 0xFFFFu) ++count16;
+    else ++count32;
+  }
+  w.u16(count16);
+  for(const auto& p : proof){
+    if(p.identifier > 0xFFFFu) continue;
+    w.u16(static_cast<std::uint16_t>(p.identifier));
+    w.hash20(p.hash);
+  }
+  w.u16(count32);
+  for(const auto& p : proof){
+    if(p.identifier <= 0xFFFFu) continue;
+    w.u32(p.identifier);
+    w.hash20(p.hash);
+  }
+  return w.take();
 }
 
 std::vector<std::byte> encode_aich_request(const FileHash& h, const AICHHash& master, std::uint16_t part_index){
