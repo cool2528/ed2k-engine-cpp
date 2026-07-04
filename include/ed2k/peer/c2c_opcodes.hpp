@@ -31,7 +31,7 @@ constexpr std::uint8_t AICHANSWER        = 0x9C;  // <HASH16><u16 part_index><HA
 constexpr std::uint8_t AICHFILEHASHANS   = 0x9D;  // <HASH16><HASH20 aich_master>
 constexpr std::uint8_t AICHFILEHASHREQ   = 0x9E;  // <HASH16>
 constexpr std::uint8_t FILEDESC          = 0x61;  // eMule: rating + comment
-constexpr std::uint8_t REQUESTSOURCES2   = 0x83;  // eMule SX2: <HASH16>
+constexpr std::uint8_t REQUESTSOURCES2   = 0x83;  // eMule SX2 standalone interop: <HASH16>; multipacket SX2 carries version/options
 constexpr std::uint8_t ANSWERSOURCES2    = 0x84;  // eMule SX2: version + hash + sources
 // large file (I64) extensions
 constexpr std::uint8_t REQUESTPARTS_I64 = 0x30;

@@ -143,6 +143,19 @@ TEST(C2CMessages, EncodeRequestSources2){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   EXPECT_EQ(encode_request_sources2(h), hex("00112233445566778899aabbccddeeff"));
 }
+TEST(C2CMessages, DecodeRequestSources2){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=decode_request_sources2(hex("00112233445566778899aabbccddeeff"));
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(*out, h);
+  EXPECT_FALSE(decode_request_sources2(bytes({4,0,0,1,2,3})).has_value());
+}
+TEST(C2CMessages, DecodeRequestSources2WithVersionOptions){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=decode_request_sources2(hex("04000000112233445566778899aabbccddeeff"));
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(*out, h);
+}
 TEST(C2CMessages, EncodeAndDecodeAnswerSources2){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   PeerSource src{0x0100007Fu, 4662, 0, 0, *UserHash::from_hex("11111111111111111111111111111111"), 0};

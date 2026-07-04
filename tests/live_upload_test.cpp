@@ -72,6 +72,9 @@ TEST(LiveUpload, SourceExchange2WithLocalPeer){
     auto hs = co_await c.handshake(live_hello(), 15s);
     EXPECT_TRUE(hs.has_value()) << (hs ? "" : hs.error().message());
     if(!hs) co_return;
+    auto status = co_await c.request_file(f->hash, 15s);
+    EXPECT_TRUE(status.has_value()) << (status ? "" : status.error().message());
+    if(!status) co_return;
     auto sx = co_await c.request_sources2(f->hash, 15s);
     EXPECT_TRUE(sx.has_value()) << (sx ? "" : sx.error().message());
     if(!sx) co_return;

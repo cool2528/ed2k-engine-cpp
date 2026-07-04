@@ -305,7 +305,7 @@ TEST(C2CConnection, RequestSources2RoundTrip){
     EXPECT_EQ(proto_byte, proto::eMule);
     EXPECT_FALSE(body.empty()); if(body.empty()) co_return;
     EXPECT_EQ(body[0], std::byte(op::REQUESTSOURCES2));
-    auto req = decode_file_hash_request(std::span<const std::byte>(body).subspan(1));
+    auto req = decode_request_sources2(std::span<const std::byte>(body).subspan(1));
     EXPECT_TRUE(req.has_value()); if(!req) co_return;
     EXPECT_EQ(*req, fh);
     co_await send_pkt(s, op::ANSWERSOURCES2, encode_answer_sources2(fh, std::array{src}), proto::eMule);

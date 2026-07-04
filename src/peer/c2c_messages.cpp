@@ -230,6 +230,17 @@ decode_shared_files_answer(std::span<const std::byte> data){
 
 std::vector<std::byte> encode_request_sources2(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 
+tl::expected<FileHash, std::error_code> decode_request_sources2(std::span<const std::byte> data){
+  if(data.size() == 16) return decode_file_hash_request(data);
+  if(data.size() != 19) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  ByteReader r(data);
+  (void)r.u8();
+  (void)r.u16();
+  FileHash h = r.hash16();
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return h;
+}
+
 std::vector<std::byte> encode_answer_sources2(const FileHash& h, std::span<const PeerSource> sources, std::uint8_t version){
   ByteWriter w;
   w.u8(version);

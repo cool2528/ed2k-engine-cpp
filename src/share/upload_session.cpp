@@ -188,7 +188,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
   }
 
   if(pkt.opcode == ed2k::peer::op::REQUESTSOURCES2) {
-    auto decoded = ed2k::peer::decode_file_hash_request(pkt.payload);
+    auto decoded = ed2k::peer::decode_request_sources2(pkt.payload);
     if(!decoded) co_return tl::unexpected(decoded.error());
     const KnownFile* file = files_.find(*decoded);
     if(!file) co_return co_await send_not_found(*decoded);
