@@ -7,7 +7,7 @@ using udp = asio::ip::udp;
 using clock_type = std::chrono::steady_clock;
 
 UdpServerConnection::UdpServerConnection(asio::any_io_executor ex, IPv4 ip, std::uint16_t port)
-  : sock_(ex), server_(udp::endpoint(asio::ip::address_v4(ip.value), port)) {}
+  : sock_(ex), server_(udp::endpoint(asio::ip::address_v4(ip.host()), port)) {}
 void UdpServerConnection::on_event(std::function<void(const UdpEvent&)> sink){ on_event_ = std::move(sink); }
 void UdpServerConnection::close() noexcept { sock_.close(); }
 

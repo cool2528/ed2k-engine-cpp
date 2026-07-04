@@ -151,10 +151,10 @@ TEST(UdpConnection, ServerListRoundTrip){
   });
   run_coro(rt, [&]() -> asio::awaitable<void>{
     UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
-    auto r = co_await c.server_list(IPv4{0x01020304u}, 0x1234u, 2s);
+    auto r = co_await c.server_list(IPv4::from_host(0x01020304u), 0x1234u, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     EXPECT_EQ(r->size(), 1u); if(r->size() != 1u) co_return;
-    EXPECT_EQ((*r)[0].first.value, 0x01020304u);
+    EXPECT_EQ((*r)[0].first.host(), 0x01020304u);
     c.close(); co_return;
   });
 }

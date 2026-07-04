@@ -128,7 +128,7 @@ TEST(C2CMessages, DecodeHelloAnswer){
   EXPECT_EQ(out->nickname, "peer");
   EXPECT_EQ(out->version, 0x3Cu);
   EXPECT_TRUE(out->server_ip.has_value());
-  EXPECT_EQ(out->server_ip->value, 0x7F000001u);
+  EXPECT_EQ(out->server_ip->host(), 0x7F000001u);
   EXPECT_EQ(out->server_port, 0x4662u);
 }
 TEST(C2CMessages, DecodeHello){
@@ -148,7 +148,7 @@ TEST(C2CMessages, DecodeHello){
   EXPECT_EQ(out->nickname, "peer");
   EXPECT_EQ(out->version, 0x3Cu);
   EXPECT_TRUE(out->server_ip.has_value());
-  EXPECT_EQ(out->server_ip->value, 0x7F000001u);
+  EXPECT_EQ(out->server_ip->host(), 0x7F000001u);
   EXPECT_EQ(out->server_port, 0x4662u);
 }
 TEST(C2CMessages, DecodeHelloRejectsBadHashsize){

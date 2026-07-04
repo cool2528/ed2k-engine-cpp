@@ -20,7 +20,7 @@ bool Connection::is_open() const noexcept { return socket_.is_open(); }
 
 asio::awaitable<tl::expected<void,std::error_code>>
 Connection::connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout){
-  tcp::endpoint ep(asio::ip::address_v4(ip.value), port);
+  tcp::endpoint ep(asio::ip::address_v4(ip.host()), port);
   auto [ec] = co_await socket_.async_connect(
       ep, asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
   if(ec){

@@ -243,7 +243,7 @@ TEST(ServerConnection, CallbackRequestedEmitted){
     for(auto& e:evs){
       if(std::holds_alternative<CallbackRequestedEvent>(e)){
         auto& cb=std::get<CallbackRequestedEvent>(e);
-        got_cb = (cb.ip.value==0x0D0C0B0Au && cb.port==0x1234u);
+        got_cb = (cb.ip.host()==0x0D0C0B0Au && cb.port==0x1234u);
       }
     }
     EXPECT_TRUE(got_cb);

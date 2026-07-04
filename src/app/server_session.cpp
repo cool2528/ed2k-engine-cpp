@@ -30,7 +30,7 @@ std::vector<ServerTarget> build_targets(std::span<const std::byte> met_bytes,
   std::vector<ServerTarget> out;
   std::unordered_set<std::uint64_t> seen;
   auto push=[&](const ServerTarget& t){
-    std::uint64_t k = (std::uint64_t(t.ip.value) << 16) | t.port;
+    std::uint64_t k = (std::uint64_t(t.ip.host()) << 16) | t.port;
     if(seen.insert(k).second) out.push_back(t);
   };
   if(override) push(*override);

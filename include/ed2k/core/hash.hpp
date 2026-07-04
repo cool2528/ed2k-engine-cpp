@@ -32,7 +32,11 @@ class AICHHash {
 };
 
 struct IPv4 {
-  std::uint32_t value = 0; // 主机序（a 在高位，a<<24|b<<16|c<<8|d，与 asio::address_v4 一致）
+ private:
+  std::uint32_t value_ = 0; // 主机序（a 在高位，a<<24|b<<16|c<<8|d，与 asio::address_v4 一致）
+ public:
+  static constexpr IPv4 from_host(std::uint32_t v) noexcept { IPv4 ip; ip.value_ = v; return ip; }
+  constexpr std::uint32_t host() const noexcept { return value_; }
   static tl::expected<IPv4,std::error_code> from_dotted(std::string_view);
   static IPv4 from_wire(std::uint32_t le); // 线序 u32（a 在低位，aMule ReadUInt32）→ IPv4
   std::string to_dotted() const;

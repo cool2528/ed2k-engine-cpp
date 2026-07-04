@@ -8,7 +8,7 @@ std::vector<std::byte> encode_get_sources_req(const FileHash& h, std::uint64_t s
   ByteWriter w; w.hash16(h); w.u32(static_cast<std::uint32_t>(size)); return w.take();
 }
 std::vector<std::byte> encode_server_status_req(std::uint32_t challenge){ ByteWriter w; w.u32(challenge); return w.take(); }
-std::vector<std::byte> encode_server_list_req(IPv4 ip, std::uint16_t port){ ByteWriter w; w.u32_be(ip.value); w.u16(port); return w.take(); }
+std::vector<std::byte> encode_server_list_req(IPv4 ip, std::uint16_t port){ ByteWriter w; w.u32_be(ip.host()); w.u16(port); return w.take(); }
 std::vector<std::byte> encode_server_desc_req(std::uint32_t challenge){ ByteWriter w; w.u32(challenge); return w.take(); }
 
 tl::expected<UdpSearchResult,std::error_code> decode_glob_search_res(std::span<const std::byte> data){

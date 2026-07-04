@@ -82,14 +82,14 @@ TEST(ServerMessages, DecodeServerList){
   auto out = decode_server_list(bytes({2, 1,2,3,4, 0x34,0x12, 5,6,7,8, 0x78,0x56}));
   ASSERT_TRUE(out.has_value());
   ASSERT_EQ(out->size(), 2u);
-  EXPECT_EQ((*out)[0].first.value, 0x01020304u);
+  EXPECT_EQ((*out)[0].first.host(), 0x01020304u);
   EXPECT_EQ((*out)[0].second, 0x1234u);
-  EXPECT_EQ((*out)[1].first.value, 0x05060708u);
+  EXPECT_EQ((*out)[1].first.host(), 0x05060708u);
 }
 TEST(ServerMessages, DecodeCallbackRequested){
   auto out = decode_callback_requested(bytes({0x7F,0,0,1, 0x34,0x12}));
   ASSERT_TRUE(out.has_value());
-  EXPECT_EQ(out->ip.value, 0x7F000001u);
+  EXPECT_EQ(out->ip.host(), 0x7F000001u);
   EXPECT_EQ(out->port, 0x1234u);
 }
 TEST(ServerMessages, DecodeFoundSources){
@@ -151,7 +151,7 @@ TEST(ServerMessages, DecodeServerIdent){
   auto out = decode_server_ident(d);
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(out->hash, *MD4Hash::from_hex("00112233445566778899aabbccddeeff"));
-  EXPECT_EQ(out->ip.value, 0x7F000001u);
+  EXPECT_EQ(out->ip.host(), 0x7F000001u);
   EXPECT_EQ(out->port, 0x1234u);
   EXPECT_EQ(out->name, "name");
   EXPECT_EQ(out->description, "desc");

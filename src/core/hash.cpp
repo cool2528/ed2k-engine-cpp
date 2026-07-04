@@ -42,14 +42,14 @@ tl::expected<IPv4,std::error_code> IPv4::from_dotted(std::string_view s){
   if(std::sscanf(str.c_str(),"%u.%u.%u.%u%c",&a,&b,&c,&d,&extra)!=4)
     return tl::unexpected(make_error_code(errc::malformed_link));
   if(a>255||b>255||c>255||d>255) return tl::unexpected(make_error_code(errc::malformed_link));
-  return IPv4{ (a<<24)|(b<<16)|(c<<8)|d };
+  return IPv4::from_host((a<<24)|(b<<16)|(c<<8)|d);
 }
 IPv4 IPv4::from_wire(std::uint32_t le){
-  // 线序 a 在低位（aMule ReadUInt32 LE）；IPv4.value 约定 a 在高位 → 字节交换
-  return IPv4{ ((le&0xFFu)<<24)|((le&0xFF00u)<<8)|((le&0xFF0000u)>>8)|((le&0xFF000000u)>>24) };
+  // 线序 a 在低位（aMule ReadUInt32 LE）；IPv4.host() 约定 a 在高位 → 字节交换
+  return IPv4::from_host(((le&0xFFu)<<24)|((le&0xFF00u)<<8)|((le&0xFF0000u)>>8)|((le&0xFF000000u)>>24));
 }
 std::string IPv4::to_dotted() const {
   char buf[16]; std::snprintf(buf,sizeof buf,"%u.%u.%u.%u",
-    (value>>24)&0xff,(value>>16)&0xff,(value>>8)&0xff,value&0xff); return buf;
+    (value_>>24)&0xff,(value_>>16)&0xff,(value_>>8)&0xff,value_&0xff); return buf;
 }
 }

@@ -59,12 +59,13 @@ TEST(LiveDownload, LocalPeerCompletes){
   auto ip = IPv4::from_dotted(ss.substr(0, colon));
   ASSERT_TRUE(ip.has_value()) << "bad ED2K_SOURCE ip";
   std::uint16_t port = std::uint16_t(std::stoi(ss.substr(colon + 1)));
-  // IPv4.value is a-high-byte (asio order); SourceEndpoint.id is aMule-LE
+  // IPv4.host() is a-high-byte (asio order); SourceEndpoint.id is aMule-LE
   // (a-low-byte) so that low_id() detection + IPv4::from_wire(id) bswap work.
-  std::uint32_t id = ((ip->value & 0x000000FFu) << 24) |
-                     ((ip->value & 0x0000FF00u) << 8)  |
-                     ((ip->value & 0x00FF0000u) >> 8)  |
-                     ((ip->value & 0xFF000000u) >> 24);
+  std::uint32_t v = ip->host();
+  std::uint32_t id = ((v & 0x000000FFu) << 24) |
+                     ((v & 0x0000FF00u) << 8)  |
+                     ((v & 0x00FF0000u) >> 8)  |
+                     ((v & 0xFF000000u) >> 24);
   ed2k::server::SourceEndpoint src{ id, port };
   ASSERT_FALSE(src.low_id()) << "ED2K_SOURCE must be a HighID (reachable) peer";
 

@@ -23,7 +23,7 @@ std::vector<std::byte> encode_hello(const HelloInfo& h){
   w.u32(static_cast<std::uint32_t>(tags.size()));
   codec::write_taglist(w, tags);
   // 尾部 server_ip(4 BE)+server_port(2 LE) — aMule SendHelloTypePacket 末尾无条件写入(0/0 若未连服务器)。
-  w.u32_be(h.server_ip ? h.server_ip->value : 0);
+  w.u32_be(h.server_ip ? h.server_ip->host() : 0);
   w.u16(h.server_port ? *h.server_port : 0);
   return w.take();
 }
@@ -65,7 +65,7 @@ tl::expected<HelloInfo,std::error_code> decode_hello_answer(std::span<const std:
     if(t.name_id == tag::CT_NAME && std::holds_alternative<std::string>(t.value)) h.nickname = std::get<std::string>(t.value);
     else if(t.name_id == tag::CT_VERSION && std::holds_alternative<std::uint64_t>(t.value)) h.version = static_cast<std::uint32_t>(std::get<std::uint64_t>(t.value));
   }
-  if(r.remaining() >= 6){ h.server_ip = IPv4{r.u32_be()}; h.server_port = r.u16(); }
+  if(r.remaining() >= 6){ h.server_ip = IPv4::from_host(r.u32_be()); h.server_port = r.u16(); }
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return h;
 }
