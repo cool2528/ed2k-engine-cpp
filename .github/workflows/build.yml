@@ -57,8 +57,14 @@ jobs:
           fi
           # Pin the vcpkg tree to the exact baseline commit so the version database
           # matches what vcpkg.json references (full history is present on runners).
+          # `-f` discards any local modifications the runner image carries (some
+          # Linux images patch ports/); if the commit is absent (shallow image),
+          # fetch it explicitly first.
           git -C "$VCPKG_DIR" fetch --tags origin
-          git -C "$VCPKG_DIR" checkout "$BASELINE"
+          git -C "$VCPKG_DIR" checkout -f "$BASELINE" 2>/dev/null || {
+            git -C "$VCPKG_DIR" fetch origin "$BASELINE"
+            git -C "$VCPKG_DIR" checkout -f "$BASELINE"
+          }
           "$VCPKG_DIR/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$VCPKG_DIR" >> "$GITHUB_ENV"
           "$VCPKG_DIR/vcpkg" --version
