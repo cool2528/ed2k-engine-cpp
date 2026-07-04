@@ -127,6 +127,53 @@ TEST(C2CMessages, EncodeUdpReaskAck){
   auto out=encode_reask_ack(42);
   EXPECT_EQ(out, bytes({42,0}));
 }
+TEST(C2CMessages, EncodeSharedFilesAnswer){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  SharedFileEntry entry{h, 0x0100007Fu, 4662};
+  auto out=encode_shared_files_answer(std::array{entry});
+  ByteWriter w;
+  w.u32(1);
+  w.hash16(h);
+  w.u32(0x0100007Fu);
+  w.u16(4662);
+  w.u32(0);
+  EXPECT_EQ(out, w.take());
+}
+TEST(C2CMessages, EncodeRequestSources2){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  EXPECT_EQ(encode_request_sources2(h), hex("00112233445566778899aabbccddeeff"));
+}
+TEST(C2CMessages, EncodeAndDecodeAnswerSources2){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  PeerSource src{0x0100007Fu, 4662, 0, 0, *UserHash::from_hex("11111111111111111111111111111111"), 0};
+  auto out=encode_answer_sources2(h, std::array{src});
+  ByteWriter w;
+  w.u8(4);
+  w.hash16(h);
+  w.u16(1);
+  w.u32(0x0100007Fu);
+  w.u16(4662);
+  w.u32(0);
+  w.u16(0);
+  w.hash16(src.user_hash);
+  w.u8(0);
+  EXPECT_EQ(out, w.take());
+  auto decoded=decode_answer_sources2(out);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->hash, h);
+  ASSERT_EQ(decoded->sources.size(), 1u);
+  EXPECT_EQ(decoded->sources[0].client_id, 0x0100007Fu);
+  EXPECT_EQ(decoded->sources[0].port, 4662u);
+  EXPECT_EQ(decoded->sources[0].user_hash, src.user_hash);
+}
+TEST(C2CMessages, EncodeAndDecodeFileDesc){
+  auto out=encode_file_desc(5, "verified");
+  EXPECT_EQ(out, bytes({5,8,0,0,0,'v','e','r','i','f','i','e','d'}));
+  auto decoded=decode_file_desc(out);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->rating, 5u);
+  EXPECT_EQ(decoded->comment, "verified");
+}
 TEST(C2CMessages, EncodeRequestParts){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   auto out=encode_request_parts(h, {100,200,300}, {150,250,350});

@@ -203,6 +203,20 @@ C2CConnection::request_aich_master_hash(const FileHash& h, std::chrono::millisec
   co_return decode_aich_file_hash_ans(rp->payload);
 }
 
+asio::awaitable<tl::expected<SourceExchangeAnswer,std::error_code>>
+C2CConnection::request_sources2(const FileHash& h, std::chrono::milliseconds timeout){
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::REQUESTSOURCES2;
+  req.payload=encode_request_sources2(h);
+  auto sr = co_await conn_.send(req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(op::ANSWERSOURCES2, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  auto ans = decode_answer_sources2(rp->payload);
+  if(!ans) co_return tl::unexpected(ans.error());
+  if(ans->hash != h) co_return tl::unexpected(make_error_code(errc::hash_mismatch));
+  co_return std::move(*ans);
+}
+
 asio::awaitable<tl::expected<AICHRecoveryData,std::error_code>>
 C2CConnection::request_aich_proof(const FileHash& h, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::AICHREQUEST;

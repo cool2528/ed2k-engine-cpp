@@ -506,3 +506,80 @@ TEST(UploadSession, AccountsUploadedBytesAfterSendingPart){
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST(UploadSession, AnswersAskSharedFiles){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "shared.bin";
+  f.size = 1;
+  db.add(f);
+
+  auto self = hello("server");
+  self.client_id = 0x0100007Fu;
+  self.port = 4662;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, self, rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    EXPECT_EQ((co_await read_packet(s)).opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::ASKSHAREDFILES, {});
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.opcode, op::ASKSHAREDFILESANSWER);
+    auto decoded = decode_shared_files_answer(ans.payload);
+    EXPECT_TRUE(decoded.has_value()); if(!decoded) co_return;
+    EXPECT_EQ(decoded->size(), 1u);
+    if(decoded->size() != 1u) co_return;
+    EXPECT_EQ((*decoded)[0].hash, f.hash);
+    EXPECT_EQ((*decoded)[0].client_id, self.client_id);
+    EXPECT_EQ((*decoded)[0].port, self.port);
+    s.close();
+    co_return;
+  });
+}
+
+TEST(UploadSession, AnswersRequestSources2WithEmptySourceList){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "shared.bin";
+  f.size = 1;
+  db.add(f);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    EXPECT_EQ((co_await read_packet(s)).opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::REQUESTSOURCES2, encode_request_sources2(f.hash), ed2k::net::proto::eMule);
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.protocol, ed2k::net::proto::eMule);
+    EXPECT_EQ(ans.opcode, op::ANSWERSOURCES2);
+    auto decoded = decode_answer_sources2(ans.payload);
+    EXPECT_TRUE(decoded.has_value()); if(!decoded) co_return;
+    EXPECT_EQ(decoded->hash, f.hash);
+    EXPECT_TRUE(decoded->sources.empty());
+    s.close();
+    co_return;
+  });
+}

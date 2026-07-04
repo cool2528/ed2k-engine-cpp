@@ -196,6 +196,97 @@ tl::expected<FileHash,std::error_code> decode_file_req_ans_no_fil(std::span<cons
   return h;
 }
 
+std::vector<std::byte> encode_shared_files_answer(std::span<const SharedFileEntry> files){
+  ByteWriter w;
+  w.u32(static_cast<std::uint32_t>(files.size()));
+  for(const auto& f : files) {
+    w.hash16(f.hash);
+    w.u32(f.client_id);
+    w.u16(f.port);
+    w.u32(0); // empty tag set
+  }
+  return w.take();
+}
+
+tl::expected<std::vector<SharedFileEntry>, std::error_code>
+decode_shared_files_answer(std::span<const std::byte> data){
+  ByteReader r(data);
+  const auto count = r.u32();
+  if(count > 1000000) return tl::unexpected(make_error_code(errc::count_too_large));
+  std::vector<SharedFileEntry> out;
+  out.reserve(count);
+  for(std::uint32_t i = 0; i < count; ++i) {
+    SharedFileEntry e;
+    e.hash = r.hash16();
+    e.client_id = r.u32();
+    e.port = r.u16();
+    const auto tags = r.u32();
+    if(tags != 0) return tl::unexpected(make_error_code(errc::unsupported_version));
+    if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+    out.push_back(e);
+  }
+  return out;
+}
+
+std::vector<std::byte> encode_request_sources2(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
+
+std::vector<std::byte> encode_answer_sources2(const FileHash& h, std::span<const PeerSource> sources, std::uint8_t version){
+  ByteWriter w;
+  w.u8(version);
+  w.hash16(h);
+  w.u16(static_cast<std::uint16_t>(sources.size()));
+  for(const auto& s : sources) {
+    w.u32(s.client_id);
+    w.u16(s.port);
+    w.u32(s.server_ip);
+    w.u16(s.server_port);
+    w.hash16(s.user_hash);
+    w.u8(s.crypt_options);
+  }
+  return w.take();
+}
+
+tl::expected<SourceExchangeAnswer, std::error_code> decode_answer_sources2(std::span<const std::byte> data){
+  ByteReader r(data);
+  SourceExchangeAnswer out;
+  out.version = r.u8();
+  out.hash = r.hash16();
+  const auto count = r.u16();
+  out.sources.reserve(count);
+  for(std::uint16_t i = 0; i < count && r.ok(); ++i) {
+    PeerSource s;
+    s.client_id = r.u32();
+    s.port = r.u16();
+    s.server_ip = r.u32();
+    s.server_port = r.u16();
+    s.user_hash = r.hash16();
+    s.crypt_options = r.u8();
+    out.sources.push_back(s);
+  }
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return out;
+}
+
+std::vector<std::byte> encode_file_desc(std::uint8_t rating, std::string_view comment){
+  ByteWriter w;
+  w.u8(rating);
+  w.u32(static_cast<std::uint32_t>(comment.size()));
+  w.blob(std::as_bytes(std::span{comment.data(), comment.size()}));
+  return w.take();
+}
+
+tl::expected<FileDesc, std::error_code> decode_file_desc(std::span<const std::byte> data){
+  ByteReader r(data);
+  FileDesc out;
+  out.rating = r.u8();
+  const auto len = r.u32();
+  auto blob = r.blob(len);
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  if(out.rating > 5) out.rating = 0;
+  out.comment.assign(reinterpret_cast<const char*>(blob.data()), blob.size());
+  return out;
+}
+
 std::vector<std::byte> encode_aich_file_hash_req(const FileHash& h){
   ByteWriter w;
   w.hash16(h);

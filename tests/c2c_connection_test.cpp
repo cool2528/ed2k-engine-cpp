@@ -295,6 +295,35 @@ TEST(C2CConnection, RequestAichMasterHashRoundTrip){
     c.close(); co_return;
   });
 }
+
+TEST(C2CConnection, RequestSources2RoundTrip){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  FileHash fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  PeerSource src{0x0100007Fu, 4662, 0, 0, *UserHash::from_hex("11111111111111111111111111111111"), 0};
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    auto [proto_byte, body] = co_await read_frame_proto(s);
+    EXPECT_EQ(proto_byte, proto::eMule);
+    EXPECT_FALSE(body.empty()); if(body.empty()) co_return;
+    EXPECT_EQ(body[0], std::byte(op::REQUESTSOURCES2));
+    auto req = decode_file_hash_request(std::span<const std::byte>(body).subspan(1));
+    EXPECT_TRUE(req.has_value()); if(!req) co_return;
+    EXPECT_EQ(*req, fh);
+    co_await send_pkt(s, op::ANSWERSOURCES2, encode_answer_sources2(fh, std::array{src}), proto::eMule);
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto r = co_await c.request_sources2(fh, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->hash, fh);
+    EXPECT_EQ(r->sources.size(), 1u); if(r->sources.size() != 1u) co_return;
+    EXPECT_EQ(r->sources[0].client_id, src.client_id);
+    EXPECT_EQ(r->sources[0].port, src.port);
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, RequestAichProofMasterMismatch){
   // 回显的 master_hash 与请求不一致 → hash_mismatch (aMule DownloadClient.cpp:1634 守卫)
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());

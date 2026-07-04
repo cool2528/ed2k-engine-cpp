@@ -54,6 +54,17 @@ std::vector<std::byte> encode_cancel_transfer();
 struct FileStatus { FileHash hash; std::vector<bool> parts; };
 struct FileNameAnswer { FileHash hash; std::string name; };
 struct Block { FileHash hash; std::uint64_t start=0, end=0; std::vector<std::byte> data; };
+struct SharedFileEntry { FileHash hash; std::uint32_t client_id=0; std::uint16_t port=0; };
+struct PeerSource {
+  std::uint32_t client_id=0;
+  std::uint16_t port=0;
+  std::uint32_t server_ip=0;
+  std::uint16_t server_port=0;
+  UserHash user_hash;
+  std::uint8_t crypt_options=0;
+};
+struct SourceExchangeAnswer { std::uint8_t version=0; FileHash hash; std::vector<PeerSource> sources; };
+struct FileDesc { std::uint8_t rating=0; std::string comment; };
 
 tl::expected<HelloInfo,std::error_code>          decode_hello(std::span<const std::byte>);        // OP_HELLO(校验并跳过 0x10 前导)
 tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>); // OP_HELLOANSWER(无前导)
@@ -64,6 +75,13 @@ tl::expected<std::uint16_t,std::error_code>      decode_queue_ranking(std::span<
 tl::expected<Block,std::error_code>              decode_sending_part(std::span<const std::byte>);
 tl::expected<Block,std::error_code>              decode_compressed_part(std::span<const std::byte>);
 tl::expected<FileHash,std::error_code>           decode_file_req_ans_no_fil(std::span<const std::byte>);
+std::vector<std::byte> encode_shared_files_answer(std::span<const SharedFileEntry> files);
+tl::expected<std::vector<SharedFileEntry>, std::error_code> decode_shared_files_answer(std::span<const std::byte>);
+std::vector<std::byte> encode_request_sources2(const FileHash&);
+std::vector<std::byte> encode_answer_sources2(const FileHash&, std::span<const PeerSource> sources, std::uint8_t version = 4);
+tl::expected<SourceExchangeAnswer, std::error_code> decode_answer_sources2(std::span<const std::byte>);
+std::vector<std::byte> encode_file_desc(std::uint8_t rating, std::string_view comment);
+tl::expected<FileDesc, std::error_code> decode_file_desc(std::span<const std::byte>);
 
 // AICH (aMule SHAHashSet) — 两级 Merkle 树恢复数据。详见 aich_checker.hpp / 设计 spec §5。
 // 四个 opcode 均在 OP_EMULEPROT(0xC5) 下，非 eDonkey(0xE3)。

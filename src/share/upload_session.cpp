@@ -174,6 +174,37 @@ UploadSession::send_not_found(const ed2k::FileHash& hash) {
 
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handle(const ed2k::net::Packet& pkt) {
+  if(pkt.opcode == ed2k::peer::op::ASKSHAREDFILES) {
+    std::vector<ed2k::peer::SharedFileEntry> entries;
+    entries.reserve(files_.files().size());
+    for(const auto& file : files_.files()) {
+      entries.push_back({file.hash, self_.client_id, self_.port});
+    }
+    ed2k::net::Packet ans;
+    ans.protocol = ed2k::net::proto::eDonkey;
+    ans.opcode = ed2k::peer::op::ASKSHAREDFILESANSWER;
+    ans.payload = ed2k::peer::encode_shared_files_answer(entries);
+    co_return co_await conn_.send(ans);
+  }
+
+  if(pkt.opcode == ed2k::peer::op::REQUESTSOURCES2) {
+    auto decoded = ed2k::peer::decode_file_hash_request(pkt.payload);
+    if(!decoded) co_return tl::unexpected(decoded.error());
+    const KnownFile* file = files_.find(*decoded);
+    if(!file) co_return co_await send_not_found(*decoded);
+    ed2k::net::Packet ans;
+    ans.protocol = ed2k::net::proto::eMule;
+    ans.opcode = ed2k::peer::op::ANSWERSOURCES2;
+    ans.payload = ed2k::peer::encode_answer_sources2(file->hash, {});
+    co_return co_await conn_.send(ans);
+  }
+
+  if(pkt.opcode == ed2k::peer::op::FILEDESC) {
+    auto decoded = ed2k::peer::decode_file_desc(pkt.payload);
+    if(!decoded) co_return tl::unexpected(decoded.error());
+    co_return tl::expected<void, std::error_code>{};
+  }
+
   if(pkt.opcode == ed2k::peer::op::STARTUPLOADREQ) {
     auto decoded = ed2k::peer::decode_file_hash_request(pkt.payload);
     if(!decoded) co_return tl::unexpected(decoded.error());
