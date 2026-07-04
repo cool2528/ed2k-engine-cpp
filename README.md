@@ -23,7 +23,7 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | Live real-peer validation | ✅ vs local aMule 2.3.3 + real eMule server (see [Live tests](#live-tests)) |
 | Linux / CI | ⏳ planned (R0-2/R0-3) |
 
-Mock loopback tests: **229 pass, 5 skip** (live-gated only); live **4/4 green**. Version: `0.1.0` (→ `1.0.0` at release).
+Mock loopback tests: **229 pass, 5 skip** (live-gated only); live **4/4 green**. Version: `1.0.0`.
 
 ## Build
 

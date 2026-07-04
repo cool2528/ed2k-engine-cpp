@@ -3,7 +3,7 @@
 All notable changes to ed2kengine. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
-## [Unreleased] — toward 1.0.0
+## [1.0.0] — 2026-07-04
 
 ### Fixed — live protocol fidelity vs aMule 2.3.3 (R0-1)
 Discovered by byte-comparison against aMule source while validating
