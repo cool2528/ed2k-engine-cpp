@@ -8,6 +8,7 @@
 #include "ed2k/core/hash.hpp"        // UserHash / FileHash / MD4Hash / IPv4
 #include "ed2k/codec/tag.hpp"        // codec::Tag
 #include "ed2k/server/search_query.hpp"
+#include "ed2k/share/known_file.hpp"
 namespace ed2k::server {
 
 struct LoginParams {
@@ -24,6 +25,7 @@ std::vector<std::byte> encode_search(const SearchExpr&);                       /
 std::vector<std::byte> encode_get_sources(const FileHash&, std::uint64_t size);
 std::vector<std::byte> encode_callback_request(std::uint32_t client_id);
 std::vector<std::byte> encode_get_server_list();
+std::vector<std::byte> encode_offer_files(std::span<const ed2k::share::KnownFile>);
 
 // S→C 解码结构
 struct IdChange        { std::uint32_t id=0, flags=0; bool high_id() const { return id>=0x1000000u; } };

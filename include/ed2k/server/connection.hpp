@@ -12,6 +12,7 @@
 #include "ed2k/net/connection.hpp"     // net::Connection
 #include "ed2k/server/messages.hpp"    // LoginParams/SearchResultItem/FoundSources/decode_*
 #include "ed2k/server/search_query.hpp"// SearchExpr
+#include "ed2k/share/known_file.hpp"
 namespace ed2k::server {
 
 struct LoginResult { std::uint32_t client_id=0, flags=0; bool high_id=false; };
@@ -37,6 +38,8 @@ class ServerConnection {
     get_sources(const FileHash&, std::uint64_t size, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     callback_request(std::uint32_t client_id, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<void,std::error_code>>
+    publish_files(std::span<const ed2k::share::KnownFile> files);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     receive_events(std::chrono::milliseconds timeout);
   void close() noexcept;

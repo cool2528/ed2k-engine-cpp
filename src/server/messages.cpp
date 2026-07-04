@@ -9,6 +9,7 @@ using codec::Tag;
 namespace {
 Tag string_tag(std::uint8_t id, std::string_view v){ Tag t; t.name_id=id; t.value=std::string(v); return t; }
 Tag u32_tag(std::uint8_t id, std::uint32_t v){ Tag t; t.name_id=id; t.value=std::uint64_t(v); return t; }
+Tag u64_tag(std::uint8_t id, std::uint64_t v){ Tag t; t.name_id=id; t.value=v; return t; }
 }
 
 std::vector<std::byte> encode_login(const LoginParams& p){
@@ -32,6 +33,20 @@ std::vector<std::byte> encode_callback_request(std::uint32_t client_id){
   ByteWriter w; w.u32(client_id); return w.take();
 }
 std::vector<std::byte> encode_get_server_list(){ return {}; }
+std::vector<std::byte> encode_offer_files(std::span<const ed2k::share::KnownFile> files){
+  ByteWriter w;
+  w.u32(static_cast<std::uint32_t>(files.size()));
+  for(const auto& f : files){
+    w.hash16(f.hash);
+    std::vector<Tag> tags;
+    tags.push_back(string_tag(tag::FT_FILENAME, f.name));
+    tags.push_back(u64_tag(tag::FT_FILESIZE, f.size));
+    tags.push_back(string_tag(tag::FT_AICH_FILEHASH, f.aich_root.to_base32()));
+    w.u32(static_cast<std::uint32_t>(tags.size()));
+    codec::write_taglist(w, tags);
+  }
+  return w.take();
+}
 
 tl::expected<IdChange,std::error_code> decode_id_change(std::span<const std::byte> data){
   ByteReader r(data);

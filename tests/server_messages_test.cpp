@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
+#include <array>
 #include "ed2k/server/messages.hpp"
 #include "ed2k/server/search_query.hpp"
+#include "ed2k/share/known_file.hpp"
 using namespace ed2k; using namespace ed2k::server;
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
   std::vector<std::byte> v; for(int x:xs) v.push_back(std::byte(x)); return v;
@@ -44,6 +46,58 @@ TEST(ServerMessages, EncodeCallbackRequest){
 }
 TEST(ServerMessages, EncodeGetServerList){
   EXPECT_TRUE(encode_get_server_list().empty());
+}
+TEST(ServerMessages, EncodeOfferFilesUsesAichAndUint64SizeTags){
+  share::KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "big.bin";
+  f.size = 0x100000001ull;
+
+  auto out = encode_offer_files(std::array<share::KnownFile, 1>{f});
+  codec::ByteReader r(out);
+  EXPECT_EQ(r.u32(), 1u);
+  EXPECT_EQ(r.hash16(), f.hash);
+  auto tags = codec::read_taglist(r, r.u32());
+  ASSERT_TRUE(tags.has_value());
+  ASSERT_EQ(tags->size(), 3u);
+  EXPECT_EQ((*tags)[0].name_id, tag::FT_FILENAME);
+  EXPECT_EQ(std::get<std::string>((*tags)[0].value), "big.bin");
+  EXPECT_EQ((*tags)[1].name_id, tag::FT_FILESIZE);
+  EXPECT_EQ(std::get<std::uint64_t>((*tags)[1].value), 0x100000001ull);
+  EXPECT_EQ((*tags)[2].name_id, tag::FT_AICH_FILEHASH);
+  EXPECT_EQ(std::get<std::string>((*tags)[2].value), f.aich_root.to_base32());
+  EXPECT_TRUE(r.ok());
+  EXPECT_EQ(r.remaining(), 0u);
+}
+TEST(ServerMessages, EncodeOfferFilesMultipleFilesPreservesCountAndOrder){
+  share::KnownFile a;
+  a.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  a.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  a.name = "a.bin";
+  a.size = 1;
+  share::KnownFile b;
+  b.hash = *FileHash::from_hex("ffeeddccbbaa99887766554433221100");
+  b.aich_root = *AICHHash::from_base32("CI2FM6EQUPY5GRRHUKFTKW6DBQ6TNNKZ");
+  b.name = "b.bin";
+  b.size = 2;
+
+  std::array files{a, b};
+  auto out = encode_offer_files(files);
+  codec::ByteReader r(out);
+  EXPECT_EQ(r.u32(), 2u);
+  EXPECT_EQ(r.hash16(), a.hash);
+  auto tags_a = codec::read_taglist(r, r.u32());
+  ASSERT_TRUE(tags_a.has_value());
+  ASSERT_EQ(tags_a->size(), 3u);
+  EXPECT_EQ(std::get<std::string>((*tags_a)[0].value), "a.bin");
+  EXPECT_EQ(r.hash16(), b.hash);
+  auto tags_b = codec::read_taglist(r, r.u32());
+  ASSERT_TRUE(tags_b.has_value());
+  ASSERT_EQ(tags_b->size(), 3u);
+  EXPECT_EQ(std::get<std::string>((*tags_b)[0].value), "b.bin");
+  EXPECT_TRUE(r.ok());
+  EXPECT_EQ(r.remaining(), 0u);
 }
 TEST(ServerMessages, EncodeSearchDelegates){
   SearchExpr k = Keyword{"foo"};

@@ -91,6 +91,13 @@ ServerConnection::callback_request(std::uint32_t client_id, std::chrono::millise
 }
 
 asio::awaitable<tl::expected<void,std::error_code>>
+ServerConnection::publish_files(std::span<const ed2k::share::KnownFile> files){
+  net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::OFFERFILES;
+  req.payload = encode_offer_files(files);
+  co_return co_await conn_.send(req);
+}
+
+asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::receive_events(std::chrono::milliseconds timeout){
   auto rp = co_await pump_until(op::NONE, timeout);
   if(!rp) co_return tl::unexpected(rp.error());

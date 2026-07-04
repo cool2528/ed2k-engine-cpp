@@ -1,9 +1,11 @@
 #include <cstdio>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <vector>
 #include <fstream>
 #include <chrono>
+#include <optional>
 #include "ed2k/version.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
@@ -13,6 +15,7 @@
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/server/connection.hpp"
 #include "ed2k/server/search_query.hpp"
+#include "ed2k/share/known_file.hpp"
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 namespace asio = boost::asio;
@@ -23,6 +26,7 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool login <server.met> [--ip:x.x.x.x] [--port:n]\n"
   "       ed2k-tool search <server.met> <keyword>\n"
   "       ed2k-tool sources <server.met> <ed2k-link>\n"
+  "       ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]\n"
   "       ed2k-tool download <ed2k-link> [--out:PATH] [--server:server.met]"); return 2; }
 static std::vector<std::byte> read_all(const char* p){
   std::ifstream f(p,std::ios::binary); std::vector<std::byte> v;
@@ -126,6 +130,40 @@ int main(int argc,char** argv){
       for(const auto& s : gs->sources)
         std::printf("%s  id=0x%08X  port=%u  %s\n", IPv4::from_wire(s.id).to_dotted().c_str(), s.id, s.port, s.low_id()?"LowID":"HighID");
       std::printf("(%zu sources)\n", gs->sources.size());
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
+  }
+  if(cmd=="publish"){
+    if(argc<3) return usage();
+    std::filesystem::path dir = argv[2];
+    std::vector<std::byte> metbytes;
+    std::optional<ed2k::app::ServerTarget> ov;
+    for(int i=3;i<argc;++i){
+      std::string a=argv[i];
+      if(a.rfind("--server:",0)==0){
+        metbytes = read_all(a.substr(9).c_str());
+      } else if(a.rfind("--ip:",0)==0){
+        auto ip=IPv4::from_dotted(a.substr(5));
+        if(ip){ ed2k::app::ServerTarget t; t.ip=*ip; ov=t; }
+      } else if(a.rfind("--port:",0)==0){
+        if(ov) ov->port=std::uint16_t(std::stoi(a.substr(7)));
+      }
+    }
+    ed2k::share::KnownFileDB db;
+    auto scan = db.scan_dir(dir);
+    if(!scan){ std::printf("error: %s\n", scan.error().message().c_str()); return 1; }
+    if(db.files().empty()){ std::printf("error: no regular files in %s\n", dir.string().c_str()); return 1; }
+    ed2k::net::IoRuntime rt; int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=4662;
+      p.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+      auto lg = co_await ed2k::app::login_with_rotation(rt.executor(), metbytes, ov, p, std::chrono::milliseconds(15000));
+      if(!lg){ std::printf("error: %s\n", lg.error().message().c_str()); rc=1; rt.stop(); co_return; }
+      auto pr = co_await lg->conn.publish_files(db.files());
+      if(!pr){ std::printf("error: %s\n", pr.error().message().c_str()); rc=1; }
+      else std::printf("published %zu files\n", db.files().size());
+      lg->conn.close();
       rt.stop(); co_return;
     }, asio::detached);
     rt.run(); return rc;

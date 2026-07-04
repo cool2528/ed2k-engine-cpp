@@ -8,6 +8,7 @@ namespace op {
 constexpr std::uint8_t LOGINREQUEST     = 0x01;
 constexpr std::uint8_t REJECT            = 0x05;
 constexpr std::uint8_t GETSERVERLIST     = 0x14;
+constexpr std::uint8_t OFFERFILES        = 0x15;
 constexpr std::uint8_t SEARCHREQUEST     = 0x16;
 constexpr std::uint8_t GETSOURCES        = 0x19;
 constexpr std::uint8_t CALLBACKREQUEST   = 0x1C;
@@ -32,6 +33,7 @@ constexpr std::uint8_t FT_FILENAME      = 0x01;
 constexpr std::uint8_t FT_FILESIZE      = 0x02;
 constexpr std::uint8_t FT_FILETYPE      = 0x03;
 constexpr std::uint8_t FT_FILEFORMAT    = 0x04;
+constexpr std::uint8_t FT_AICH_FILEHASH = 0x11;
 constexpr std::uint8_t FT_SOURCES       = 0x15;
 constexpr std::uint8_t ST_SERVERNAME    = 0x01;
 constexpr std::uint8_t ST_DESCRIPTION   = 0x0B;
