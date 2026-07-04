@@ -220,4 +220,17 @@ std::vector<std::pair<std::uint64_t,std::uint64_t>> PartFile::gaps() const {
   }
   return out;
 }
+tl::expected<ed2k::share::KnownFile,std::error_code> PartFile::to_known_file() const {
+  if(!complete()) return tl::unexpected(make_error_code(errc::hash_mismatch));
+  auto aich = aich_hash_file(path_);
+  if(!aich) return tl::unexpected(aich.error());
+  ed2k::share::KnownFile f;
+  f.hash = file_hash_;
+  f.aich_root = *aich;
+  f.part_hashes = part_hashes_;
+  f.path = path_;
+  f.name = path_.filename().string();
+  f.size = size_;
+  return f;
+}
 }

@@ -5,7 +5,7 @@ void write_tag(ByteWriter& w, const Tag& t){
     std::holds_alternative<std::string>(t.value) ? tagtype::String :
     std::holds_alternative<MD4Hash>(t.value)     ? tagtype::Hash16 :
     std::holds_alternative<std::vector<std::byte>>(t.value) ? tagtype::Blob :
-                                                   tagtype::Uint32;
+    (std::get<std::uint64_t>(t.value) > 0xFFFFFFFFull ? tagtype::Uint64 : tagtype::Uint32);
   if(t.has_string_name()){
     w.u8(type); w.string16(t.name_str);
   } else {
@@ -15,6 +15,7 @@ void write_tag(ByteWriter& w, const Tag& t){
     case tagtype::String: w.string16(std::get<std::string>(t.value)); break;
     case tagtype::Hash16: w.hash16(std::get<MD4Hash>(t.value)); break;
     case tagtype::Uint32: w.u32(std::uint32_t(std::get<std::uint64_t>(t.value))); break;
+    case tagtype::Uint64: w.u64(std::get<std::uint64_t>(t.value)); break;
     case tagtype::Blob: { auto& b=std::get<std::vector<std::byte>>(t.value);
       w.u32(std::uint32_t(b.size())); w.blob(b); } break;
   }

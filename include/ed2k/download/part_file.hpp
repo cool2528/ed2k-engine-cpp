@@ -10,6 +10,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include "ed2k/core/hash.hpp"
+#include "ed2k/share/known_file.hpp"
 #include "ed2k/util/error.hpp"
 #include "ed2k/hash/aich_hasher.hpp"   // AICH_BLOCK_SIZE / PART_SIZE 单一定义源
 namespace ed2k::download {
@@ -29,6 +30,7 @@ class PartFile {
   std::vector<std::pair<std::size_t,std::size_t>> pending_blocks() const;          // (part, block_in_part)
   bool complete() const noexcept;
   std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps() const;
+  tl::expected<ed2k::share::KnownFile,std::error_code> to_known_file() const;
  private:
   std::filesystem::path path_;
   std::filesystem::path met_path_;   // path_ + ".part.met" (P4c-3 M2 续传持久化)
