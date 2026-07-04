@@ -88,7 +88,15 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
                                           server::ServerConnection* server_conn,
                                           peer::InboundListener* listener)
   : ex_(ex), disk_ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich),
-    sources_(std::move(sources)), server_conn_(server_conn), listener_(listener) {}
+    sources_(std::move(sources)),
+    server_conn_(server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt),
+    listener_(listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt) {}
+
+MultiSourceDownload MultiSourceDownload::Builder::build() {
+  return MultiSourceDownload(net_ex_, disk_ex_, std::move(out_), hash_, size_,
+                             std::move(aich_), std::move(sources_),
+                             std::move(server_), std::move(listener_));
+}
 
 // === raccoon 多源并发 (P4c-3) ===
 // 设计 spec §3: 单 io_context/单网络线程 + co_spawn 多 worker + 共享无锁状态。
@@ -108,15 +116,15 @@ fetch_hashset(boost::asio::any_io_executor ex,
               const ed2k::server::SourceEndpoint& source, const FileHash& hash,
               std::uint64_t size,
               std::chrono::milliseconds timeout,
-              ed2k::server::ServerConnection* server_conn,
-              ed2k::peer::InboundListener* listener){
+              std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
+              std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener){
   bool accepted = false;   // LowID 回调路径下我方是 TCP acceptor, 握手角色随之翻转
   std::optional<ed2k::peer::C2CConnection> conn_opt;
   if(source.low_id()){
     if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
-    auto cb = co_await server_conn->callback_request(source.id, timeout);
+    auto cb = co_await server_conn->get().callback_request(source.id, timeout);
     if(!cb) co_return tl::unexpected(cb.error());
-    auto acc = co_await listener->accept(timeout);
+    auto acc = co_await listener->get().accept(timeout);
     if(!acc) co_return tl::unexpected(acc.error());
     conn_opt.emplace(std::move(*acc));
     accepted = true;
@@ -184,8 +192,8 @@ peer_worker(boost::asio::any_io_executor ex,
             std::vector<bool> pre_parts,
             SharedState& st,
             std::chrono::milliseconds timeout, std::size_t max_retries,
-            ed2k::server::ServerConnection* server_conn,
-            ed2k::peer::InboundListener* listener,
+            std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
+            std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
             ResultCh& done_ch){
   auto finish = [&](std::error_code ec){
     if(ec && !st.first_err) st.first_err = ec;   // 首个失败错误 (单网络线程 → 无竞争)
@@ -204,9 +212,9 @@ peer_worker(boost::asio::any_io_executor ex,
     bool accepted = false;
     if(source.low_id()){
       if(!server_conn || !listener){ finish(make_error_code(errc::connect_failed)); co_return; }
-      auto cb = co_await server_conn->callback_request(source.id, timeout);
+      auto cb = co_await server_conn->get().callback_request(source.id, timeout);
       if(!cb){ finish(cb.error()); co_return; }
-      auto acc = co_await listener->accept(timeout);
+      auto acc = co_await listener->get().accept(timeout);
       if(!acc){ finish(acc.error()); co_return; }
       conn_opt.emplace(std::move(*acc));
       accepted = true;

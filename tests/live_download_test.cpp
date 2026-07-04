@@ -75,9 +75,13 @@ TEST(LiveDownload, LocalPeerCompletes){
   std::filesystem::remove(out);
   ed2k::net::IoRuntime rt;
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    ed2k::download::MultiSourceDownload dl(rt.executor(), out, f->hash, f->size,
-                                           std::nullopt, std::vector{src},
-                                           nullptr, nullptr);
+    auto dl = ed2k::download::MultiSourceDownload::Builder(rt.executor())
+                .out(out)
+                .hash(f->hash)
+                .size(f->size)
+                .aich(std::nullopt)
+                .sources(std::vector{src})
+                .build();
     auto r = co_await dl.run(std::chrono::seconds(300), 3);
     EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
     co_return;

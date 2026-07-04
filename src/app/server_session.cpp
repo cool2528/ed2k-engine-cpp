@@ -96,9 +96,15 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
     catch(const std::exception&) { /* bind 失败 — 保持 listener 为空; LowID 源优雅跳过 */ }
   }
   // M2: aich=nullopt -> MultiSourceDownload 走 part-MD4 兜底路径
-  ed2k::download::MultiSourceDownload dl(ex, opts.out_path, link.hash, link.size,
-                                         std::nullopt, std::move(gs->sources),
-                                         &lg->conn, listener.has_value() ? &*listener : nullptr);
+  auto builder = ed2k::download::MultiSourceDownload::Builder(ex)
+                   .out(opts.out_path)
+                   .hash(link.hash)
+                   .size(link.size)
+                   .aich(std::nullopt)
+                   .sources(std::move(gs->sources))
+                   .server(lg->conn);
+  if(listener) builder.listener(*listener);
+  auto dl = builder.build();
   co_return co_await dl.run(opts.total_timeout, 3);
 }
 }
