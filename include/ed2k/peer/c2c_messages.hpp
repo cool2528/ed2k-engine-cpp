@@ -40,6 +40,9 @@ std::vector<std::byte> encode_req_filename_answer(const FileHash&, std::string_v
 std::vector<std::byte> encode_file_status(const FileHash&, std::span<const bool> parts);
 std::vector<std::byte> encode_hashset_answer(const FileHash&, std::span<const PartHash> part_hashes);
 std::vector<std::byte> encode_start_upload(const FileHash&);
+std::vector<std::byte> encode_queue_ranking(std::uint16_t rank);
+std::vector<std::byte> encode_reask_file_ping(const FileHash&);
+std::vector<std::byte> encode_reask_ack(std::uint16_t rank);
 std::vector<std::byte> encode_request_parts(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends);
 struct RequestParts { FileHash hash; std::array<std::uint64_t,3> starts{}, ends{}; };
 tl::expected<RequestParts,std::error_code> decode_request_parts(std::span<const std::byte>);

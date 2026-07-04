@@ -8,6 +8,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/buffer.hpp>
@@ -18,6 +19,7 @@
 #include "ed2k/hash/aich_hasher.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
 #include "ed2k/share/known_file.hpp"
+#include "ed2k/share/upload_queue.hpp"
 #include "ed2k/share/upload_session.hpp"
 #include "mock_peer.hpp"
 
@@ -43,6 +45,12 @@ static HelloInfo hello(std::string name){
   h.version = 0x3C;
   h.port = 4662;
   h.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  return h;
+}
+
+static HelloInfo hello_with_hash(std::string name, std::string_view hash){
+  auto h = hello(std::move(name));
+  h.user_hash = *UserHash::from_hex(hash);
   return h;
 }
 
@@ -296,4 +304,133 @@ TEST(UploadSession, AnswersAichRecoveryRequest){
   });
   std::error_code ec;
   std::filesystem::remove(path, ec);
+}
+
+TEST(UploadSession, AcceptsStartUploadWhenQueueSlotAvailable){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "queued.bin";
+  f.size = 1;
+  db.add(f);
+  UploadQueue queue(1);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), &queue);
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::STARTUPLOADREQ, encode_start_upload(f.hash));
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.opcode, op::ACCEPTUPLOADREQ);
+    EXPECT_TRUE(ans.payload.empty());
+    s.close();
+    co_return;
+  });
+}
+
+TEST(UploadSession, QueuesStartUploadWhenSlotsAreFull){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "queued.bin";
+  f.size = 1;
+  db.add(f);
+  UploadQueue queue(1);
+  queue.enqueue(*UserHash::from_hex("ffffffffffffffffffffffffffffffff"), f.hash);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), &queue);
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::STARTUPLOADREQ, encode_start_upload(f.hash));
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.opcode, op::QUEUERANKING);
+    auto rank = decode_queue_ranking(ans.payload);
+    EXPECT_TRUE(rank.has_value());
+    if(!rank) co_return;
+    EXPECT_EQ(*rank, 1u);
+    s.close();
+    co_return;
+  });
+}
+
+TEST(UploadSession, AcceptsQueuedPeerAfterSlotReleaseOnReask){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "queued.bin";
+  f.size = 1;
+  db.add(f);
+  UploadQueue queue(1);
+
+  tcp::acceptor acceptor(rt.context(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const auto port = acceptor.local_endpoint().port();
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    for(int i = 0; i < 2; ++i) {
+      auto [ec, sock] = co_await acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      asio::co_spawn(rt.context(), [&, s = std::move(sock)]() mutable -> asio::awaitable<void>{
+        UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), &queue);
+        (void)co_await session.run(2s);
+        co_return;
+      }, asio::detached);
+    }
+    co_return;
+  }, asio::detached);
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c1(rt.executor());
+    auto cr1 = co_await c1.connect(*IPv4::from_dotted("127.0.0.1"), port, 2s);
+    EXPECT_TRUE(cr1.has_value()); if(!cr1) co_return;
+    auto hs1 = co_await c1.handshake(hello_with_hash("client-1", "11111111111111111111111111111111"), 2s);
+    EXPECT_TRUE(hs1.has_value()); if(!hs1) co_return;
+    auto up1 = co_await c1.start_upload(f.hash, 2s);
+    EXPECT_TRUE(up1.has_value()); if(!up1) co_return;
+
+    C2CConnection c2(rt.executor());
+    auto cr2 = co_await c2.connect(*IPv4::from_dotted("127.0.0.1"), port, 2s);
+    EXPECT_TRUE(cr2.has_value()); if(!cr2) co_return;
+    auto hs2 = co_await c2.handshake(hello_with_hash("client-2", "22222222222222222222222222222222"), 2s);
+    EXPECT_TRUE(hs2.has_value()); if(!hs2) co_return;
+    auto queued = co_await c2.start_upload(f.hash, 2s);
+    EXPECT_FALSE(queued.has_value());
+    if(queued) co_return;
+    EXPECT_EQ(queued.error(), make_error_code(errc::upload_queued));
+
+    c1.close();
+    asio::steady_timer t(rt.context());
+    t.expires_after(20ms);
+    co_await t.async_wait(asio::use_awaitable);
+
+    auto accepted = co_await c2.start_upload(f.hash, 2s);
+    EXPECT_TRUE(accepted.has_value());
+    c2.close();
+    co_return;
+  });
 }

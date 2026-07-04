@@ -115,6 +115,18 @@ TEST(C2CMessages, EncodeStartUpload){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   EXPECT_EQ(encode_start_upload(h), hex("00112233445566778899aabbccddeeff"));
 }
+TEST(C2CMessages, EncodeQueueRanking){
+  auto out=encode_queue_ranking(42);
+  EXPECT_EQ(out, bytes({42,0}));
+}
+TEST(C2CMessages, EncodeUdpReaskFilePing){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  EXPECT_EQ(encode_reask_file_ping(h), hex("00112233445566778899aabbccddeeff"));
+}
+TEST(C2CMessages, EncodeUdpReaskAck){
+  auto out=encode_reask_ack(42);
+  EXPECT_EQ(out, bytes({42,0}));
+}
 TEST(C2CMessages, EncodeRequestParts){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   auto out=encode_request_parts(h, {100,200,300}, {150,250,350});

@@ -106,6 +106,17 @@ UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
                              asio::any_io_executor disk_executor)
   : conn_(std::move(socket)), files_(files), self_(std::move(self)), disk_executor_(std::move(disk_executor)) {}
 
+UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
+                             const KnownFileDB& files,
+                             ed2k::peer::HelloInfo self,
+                             asio::any_io_executor disk_executor,
+                             UploadQueue* queue)
+  : conn_(std::move(socket)),
+    files_(files),
+    self_(std::move(self)),
+    disk_executor_(std::move(disk_executor)),
+    queue_(queue) {}
+
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handshake(std::chrono::milliseconds timeout) {
   auto rp = co_await conn_.recv(timeout);
@@ -114,6 +125,7 @@ UploadSession::handshake(std::chrono::milliseconds timeout) {
     co_return tl::unexpected(make_error_code(errc::server_protocol_error));
   auto peer = ed2k::peer::decode_hello(rp->payload);
   if(!peer) co_return tl::unexpected(peer.error());
+  peer_ = *peer;
   ed2k::net::Packet ans;
   ans.protocol = ed2k::net::proto::eDonkey;
   ans.opcode = ed2k::peer::op::HELLOANSWER;
@@ -134,6 +146,28 @@ UploadSession::send_not_found(const ed2k::FileHash& hash) {
 
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handle(const ed2k::net::Packet& pkt) {
+  if(pkt.opcode == ed2k::peer::op::STARTUPLOADREQ) {
+    auto decoded = ed2k::peer::decode_file_hash_request(pkt.payload);
+    if(!decoded) co_return tl::unexpected(decoded.error());
+    const KnownFile* file = files_.find(*decoded);
+    if(!file) co_return co_await send_not_found(*decoded);
+
+    ed2k::net::Packet ans;
+    ans.protocol = ed2k::net::proto::eDonkey;
+    if(!queue_ || !peer_) {
+      ans.opcode = ed2k::peer::op::ACCEPTUPLOADREQ;
+    } else {
+      auto decision = queue_->enqueue(peer_->user_hash, *decoded);
+      if(decision.state == UploadQueueState::accepted) {
+        ans.opcode = ed2k::peer::op::ACCEPTUPLOADREQ;
+      } else {
+        ans.opcode = ed2k::peer::op::QUEUERANKING;
+        ans.payload = ed2k::peer::encode_queue_ranking(decision.rank);
+      }
+    }
+    co_return co_await conn_.send(ans);
+  }
+
   if(pkt.opcode == ed2k::peer::op::REQUESTPARTS) {
     auto decoded = ed2k::peer::decode_request_parts(pkt.payload);
     if(!decoded) co_return tl::unexpected(decoded.error());
@@ -266,8 +300,10 @@ UploadSession::run(std::chrono::milliseconds timeout) {
   while(true) {
     auto rp = co_await conn_.recv(timeout);
     if(!rp) {
-      if(rp.error() == make_error_code(errc::connection_closed))
+      if(rp.error() == make_error_code(errc::connection_closed)) {
+        if(queue_ && peer_) queue_->remove(peer_->user_hash);
         co_return tl::expected<void, std::error_code>{};
+      }
       co_return tl::unexpected(rp.error());
     }
     auto hr = co_await handle(*rp);

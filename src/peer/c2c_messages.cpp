@@ -72,6 +72,13 @@ std::vector<std::byte> encode_hashset_answer(const FileHash& h, std::span<const 
   return w.take();
 }
 std::vector<std::byte> encode_start_upload(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
+std::vector<std::byte> encode_queue_ranking(std::uint16_t rank){
+  ByteWriter w;
+  w.u16(rank);
+  return w.take();
+}
+std::vector<std::byte> encode_reask_file_ping(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
+std::vector<std::byte> encode_reask_ack(std::uint16_t rank){ return encode_queue_ranking(rank); }
 std::vector<std::byte> encode_request_parts(const FileHash& h, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends){
   ByteWriter w; w.hash16(h);
   for(auto s : starts) w.u32(s);
