@@ -21,6 +21,7 @@
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/share/upload_queue.hpp"
 #include "ed2k/share/upload_session.hpp"
+#include "ed2k/share/upload_throttler.hpp"
 #include "mock_peer.hpp"
 
 using namespace ed2k;
@@ -433,4 +434,40 @@ TEST(UploadSession, AcceptsQueuedPeerAfterSlotReleaseOnReask){
     c2.close();
     co_return;
   });
+}
+
+TEST(UploadSession, ThrottlesSendingPartFrames){
+  ed2k::net::IoRuntime rt;
+  auto data = sample_data(12000);
+  auto path = temp_file("ed2k-upload-session-throttled.bin");
+  write_file(path, data);
+  KnownFileDB db;
+  auto f = known_file_for(path, data);
+  db.add(f);
+  UploadBandwidthThrottler throttler(rt.executor(), 512000);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), nullptr, &throttler);
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto hs = co_await c.handshake(hello("client"), 2s);
+    EXPECT_TRUE(hs.has_value()); if(!hs) co_return;
+
+    auto start = std::chrono::steady_clock::now();
+    auto blocks = co_await c.request_blocks(f.hash, {0,0,0}, {12000,0,0}, 2s);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_TRUE(blocks.has_value()); if(!blocks) co_return;
+    EXPECT_GE(elapsed, 10ms);
+    c.close();
+    co_return;
+  });
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
 }

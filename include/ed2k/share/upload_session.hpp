@@ -9,6 +9,7 @@
 #include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/share/upload_queue.hpp"
+#include "ed2k/share/upload_throttler.hpp"
 
 namespace ed2k::share {
 
@@ -26,6 +27,12 @@ class UploadSession {
                 ed2k::peer::HelloInfo self,
                 boost::asio::any_io_executor disk_executor,
                 UploadQueue* queue);
+  UploadSession(boost::asio::ip::tcp::socket&& socket,
+                const KnownFileDB& files,
+                ed2k::peer::HelloInfo self,
+                boost::asio::any_io_executor disk_executor,
+                UploadQueue* queue,
+                UploadBandwidthThrottler* throttler);
 
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     run(std::chrono::milliseconds timeout);
@@ -48,6 +55,7 @@ class UploadSession {
   std::optional<ed2k::peer::HelloInfo> peer_;
   boost::asio::any_io_executor disk_executor_;
   UploadQueue* queue_ = nullptr;
+  UploadBandwidthThrottler* throttler_ = nullptr;
 };
 
 } // namespace ed2k::share
