@@ -3,12 +3,15 @@ name: build
 # R0-2/R0-3 CI. Matrix build (Windows MSVC + Ubuntu GCC) via vcpkg manifest mode.
 # Live tests skip by default (no ED2K_LIVE) — they need a real eMule server (R0-1).
 #
-# vcpkg versioning note: manifest mode with a pinned builtin-baseline requires the
-# local vcpkg checkout to be a *full* (non-shallow) clone whose HEAD is at or beyond
-# the baseline commit — otherwise the version database lacks entries the baseline
-# references (e.g. boost-asio@1.91.0). We therefore checkout the exact baseline
-# commit in the runner's vcpkg and re-bootstrap. Compiled deps are cached via the
-# x-gha binary source (GitHub Actions cache).
+# vcpkg: a fresh full clone is pinned to the vcpkg.json builtin-baseline commit
+# (cached across runs by baseline). This sidesteps runner-image vcpkg state
+# (local port modifications on Linux, version drift on Windows). vcpkg manifest
+# versioning requires a *full* (non-shallow) clone at >= the baseline commit so
+# the version database has every entry the baseline references.
+#
+# Windows pins to windows-2022 (VS 2022) to match the `default` preset's
+# "Visual Studio 17 2022" generator; windows-latest now ships VS 18 (2025).
+# Compiled deps are cached via the x-gha binary source (GitHub Actions cache).
 
 on:
   push:
@@ -27,7 +30,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2022
             preset: default
           - os: ubuntu-latest
             preset: linux
@@ -42,29 +45,33 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Set up vcpkg (checkout baseline commit)
+      - name: Read vcpkg baseline
+        id: baseline
+        shell: bash
+        run: |
+          BASELINE=$(grep builtin-baseline vcpkg.json | head -1 | sed 's/.*"\([0-9a-f]\{40\}\)".*/\1/')
+          echo "commit=$BASELINE" >> "$GITHUB_OUTPUT"
+          echo "Baseline commit: $BASELINE"
+
+      - name: Cache vcpkg clone
+        id: cache-vcpkg
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg
+          key: vcpkg-${{ steps.baseline.outputs.commit }}
+
+      - name: Set up vcpkg (full clone at baseline commit)
         shell: bash
         run: |
           set -e
-          BASELINE=$(grep builtin-baseline vcpkg.json | head -1 | sed 's/.*"\([0-9a-f]\{40\}\)".*/\1/')
-          echo "Baseline commit: $BASELINE"
-          # Use the runner's pre-installed vcpkg (full clone) when available;
-          # otherwise fall back to a fresh full clone.
-          VCPKG_DIR="${VCPKG_INSTALLATION_ROOT:-}"
-          if [ -z "$VCPKG_DIR" ] || [ ! -d "$VCPKG_DIR/.git" ]; then
-            VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+          VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+          if [ ! -d "$VCPKG_DIR/.git" ]; then
             git clone https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
           fi
-          # Pin the vcpkg tree to the exact baseline commit so the version database
-          # matches what vcpkg.json references (full history is present on runners).
-          # `-f` discards any local modifications the runner image carries (some
-          # Linux images patch ports/); if the commit is absent (shallow image),
-          # fetch it explicitly first.
+          # Pin to the exact baseline commit (full history present → version
+          # database matches vcpkg.json). Force discards any restored-tree drift.
           git -C "$VCPKG_DIR" fetch --tags origin
-          git -C "$VCPKG_DIR" checkout -f "$BASELINE" 2>/dev/null || {
-            git -C "$VCPKG_DIR" fetch origin "$BASELINE"
-            git -C "$VCPKG_DIR" checkout -f "$BASELINE"
-          }
+          git -C "$VCPKG_DIR" checkout -f "${{ steps.baseline.outputs.commit }}"
           "$VCPKG_DIR/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$VCPKG_DIR" >> "$GITHUB_ENV"
           "$VCPKG_DIR/vcpkg" --version
