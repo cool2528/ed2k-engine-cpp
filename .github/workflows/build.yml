@@ -1,15 +1,23 @@
 name: build
 
-# R0-2/R0-3 CI scaffolding. Matrix build (Windows MSVC + Ubuntu GCC) via vcpkg manifest.
+# R0-2/R0-3 CI. Matrix build (Windows MSVC + Ubuntu GCC) via vcpkg manifest mode.
 # Live tests skip by default (no ED2K_LIVE) — they need a real eMule server (R0-1).
-# NOTE: authored without a Linux/CI environment to validate; first push to GitHub runs it.
-#       If a step fails, fix in-repo (preset/portability) rather than disabling the matrix.
+#
+# vcpkg versioning note: manifest mode with a pinned builtin-baseline requires the
+# local vcpkg checkout to be a *full* (non-shallow) clone whose HEAD is at or beyond
+# the baseline commit — otherwise the version database lacks entries the baseline
+# references (e.g. boost-asio@1.91.0). We therefore checkout the exact baseline
+# commit in the runner's vcpkg and re-bootstrap. Compiled deps are cached via the
+# x-gha binary source (GitHub Actions cache).
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   build:
@@ -21,23 +29,39 @@ jobs:
         include:
           - os: windows-latest
             preset: default
-            vcpkg: C:\vcpkg
           - os: ubuntu-latest
             preset: linux
-            vcpkg: /usr/local/vcpkg
-
-    env:
-      VCPKG_ROOT: ${{ matrix.vcpkg }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up vcpkg
+      - name: Export GitHub Actions cache credentials
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Set up vcpkg (checkout baseline commit)
         shell: bash
         run: |
-          # GitHub runners ship vcpkg at the matrix path; export VCPKG_ROOT for the toolchain.
-          echo "VCPKG_ROOT=$VCPKG_ROOT" >> "$GITHUB_ENV"
-          "$VCPKG_ROOT/vcpkg" --version || true
+          set -e
+          BASELINE=$(grep builtin-baseline vcpkg.json | head -1 | sed 's/.*"\([0-9a-f]\{40\}\)".*/\1/')
+          echo "Baseline commit: $BASELINE"
+          # Use the runner's pre-installed vcpkg (full clone) when available;
+          # otherwise fall back to a fresh full clone.
+          VCPKG_DIR="${VCPKG_INSTALLATION_ROOT:-}"
+          if [ -z "$VCPKG_DIR" ] || [ ! -d "$VCPKG_DIR/.git" ]; then
+            VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+            git clone https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
+          fi
+          # Pin the vcpkg tree to the exact baseline commit so the version database
+          # matches what vcpkg.json references (full history is present on runners).
+          git -C "$VCPKG_DIR" fetch --tags origin
+          git -C "$VCPKG_DIR" checkout "$BASELINE"
+          "$VCPKG_DIR/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VCPKG_DIR" >> "$GITHUB_ENV"
+          "$VCPKG_DIR/vcpkg" --version
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -47,7 +71,7 @@ jobs:
         run: cmake --preset ${{ matrix.preset }}
 
       - name: Build
-        run: cmake --build build/default
+        run: cmake --build --preset ${{ matrix.preset }}
 
       - name: Test
         working-directory: build/default
