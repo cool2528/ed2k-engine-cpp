@@ -87,5 +87,4 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
 
       - name: Test
-        working-directory: build/default
         run: ctest --preset ${{ matrix.preset }}
