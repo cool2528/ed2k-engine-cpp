@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <array>
 #include <utility>
 #include <vector>
@@ -34,6 +35,10 @@ std::vector<std::byte> encode_hello_packet(const HelloInfo&);   // OP_HELLO payl
 std::vector<std::byte> encode_set_req_file(const FileHash&);
 std::vector<std::byte> encode_hashset_request(const FileHash&);
 std::vector<std::byte> encode_request_filename(const FileHash&);
+tl::expected<FileHash,std::error_code> decode_file_hash_request(std::span<const std::byte>);
+std::vector<std::byte> encode_req_filename_answer(const FileHash&, std::string_view name);
+std::vector<std::byte> encode_file_status(const FileHash&, std::span<const bool> parts);
+std::vector<std::byte> encode_hashset_answer(const FileHash&, std::span<const PartHash> part_hashes);
 std::vector<std::byte> encode_start_upload(const FileHash&);
 std::vector<std::byte> encode_request_parts(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends);
 std::vector<std::byte> encode_end_of_download(const FileHash&);

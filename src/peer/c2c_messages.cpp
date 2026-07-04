@@ -36,6 +36,41 @@ std::vector<std::byte> encode_hello_packet(const HelloInfo& h){
 std::vector<std::byte> encode_set_req_file(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_hashset_request(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_request_filename(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
+tl::expected<FileHash,std::error_code> decode_file_hash_request(std::span<const std::byte> data){
+  ByteReader r(data);
+  FileHash h = r.hash16();
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return h;
+}
+std::vector<std::byte> encode_req_filename_answer(const FileHash& h, std::string_view name){
+  ByteWriter w;
+  w.hash16(h);
+  w.u32(static_cast<std::uint32_t>(name.size()));
+  w.blob(std::as_bytes(std::span{name.data(), name.size()}));
+  return w.take();
+}
+std::vector<std::byte> encode_file_status(const FileHash& h, std::span<const bool> parts){
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(static_cast<std::uint16_t>(parts.size()));
+  const std::size_t bytes_needed = (parts.size() + 7) / 8;
+  for(std::size_t byte_i = 0; byte_i < bytes_needed; ++byte_i){
+    std::uint8_t v = 0;
+    for(std::size_t bit = 0; bit < 8; ++bit){
+      const std::size_t idx = byte_i * 8 + bit;
+      if(idx < parts.size() && parts[idx]) v |= static_cast<std::uint8_t>(1u << bit);
+    }
+    w.u8(v);
+  }
+  return w.take();
+}
+std::vector<std::byte> encode_hashset_answer(const FileHash& h, std::span<const PartHash> part_hashes){
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(static_cast<std::uint16_t>(part_hashes.size()));
+  for(const auto& ph : part_hashes) w.hash16(ph);
+  return w.take();
+}
 std::vector<std::byte> encode_start_upload(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_request_parts(const FileHash& h, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends){
   ByteWriter w; w.hash16(h);

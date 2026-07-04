@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 #include <array>
+#include "ed2k/codec/byte_io.hpp"
 #include "crypto/sha1.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 using namespace ed2k; using namespace ed2k::peer; using namespace ed2k::server;
+using ed2k::codec::ByteWriter;
 
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
   std::vector<std::byte> v;
@@ -71,6 +73,44 @@ TEST(C2CMessages, EncodeRequestFilename){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   EXPECT_EQ(encode_request_filename(h), hex("00112233445566778899aabbccddeeff"));
 }
+TEST(C2CMessages, DecodeFileHashRequest){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=decode_file_hash_request(hex("00112233445566778899aabbccddeeff"));
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(*out, h);
+  EXPECT_FALSE(decode_file_hash_request(bytes({1,2,3})).has_value());
+}
+TEST(C2CMessages, EncodeReqFilenameAnswerForUpload){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=encode_req_filename_answer(h, "file.bin");
+  ByteWriter w;
+  w.hash16(h);
+  w.u32(8);
+  w.blob(bytes({'f','i','l','e','.','b','i','n'}));
+  EXPECT_EQ(out, w.take());
+}
+TEST(C2CMessages, EncodeFileStatusCompleteFileAsCountZero){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=encode_file_status(h, {});
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(0);
+  EXPECT_EQ(out, w.take());
+}
+TEST(C2CMessages, EncodeHashsetAnswerIncludesFileHashPrefix){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  std::array parts{
+    *PartHash::from_hex("11111111111111111111111111111111"),
+    *PartHash::from_hex("22222222222222222222222222222222")
+  };
+  auto out=encode_hashset_answer(h, parts);
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(2);
+  w.hash16(parts[0]);
+  w.hash16(parts[1]);
+  EXPECT_EQ(out, w.take());
+}
 TEST(C2CMessages, EncodeStartUpload){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   EXPECT_EQ(encode_start_upload(h), hex("00112233445566778899aabbccddeeff"));
@@ -97,9 +137,7 @@ TEST(C2CMessages, EncodeCancelTransfer){
   EXPECT_TRUE(encode_cancel_transfer().empty());
 }
 
-#include "ed2k/codec/byte_io.hpp"
 #include <zlib.h>
-using ed2k::codec::ByteWriter;
 static std::vector<std::byte> zlib_compress(std::span<const std::byte> in){
   uLongf bound = compressBound(static_cast<uLong>(in.size()));
   std::vector<std::byte> out(bound);
