@@ -5,6 +5,8 @@
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/util/error.hpp"
 #include <optional>
+#include <cassert>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -174,6 +176,24 @@ struct SharedState {
   bool complete = false;
   std::size_t active_workers = 0;
   std::optional<std::error_code> first_err;
+#ifndef NDEBUG
+  std::thread::id owner_thread = std::this_thread::get_id();
+  void assert_owner() const { assert(owner_thread == std::this_thread::get_id()); }
+#else
+  void assert_owner() const noexcept {}
+#endif
+  void set_error(std::error_code ec) {
+    assert_owner();
+    if(ec && !first_err) first_err = ec;
+  }
+  void dec_active_workers() {
+    assert_owner();
+    if(active_workers > 0) --active_workers;
+  }
+  void mark_complete() {
+    assert_owner();
+    complete = true;
+  }
 };
 // 完成信号 channel: worker 退出时 try_send 发一个 token; run() 收 N 个 token。
 // 签名 void(boost::system::error_code, int): 首参 error_code 被 use_awaitable 当操作状态
@@ -196,8 +216,8 @@ peer_worker(boost::asio::any_io_executor ex,
             std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
             ResultCh& done_ch){
   auto finish = [&](std::error_code ec){
-    if(ec && !st.first_err) st.first_err = ec;   // 首个失败错误 (单网络线程 → 无竞争)
-    if(st.active_workers > 0) --st.active_workers;
+    st.set_error(ec);        // 首个失败错误 (单网络线程 → 无竞争)
+    st.dec_active_workers();
     done_ch.try_send(boost::system::error_code{}, 0);   // capacity=N, 永不阻塞; 纯完成信号
   };
 
@@ -314,7 +334,7 @@ peer_worker(boost::asio::any_io_executor ex,
       }
       auto w = co_await st.pf.write_block_async(b.start, b.end, b.data, st.disk_ex);
       if(!w){ st.alloc.requeue_block(part_index, block_in_part); finish(w.error()); co_return; }
-      if(st.alloc.mark_block_done(part_index, block_in_part)){ st.complete = true; break; }
+      if(st.alloc.mark_block_done(part_index, block_in_part)){ st.mark_complete(); break; }
       retry = 0;   // 成功一块, 重置同源重试计数
     }
   }

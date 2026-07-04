@@ -707,6 +707,12 @@ TEST(Download, DiskExecutorRunsOnSeparateThread){
   EXPECT_NE(net_id, disk_id) << "disk_executor 必须运行于独立线程 (M3 卸载前提)";
 }
 
+TEST(Download, DiskPoolIsSingleThreadByContract){
+  static_assert(IoRuntime::disk_pool_thread_count == 1);
+  EXPECT_EQ(IoRuntime::disk_pool_thread_count, 1u)
+    << "PartFile f_ 由单 disk 线程串行访问; 改 >1 必须先加 strand";
+}
+
 TEST(Download, LowIdSourceViaCallback){
   // M3 capstone: LowID source via server callback. MockServer 登录后读到客户端发来的
   // CALLBACKREQUEST(source.id=0x100), 即刻 spawn 一个 MockPeer 主动连 InboundListener
