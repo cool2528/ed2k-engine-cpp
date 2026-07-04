@@ -1,4 +1,4 @@
-# ed2kengine
+# ed2k-engine-cpp
 
 A from-scratch C++20 implementation of the **eDonkey2000 / eMule (eD2k) protocol** engine —
 link parsing, server session, multi-source download with AICH corruption recovery, and resume.
@@ -6,7 +6,8 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 
 > **Protocol fidelity canon.** All wire formats are verified against the aMule source by
 > byte-level comparison (opcodes, frame layouts, two-level AICH Merkle tree, REQUESTPARTS
-> three-range encoding). No exceptions to byte fidelity.
+> three-range encoding) — and confirmed against a real aMule 2.3.3 peer in live tests.
+> No exceptions to byte fidelity.
 
 ## Status
 
@@ -19,22 +20,32 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | `.part.met` resume (met-first, no re-hash) | ✅ |
 | Async disk I/O (offload to disk thread, network never blocks) | ✅ |
 | `>4GiB` boundary (u64 blocks / offsets) | ✅ |
-| Live real-server validation | ⏳ requires real eMule server (see [Live tests](#live-tests)) |
+| Live real-peer validation | ✅ vs local aMule 2.3.3 + real eMule server (see [Live tests](#live-tests)) |
 | Linux / CI | ⏳ planned (R0-2/R0-3) |
 
-Mock loopback tests: **225 pass, 4 skip** (live-gated only). Version: `0.1.0` (→ `1.0.0` at release).
+Mock loopback tests: **229 pass, 5 skip** (live-gated only); live **4/4 green**. Version: `0.1.0` (→ `1.0.0` at release).
 
 ## Build
 
-Requirements: **Visual Studio 2022**, **CMake ≥ 3.24**, **vcpkg** (`VCPKG_ROOT` set), C++20.
+Requirements: **CMake ≥ 3.24**, **vcpkg** (`VCPKG_ROOT` set), C++20, a C++20 compiler.
+
+**Windows** (Visual Studio 2022, `default` preset):
 
 ```bash
 cmake --preset default            # configure (vcpkg manifest mode, x64 Debug)
 cmake --build build/default       # build ed2k_core + ed2k-tool + ed2k_tests
 ctest --preset default            # run tests (cwd build/default)
+# Artifacts: build/default/Debug/ed2k-tool.exe, ed2k_tests.exe
 ```
 
-Artifacts: `build/default/Debug/ed2k-tool.exe` (CLI), `ed2k_tests.exe` (tests).
+**Linux** (GCC ≥ 13, Ninja, `linux` preset):
+
+```bash
+cmake --preset linux              # configure (vcpkg manifest, Ninja, Debug)
+cmake --build --preset linux      # build
+ctest --preset linux              # run tests (live skip without ED2K_LIVE)
+# Artifacts: build/default/ed2k-tool, ed2k_tests
+```
 
 ## CLI — `ed2k-tool`
 
@@ -110,15 +121,24 @@ resumption on `ex`. `DiskExecutorRunsOnSeparateThread` test locks this in.
 
 ## Live tests
 
-Four tests are gated behind `ED2K_LIVE` and skip by default:
+Five tests are gated behind `ED2K_LIVE` and skip by default (mock loopback runs without them):
 
 ```bash
+# Server session (Login / Search / GetSources) — real eMule server
 ED2K_LIVE=1 ED2K_SERVER=ip:port ED2K_LINK="ed2k://|file|...|/" \
   ED2K_EXPECT_MD4=<hex> ctest --preset default -R Live
+
+# Peer download (LocalPeerCompletes) — direct connect to an eMule/aMule HighID peer
+ED2K_LIVE=1 ED2K_LINK="ed2k://|file|...|/" ED2K_SOURCE=ip:port \
+  ED2K_EXPECT_MD4=<hex> ./build/default/Debug/ed2k_tests.exe \
+    --gtest_filter=LiveDownload.LocalPeerCompletes
 ```
 
-These require a real eMule server and a known-good file link. Mock loopback is green; live
-green is the remaining v1.0 validation gate (R0-1).
+**R0-1 live validation ✅**: 3 `LiveServer.*` green vs a real eMule Security server; `LocalPeerCompletes`
+green vs a self-hosted local aMule 2.3.3 peer — single-part 5.57 MB + multi-part 29 MB (Red variant,
+empty trailing part) both MD4-verified end-to-end. Live testing surfaced and fixed 7 aMule byte-level
+fidelity bugs (see CHANGELOG). Public HighID peers IP-filter cloud IPs, so a local aMule instance is the
+reliable peer source.
 
 ## Project layout
 
@@ -130,6 +150,11 @@ tests/            GoogleTest (single ed2k_tests executable; live_* gated by ED2K
 docs/             RELEASE-PLAN.md (canonical progress tracker), specs/, plans/
 ```
 
+## Acknowledgements
+
+The [aMule](https://github.com/amule-project/amule) source is the authoritative wire-format
+reference; every opcode, frame layout, and hash variant here was byte-compared against it.
+
 ## License
 
-See source headers. (Project-internal; confirm before redistribution.)
+Released under the [MIT License](LICENSE).
