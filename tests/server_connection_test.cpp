@@ -286,6 +286,12 @@ TEST(ServerConnection, CallbackRequestSendsEncodedFrame){
       captured_opcode = r.u8();
       captured = r.u32();
     }
+    // ACK: tell the client the CALLBACKREQUEST frame has been read, so it does
+    // not close (and stop the io_context) before we capture f2. Without this,
+    // a single-threaded scheduler race lets rt.stop() cancel the pending
+    // read_frame on Linux/GCC (the client closes immediately after sending,
+    // unlike search/get_sources which wait for a response).
+    co_await ed2k::test::send_packet(s, op::SERVERMESSAGE, msg_payload("ack"));
     co_await keep_alive(s); co_return;
   });
   run_coro(rt, [&]() -> asio::awaitable<void>{
@@ -296,6 +302,8 @@ TEST(ServerConnection, CallbackRequestSendsEncodedFrame){
     EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
     auto cr = co_await c.callback_request(0x00001234u, 2s);
     EXPECT_TRUE(cr.has_value());
+    // Drain the server's ACK so its read_frame(f2) has completed before close.
+    (void)co_await c.receive_events(2s);
     c.close(); co_return;
   });
   EXPECT_EQ(captured_opcode, op::CALLBACKREQUEST);
