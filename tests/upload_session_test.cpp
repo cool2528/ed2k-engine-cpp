@@ -18,6 +18,7 @@
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
+#include "ed2k/share/client_credits.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/share/upload_queue.hpp"
 #include "ed2k/share/upload_session.hpp"
@@ -468,6 +469,40 @@ TEST(UploadSession, ThrottlesSendingPartFrames){
     c.close();
     co_return;
   });
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(UploadSession, AccountsUploadedBytesAfterSendingPart){
+  ed2k::net::IoRuntime rt;
+  auto data = sample_data(1000);
+  auto path = temp_file("ed2k-upload-session-credits.bin");
+  write_file(path, data);
+  KnownFileDB db;
+  auto f = known_file_for(path, data);
+  db.add(f);
+  ClientCredits credits;
+  const auto client_hash = *UserHash::from_hex("11111111111111111111111111111111");
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), nullptr, nullptr, &credits);
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto hs = co_await c.handshake(hello_with_hash("client", "11111111111111111111111111111111"), 2s);
+    EXPECT_TRUE(hs.has_value()); if(!hs) co_return;
+    auto blocks = co_await c.request_blocks(f.hash, {100,0,0}, {600,0,0}, 2s);
+    EXPECT_TRUE(blocks.has_value()); if(!blocks) co_return;
+    c.close();
+    co_return;
+  });
+  EXPECT_EQ(credits.uploaded(client_hash), 500u);
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }

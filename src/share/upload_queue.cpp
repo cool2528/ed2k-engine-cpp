@@ -3,7 +3,8 @@
 
 namespace ed2k::share {
 
-UploadQueue::UploadQueue(std::size_t max_slots) : max_slots_(max_slots) {}
+UploadQueue::UploadQueue(std::size_t max_slots, const ClientCredits* credits)
+  : max_slots_(max_slots), credits_(credits) {}
 
 UploadQueueDecision UploadQueue::enqueue(const UserHash& user_hash, const FileHash& file_hash) {
   if(has_slot(user_hash)) return {UploadQueueState::accepted, 0};
@@ -27,8 +28,16 @@ UploadQueueDecision UploadQueue::enqueue(const UserHash& user_hash, const FileHa
     return {UploadQueueState::accepted, 0};
   }
 
-  queued_.push_back(entry);
-  return {UploadQueueState::queued, static_cast<std::uint16_t>(queued_.size())};
+  auto insert_at = queued_.end();
+  if(credits_) {
+    const auto new_score = credits_->score(user_hash);
+    insert_at = std::find_if(queued_.begin(), queued_.end(), [&](const Entry& existing) {
+      return new_score > credits_->score(existing.user_hash);
+    });
+  }
+  auto inserted_it = queued_.insert(insert_at, entry);
+  return {UploadQueueState::queued,
+          static_cast<std::uint16_t>(std::distance(queued_.begin(), inserted_it) + 1)};
 }
 
 std::vector<UploadQueueGrant> UploadQueue::tick() {

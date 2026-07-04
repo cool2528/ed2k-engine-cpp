@@ -130,6 +130,21 @@ UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
     queue_(queue),
     throttler_(throttler) {}
 
+UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
+                             const KnownFileDB& files,
+                             ed2k::peer::HelloInfo self,
+                             asio::any_io_executor disk_executor,
+                             UploadQueue* queue,
+                             UploadBandwidthThrottler* throttler,
+                             ClientCredits* credits)
+  : conn_(std::move(socket)),
+    files_(files),
+    self_(std::move(self)),
+    disk_executor_(std::move(disk_executor)),
+    queue_(queue),
+    throttler_(throttler),
+    credits_(credits) {}
+
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handshake(std::chrono::milliseconds timeout) {
   auto rp = co_await conn_.recv(timeout);
@@ -301,6 +316,7 @@ UploadSession::send_requested_parts(const KnownFile& file, const ed2k::peer::Req
       if(throttler_) co_await throttler_->acquire(data->size());
       auto sr = co_await conn_.send(ans);
       if(!sr) co_return tl::unexpected(sr.error());
+      if(credits_ && peer_) credits_->add_uploaded(peer_->user_hash, data->size());
       cur = chunk_end;
     }
   }

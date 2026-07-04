@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 #include "ed2k/core/hash.hpp"
+#include "ed2k/share/client_credits.hpp"
 
 namespace ed2k::share {
 
@@ -23,7 +24,7 @@ struct UploadQueueGrant {
 
 class UploadQueue {
  public:
-  explicit UploadQueue(std::size_t max_slots);
+  explicit UploadQueue(std::size_t max_slots, const ClientCredits* credits = nullptr);
 
   UploadQueueDecision enqueue(const UserHash& user_hash, const FileHash& file_hash);
   std::vector<UploadQueueGrant> tick();
@@ -39,6 +40,7 @@ class UploadQueue {
   };
 
   std::size_t max_slots_ = 0;
+  const ClientCredits* credits_ = nullptr;
   std::vector<Entry> active_;
   std::vector<Entry> queued_;
 };
