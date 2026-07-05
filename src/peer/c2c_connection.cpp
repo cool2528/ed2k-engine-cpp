@@ -205,8 +205,8 @@ C2CConnection::request_aich_master_hash(const FileHash& h, std::chrono::millisec
 
 asio::awaitable<tl::expected<SourceExchangeAnswer,std::error_code>>
 C2CConnection::request_sources2(const FileHash& h, std::chrono::milliseconds timeout){
-  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::REQUESTSOURCES2;
-  req.payload=encode_request_sources2(h);
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::MULTIPACKET;
+  req.payload=encode_multipacket_request_sources2(h);
   auto sr = co_await conn_.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
   auto rp = co_await pump_until(op::ANSWERSOURCES2, timeout);

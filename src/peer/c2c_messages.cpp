@@ -11,6 +11,46 @@ using codec::Tag;
 namespace {
 Tag string_tag(std::uint8_t id, std::string_view v){ Tag t; t.name_id=id; t.value=std::string(v); return t; }
 Tag u32_tag(std::uint8_t id, std::uint32_t v){ Tag t; t.name_id=id; t.value=std::uint64_t(v); return t; }
+constexpr std::uint8_t CT_EMULECOMPAT_OPTIONS = 0xEF;
+constexpr std::uint8_t CT_EMULE_MISCOPTIONS1 = 0xFA;
+constexpr std::uint8_t CT_EMULE_VERSION = 0xFB;
+constexpr std::uint8_t CT_EMULE_MISCOPTIONS2 = 0xFE;
+constexpr std::uint32_t SO_AMULE = 3;
+constexpr std::uint32_t SOURCEEXCHANGE2_VERSION = 4;
+
+constexpr std::uint32_t emule_version_2_3_3() {
+  return (SO_AMULE << 24) | (2u << 17) | (3u << 10) | (3u << 7);
+}
+
+constexpr std::uint32_t misc_options1() {
+  const std::uint32_t aich = 1;
+  const std::uint32_t unicode = 1;
+  const std::uint32_t udp = 0;
+  const std::uint32_t compression = 1;
+  const std::uint32_t secure_ident = 0;
+  const std::uint32_t source_exchange = 3;
+  const std::uint32_t extended_requests = 0;
+  const std::uint32_t comments = 1;
+  const std::uint32_t multipacket = 1;
+  return (aich << 29) |
+         (unicode << 28) |
+         (udp << 24) |
+         (compression << 20) |
+         (secure_ident << 16) |
+         (source_exchange << 12) |
+         (extended_requests << 8) |
+         (comments << 4) |
+         (multipacket << 1);
+}
+
+constexpr std::uint32_t misc_options2() {
+  const std::uint32_t source_exchange2 = 1;
+  const std::uint32_t ext_multipacket = 1;
+  const std::uint32_t large_files = 1;
+  return (source_exchange2 << 10) |
+         (ext_multipacket << 5) |
+         (large_files << 4);
+}
 }
 std::vector<std::byte> encode_hello(const HelloInfo& h){
   ByteWriter w;
@@ -20,6 +60,10 @@ std::vector<std::byte> encode_hello(const HelloInfo& h){
   std::vector<Tag> tags;
   tags.push_back(string_tag(tag::CT_NAME, h.nickname));
   tags.push_back(u32_tag(tag::CT_VERSION, h.version));
+  tags.push_back(u32_tag(CT_EMULE_VERSION, emule_version_2_3_3()));
+  tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS1, misc_options1()));
+  tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS2, misc_options2()));
+  tags.push_back(u32_tag(CT_EMULECOMPAT_OPTIONS, 0));
   w.u32(static_cast<std::uint32_t>(tags.size()));
   codec::write_taglist(w, tags);
   // 尾部 server_ip(4 BE)+server_port(2 LE) — aMule SendHelloTypePacket 末尾无条件写入(0/0 若未连服务器)。
@@ -155,11 +199,33 @@ tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(const 
   return out;
 }
 tl::expected<FileNameAnswer,std::error_code> decode_req_filename_answer(std::span<const std::byte> data){
+  if(data.size() < 18) return tl::unexpected(make_error_code(errc::buffer_underflow));
   ByteReader r(data);
-  FileNameAnswer a; a.hash = r.hash16();
-  std::uint32_t len = r.u32();
-  auto b = r.blob(len);
+  FileNameAnswer a;
+  a.hash = r.hash16();
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+
+  auto rest = data.subspan(16);
+  auto byte_at = [](std::span<const std::byte> s, std::size_t i) {
+    return static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(s[i]));
+  };
+
+  if(rest.size() >= 4) {
+    const auto len32 = byte_at(rest, 0) |
+                       (byte_at(rest, 1) << 8) |
+                       (byte_at(rest, 2) << 16) |
+                       (byte_at(rest, 3) << 24);
+    if(static_cast<std::uint64_t>(len32) <= rest.size() - 4u) {
+      const auto len = static_cast<std::size_t>(len32);
+      auto b = rest.subspan(4, len);
+      a.name.assign(reinterpret_cast<const char*>(b.data()), len);
+      return a;
+    }
+  }
+
+  const auto len = static_cast<std::uint16_t>(byte_at(rest, 0) | (byte_at(rest, 1) << 8));
+  if(static_cast<std::size_t>(len) > rest.size() - 2u) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  auto b = rest.subspan(2, len);
   a.name.assign(reinterpret_cast<const char*>(b.data()), len);
   return a;
 }
@@ -229,6 +295,15 @@ decode_shared_files_answer(std::span<const std::byte> data){
 }
 
 std::vector<std::byte> encode_request_sources2(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
+
+std::vector<std::byte> encode_multipacket_request_sources2(const FileHash& h, std::uint8_t version, std::uint16_t options){
+  ByteWriter w;
+  w.hash16(h);
+  w.u8(op::REQUESTSOURCES2);
+  w.u8(version);
+  w.u16(options);
+  return w.take();
+}
 
 tl::expected<FileHash, std::error_code> decode_request_sources2(std::span<const std::byte> data){
   if(data.size() == 16) return decode_file_hash_request(data);

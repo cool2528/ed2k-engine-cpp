@@ -174,6 +174,57 @@ UploadSession::send_not_found(const ed2k::FileHash& hash) {
 
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handle(const ed2k::net::Packet& pkt) {
+  if(pkt.opcode == ed2k::peer::op::MULTIPACKET || pkt.opcode == ed2k::peer::op::MULTIPACKET_EXT) {
+    ed2k::codec::ByteReader r(pkt.payload);
+    auto hash = r.hash16();
+    const auto advertised_size = pkt.opcode == ed2k::peer::op::MULTIPACKET_EXT ? r.u64() : 0;
+    (void)advertised_size;
+    if(!r.ok()) co_return tl::unexpected(make_error_code(errc::buffer_underflow));
+
+    const KnownFile* file = files_.find(hash);
+    if(!file) co_return co_await send_not_found(hash);
+    current_file_ = hash;
+
+    while(r.remaining() > 0 && r.ok()) {
+      const auto subop = r.u8();
+      ed2k::net::Packet ans;
+      switch(subop) {
+        case ed2k::peer::op::REQUESTFILENAME:
+          ans.protocol = ed2k::net::proto::eDonkey;
+          ans.opcode = ed2k::peer::op::REQFILENAMEANSWER;
+          ans.payload = ed2k::peer::encode_req_filename_answer(hash, file->name);
+          break;
+        case ed2k::peer::op::SETREQFILEID:
+          ans.protocol = ed2k::net::proto::eDonkey;
+          ans.opcode = ed2k::peer::op::FILESTATUS;
+          ans.payload = ed2k::peer::encode_file_status(hash, {});
+          break;
+        case ed2k::peer::op::AICHFILEHASHREQ:
+          ans.protocol = ed2k::net::proto::eMule;
+          ans.opcode = ed2k::peer::op::AICHFILEHASHANS;
+          ans.payload = ed2k::peer::encode_aich_file_hash_ans(hash, file->aich_root);
+          break;
+        case ed2k::peer::op::REQUESTSOURCES2: {
+          const auto requested_version = r.u8();
+          const auto requested_options = r.u16();
+          (void)requested_options;
+          if(!r.ok()) co_return tl::unexpected(make_error_code(errc::buffer_underflow));
+          ans.protocol = ed2k::net::proto::eMule;
+          ans.opcode = ed2k::peer::op::ANSWERSOURCES2;
+          ans.payload = ed2k::peer::encode_answer_sources2(
+            hash, file->sources, std::min<std::uint8_t>(requested_version ? requested_version : 4, 4));
+          break;
+        }
+        default:
+          co_return tl::expected<void, std::error_code>{};
+      }
+      auto sr = co_await conn_.send(ans);
+      if(!sr) co_return tl::unexpected(sr.error());
+    }
+    if(!r.ok()) co_return tl::unexpected(make_error_code(errc::buffer_underflow));
+    co_return tl::expected<void, std::error_code>{};
+  }
+
   if(pkt.opcode == ed2k::peer::op::ASKSHAREDFILES) {
     std::vector<ed2k::peer::SharedFileEntry> entries;
     entries.reserve(files_.files().size());

@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -12,6 +14,7 @@
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/share/upload_session.hpp"
+#include "ed2k/util/error.hpp"
 #include "live_env.hpp"
 
 using namespace ed2k;
@@ -37,13 +40,24 @@ std::optional<std::pair<IPv4, std::uint16_t>> env_source() {
   return std::pair{*ip, static_cast<std::uint16_t>(std::stoi(ss.substr(colon + 1)))};
 }
 
-peer::HelloInfo live_hello() {
+peer::HelloInfo live_hello(std::string_view nickname = "ed2k-live-upload",
+                           std::string_view user_hash = "0123456789abcdeffedcba9876543210",
+                           std::uint16_t port = 4662) {
   peer::HelloInfo h;
-  h.nickname = "ed2k-live-upload";
+  h.nickname = std::string(nickname);
   h.version = 0x3C;
-  h.port = 4662;
-  h.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  h.port = port;
+  h.user_hash = *UserHash::from_hex(user_hash);
   return h;
+}
+
+UserHash live_user_hash(std::uint64_t seed, std::uint8_t salt) {
+  std::array<std::byte, 16> bytes{};
+  for(std::size_t i = 0; i < bytes.size(); ++i) {
+    const auto shifted = (seed >> ((i % 8) * 8)) & 0xffu;
+    bytes[i] = static_cast<std::byte>(shifted ^ (0xa5u + salt + i * 17u));
+  }
+  return UserHash::from_bytes(bytes);
 }
 
 void write_bytes(const std::filesystem::path& p, std::span<const std::byte> data) {
@@ -65,11 +79,36 @@ TEST(LiveUpload, SourceExchange2WithLocalPeer){
 
   ed2k::net::IoRuntime rt;
   run_coro(rt, [&]() -> asio::awaitable<void>{
+    const auto seed = static_cast<std::uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto holder_hash = live_user_hash(seed, 0x11);
+    const auto requester_hash = live_user_hash(seed, 0x42);
+    const auto holder_port = static_cast<std::uint16_t>(30000u + (seed % 10000u));
+    const auto requester_port = static_cast<std::uint16_t>(holder_port + 1u);
+
+    peer::C2CConnection holder(rt.executor());
+    auto holder_cr = co_await holder.connect(source->first, source->second, 15s);
+    EXPECT_TRUE(holder_cr.has_value()) << (holder_cr ? "" : holder_cr.error().message());
+    if(!holder_cr) co_return;
+    auto holder_hs = co_await holder.handshake(live_hello("ed2k-live-holder", holder_hash.to_hex(), holder_port), 15s);
+    EXPECT_TRUE(holder_hs.has_value()) << (holder_hs ? "" : holder_hs.error().message());
+    if(!holder_hs) co_return;
+    auto holder_status = co_await holder.request_file(f->hash, 15s);
+    EXPECT_TRUE(holder_status.has_value()) << (holder_status ? "" : holder_status.error().message());
+    if(!holder_status) co_return;
+    auto holder_start = co_await holder.start_upload(f->hash, 15s);
+    EXPECT_TRUE(holder_start.has_value() || holder_start.error() == make_error_code(errc::upload_queued))
+      << (holder_start ? "" : holder_start.error().message());
+    if(!holder_start && holder_start.error() != make_error_code(errc::upload_queued)) co_return;
+    auto holder_name = co_await holder.request_filename(f->hash, 15s);
+    EXPECT_TRUE(holder_name.has_value()) << (holder_name ? "" : holder_name.error().message());
+    if(!holder_name) co_return;
+
     peer::C2CConnection c(rt.executor());
     auto cr = co_await c.connect(source->first, source->second, 15s);
     EXPECT_TRUE(cr.has_value()) << (cr ? "" : cr.error().message());
     if(!cr) co_return;
-    auto hs = co_await c.handshake(live_hello(), 15s);
+    auto hs = co_await c.handshake(live_hello("ed2k-live-sx2", requester_hash.to_hex(), requester_port), 15s);
     EXPECT_TRUE(hs.has_value()) << (hs ? "" : hs.error().message());
     if(!hs) co_return;
     auto status = co_await c.request_file(f->hash, 15s);
@@ -79,7 +118,11 @@ TEST(LiveUpload, SourceExchange2WithLocalPeer){
     EXPECT_TRUE(sx.has_value()) << (sx ? "" : sx.error().message());
     if(!sx) co_return;
     EXPECT_EQ(sx->hash, f->hash);
+    EXPECT_FALSE(sx->sources.empty());
+    EXPECT_TRUE(std::any_of(sx->sources.begin(), sx->sources.end(),
+      [&](const peer::PeerSource& src) { return src.user_hash == holder_hash; }));
     c.close();
+    holder.close();
     co_return;
   });
 }

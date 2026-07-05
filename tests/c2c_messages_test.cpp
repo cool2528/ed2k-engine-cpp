@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <array>
+#include <optional>
 #include "ed2k/codec/byte_io.hpp"
+#include "ed2k/codec/tag.hpp"
 #include "crypto/sha1.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 using namespace ed2k; using namespace ed2k::peer; using namespace ed2k::server;
@@ -40,12 +42,51 @@ TEST(C2CMessages, EncodeHello){
   app(hex("0123456789abcdeffedcba9876543210"));
   app(bytes({0x04,0x03,0x02,0x01}));
   app(bytes({0x34,0x12}));
-  app(bytes({2,0,0,0}));
+  app(bytes({6,0,0,0}));
   app(bytes({0x82,tag::CT_NAME, 0x01,0x00,'u'}));
   app(bytes({0x83,tag::CT_VERSION, 0x3c,0x00,0x00,0x00}));
+  app(bytes({0x83,0xFB, 0x80,0x0D,0x04,0x03})); // CT_EMULE_VERSION: aMule 2.3.3 compatible id.
+  app(bytes({0x83,0xFA, 0x12,0x30,0x10,0x30})); // CT_EMULE_MISCOPTIONS1: SX1 v3 + comments + multipacket + AICH.
+  app(bytes({0x83,0xFE, 0x30,0x04,0x00,0x00})); // CT_EMULE_MISCOPTIONS2: SX2 + ext multipacket + large files.
+  app(bytes({0x83,0xEF, 0x00,0x00,0x00,0x00})); // CT_EMULECOMPAT_OPTIONS.
   // 尾部 server_ip(4 BE)+server_port(2 LE),未连服务器为 0(aMule SendHelloTypePacket 末尾无条件写入)。
   app(bytes({0,0,0,0, 0,0}));
   EXPECT_EQ(out, want);
+}
+TEST(C2CMessages, EncodeHelloAdvertisesEmuleSourceExchange2){
+  HelloInfo h;
+  h.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  h.client_id=0x01020304u;
+  h.port=0x1234u;
+  h.nickname="u";
+  h.version=0x3C;
+  auto out=encode_hello(h);
+
+  ed2k::codec::ByteReader r(out);
+  (void)r.hash16();
+  (void)r.u32();
+  (void)r.u16();
+  const auto tag_count = r.u32();
+  auto tags = ed2k::codec::read_taglist(r, tag_count);
+  ASSERT_TRUE(tags.has_value());
+
+  std::optional<std::uint64_t> misc1;
+  std::optional<std::uint64_t> misc2;
+  for(const auto& tag : *tags) {
+    if(!std::holds_alternative<std::uint64_t>(tag.value)) continue;
+    if(tag.name_id == 0xFA) misc1 = std::get<std::uint64_t>(tag.value);
+    if(tag.name_id == 0xFE) misc2 = std::get<std::uint64_t>(tag.value);
+  }
+
+  ASSERT_TRUE(misc1.has_value());
+  ASSERT_TRUE(misc2.has_value());
+  EXPECT_EQ((*misc1 >> 12) & 0x0Fu, 3u);  // SourceExchange v1 version.
+  EXPECT_EQ((*misc1 >> 8) & 0x0Fu, 0u);   // No extended request payloads in multipacket.
+  EXPECT_EQ((*misc1 >> 4) & 0x0Fu, 1u);   // Comments v1.
+  EXPECT_EQ((*misc1 >> 1) & 0x01u, 1u);   // Multipacket.
+  EXPECT_EQ((*misc2 >> 10) & 0x01u, 1u);  // SourceExchange2 supported.
+  EXPECT_EQ((*misc2 >> 5) & 0x01u, 1u);   // Extended multipacket.
+  EXPECT_EQ((*misc2 >> 4) & 0x01u, 1u);   // Large files.
 }
 TEST(C2CMessages, EncodeHelloPacket){
   // OP_HELLO payload = [0x10 hashsize] + encode_hello body(aMule SendHelloPacket: WriteUInt8(16) 后 SendHelloTypePacket)。
@@ -364,6 +405,17 @@ TEST(C2CMessages, DecodeReqFilenameAnswer){
   auto out=decode_req_filename_answer(w.take());
   ASSERT_TRUE(out.has_value());
   EXPECT_EQ(out->name, "abc");
+}
+TEST(C2CMessages, DecodeReqFilenameAnswerWithAmuleU16String){
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  ByteWriter w;
+  w.hash16(h);
+  w.u16(23);
+  w.blob(bytes({'e','d','2','k','_','p','5','_','l','i','v','e','_','s','o','u','r','c','e','.','b','i','n'}));
+  auto out=decode_req_filename_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->hash, h);
+  EXPECT_EQ(out->name, "ed2k_p5_live_source.bin");
 }
 TEST(C2CMessages, DecodeQueueRanking){
   ByteWriter w;

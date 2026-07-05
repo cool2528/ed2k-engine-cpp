@@ -79,6 +79,7 @@ tl::expected<FileHash,std::error_code>           decode_file_req_ans_no_fil(std:
 std::vector<std::byte> encode_shared_files_answer(std::span<const SharedFileEntry> files);
 tl::expected<std::vector<SharedFileEntry>, std::error_code> decode_shared_files_answer(std::span<const std::byte>);
 std::vector<std::byte> encode_request_sources2(const FileHash&);
+std::vector<std::byte> encode_multipacket_request_sources2(const FileHash&, std::uint8_t version = 4, std::uint16_t options = 0);
 tl::expected<FileHash, std::error_code> decode_request_sources2(std::span<const std::byte>);
 std::vector<std::byte> encode_answer_sources2(const FileHash&, std::span<const PeerSource> sources, std::uint8_t version = 4);
 tl::expected<SourceExchangeAnswer, std::error_code> decode_answer_sources2(std::span<const std::byte>);

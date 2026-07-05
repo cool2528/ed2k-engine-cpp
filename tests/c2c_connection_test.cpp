@@ -304,10 +304,13 @@ TEST(C2CConnection, RequestSources2RoundTrip){
     auto [proto_byte, body] = co_await read_frame_proto(s);
     EXPECT_EQ(proto_byte, proto::eMule);
     EXPECT_FALSE(body.empty()); if(body.empty()) co_return;
-    EXPECT_EQ(body[0], std::byte(op::REQUESTSOURCES2));
-    auto req = decode_request_sources2(std::span<const std::byte>(body).subspan(1));
-    EXPECT_TRUE(req.has_value()); if(!req) co_return;
-    EXPECT_EQ(*req, fh);
+    EXPECT_EQ(body[0], std::byte{0x92}); // OP_MULTIPACKET
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
+    EXPECT_EQ(r.hash16(), fh);
+    EXPECT_EQ(r.u8(), op::REQUESTSOURCES2);
+    EXPECT_EQ(r.u8(), 4u);
+    EXPECT_EQ(r.u16(), 0u);
+    EXPECT_TRUE(r.ok());
     co_await send_pkt(s, op::ANSWERSOURCES2, encode_answer_sources2(fh, std::array{src}), proto::eMule);
     co_await keep_alive(s); co_return;
   });
