@@ -1,6 +1,7 @@
 #include "ed2k/kad/network.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <utility>
 
@@ -58,6 +59,27 @@ bool append_candidate(std::vector<Contact>& candidates, const Contact& contact, 
   candidates.push_back(contact);
   return true;
 }
+
+bool is_zero_id(const KadID& id) noexcept {
+  return std::all_of(id.bytes().begin(), id.bytes().end(), [](std::byte value) {
+    return value == std::byte{0};
+  });
+}
+
+KadID fallback_user_hash(const KadNetworkOptions& options) noexcept {
+  if (!is_zero_id(options.user_hash)) {
+    return options.user_hash;
+  }
+  return options.id;
+}
+
+KadID bitwise_not_id(const KadID& id) noexcept {
+  std::array<std::byte, KadID::size> bytes{};
+  for (std::size_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = std::byte{static_cast<unsigned char>(~std::to_integer<unsigned char>(id.bytes()[i]))};
+  }
+  return KadID::from_bytes(bytes);
+}
 } // namespace
 
 KadNetwork::KadNetwork(asio::any_io_executor ex, KadNetworkOptions options)
@@ -69,7 +91,13 @@ KadNetwork::KadNetwork(asio::any_io_executor ex, KadNetworkOptions options)
           .tcp_port = options.tcp_port,
           .version = options.version,
       }),
+      user_hash_(fallback_user_hash(options)),
       routing_(options.id) {}
+
+void KadNetwork::deactivate_buddy() noexcept {
+  buddy_.reset();
+  buddy_state_ = KadBuddyState::inactive;
+}
 
 asio::awaitable<tl::expected<Contact, std::error_code>>
 KadNetwork::send_hello(udp::endpoint remote, std::chrono::milliseconds timeout) {
@@ -453,6 +481,94 @@ KadNetwork::search_notes(std::span<const Contact> peers, KadID file_id, std::uin
   co_return entries;
 }
 
+asio::awaitable<tl::expected<IPv4, std::error_code>>
+KadNetwork::check_tcp_firewall(const Contact& remote, std::chrono::milliseconds timeout) {
+  routing_.add_or_update(remote);
+
+  auto request_packet = remote.version > 6 ? encode_kademlia_firewalled2_req(self_.tcp_port, user_hash_, 0)
+                                           : encode_kademlia_firewalled_req(self_.tcp_port);
+  auto sent = co_await socket_.send_to(endpoint_from_contact(remote), request_packet);
+  if (!sent) {
+    co_return tl::unexpected(sent.error());
+  }
+
+  auto received = co_await socket_.recv_from(timeout);
+  if (!received) {
+    co_return tl::unexpected(received.error());
+  }
+
+  auto response = decode_kademlia_firewalled_res(received->first);
+  if (!response) {
+    co_return tl::unexpected(response.error());
+  }
+
+  observed_external_ip_ = response->ip;
+  co_return response->ip;
+}
+
+asio::awaitable<tl::expected<void, std::error_code>>
+KadNetwork::send_udp_firewall_result(const Contact& remote, std::uint16_t incoming_port,
+                                     std::uint8_t error_code) {
+  auto sent = co_await socket_.send_to(endpoint_from_contact(remote),
+                                      encode_kad2_firewall_udp(error_code, incoming_port));
+  if (!sent) {
+    co_return tl::unexpected(sent.error());
+  }
+  co_return tl::expected<void, std::error_code>{};
+}
+
+asio::awaitable<tl::expected<KadBuddyInfo, std::error_code>>
+KadNetwork::request_buddy(const Contact& remote, std::chrono::milliseconds timeout) {
+  routing_.add_or_update(remote);
+  buddy_state_ = KadBuddyState::connecting;
+
+  const auto buddy_id = bitwise_not_id(self_.id);
+  auto sent = co_await socket_.send_to(endpoint_from_contact(remote),
+                                      encode_kademlia_find_buddy_req(buddy_id, user_hash_, self_.tcp_port));
+  if (!sent) {
+    deactivate_buddy();
+    co_return tl::unexpected(sent.error());
+  }
+
+  auto received = co_await socket_.recv_from(timeout);
+  if (!received) {
+    deactivate_buddy();
+    co_return tl::unexpected(received.error());
+  }
+
+  auto response = decode_kademlia_find_buddy_res(received->first);
+  if (!response) {
+    deactivate_buddy();
+    co_return tl::unexpected(response.error());
+  }
+  if (bitwise_not_id(response->buddy_id) != self_.id) {
+    deactivate_buddy();
+    co_return tl::unexpected(protocol_error_code());
+  }
+
+  Contact buddy_contact = remote;
+  buddy_contact.tcp_port = response->tcp_port;
+  KadBuddyInfo info{
+      .contact = buddy_contact,
+      .buddy_id = response->buddy_id,
+      .user_hash = response->user_hash,
+      .connect_options = response->has_connect_options ? response->connect_options : std::uint8_t{0},
+  };
+  buddy_ = info;
+  buddy_state_ = KadBuddyState::active;
+  co_return info;
+}
+
+asio::awaitable<tl::expected<void, std::error_code>>
+KadNetwork::send_callback(const Contact& buddy_contact, KadID buddy_id, KadID file_id) {
+  auto sent = co_await socket_.send_to(endpoint_from_contact(buddy_contact),
+                                      encode_kademlia_callback_req(buddy_id, file_id, self_.tcp_port));
+  if (!sent) {
+    co_return tl::unexpected(sent.error());
+  }
+  co_return tl::expected<void, std::error_code>{};
+}
+
 asio::awaitable<tl::expected<void, std::error_code>>
 KadNetwork::serve_once(std::chrono::milliseconds timeout) {
   auto received = co_await socket_.recv_from(timeout);
@@ -606,6 +722,112 @@ KadNetwork::serve_once(std::chrono::milliseconds timeout) {
     }
     case opcode::kad2_publish_res_ack:
       break;
+    case opcode::kademlia_firewalled_req: {
+      auto request = decode_kademlia_firewalled_req(packet);
+      if (!request) {
+        co_return tl::unexpected(request.error());
+      }
+      auto sent = co_await socket_.send_to(sender, encode_kademlia_firewalled_res(endpoint_ip(sender)));
+      if (!sent) {
+        co_return tl::unexpected(sent.error());
+      }
+      break;
+    }
+    case opcode::kademlia_firewalled2_req: {
+      auto request = decode_kademlia_firewalled2_req(packet);
+      if (!request) {
+        co_return tl::unexpected(request.error());
+      }
+      auto sent = co_await socket_.send_to(sender, encode_kademlia_firewalled_res(endpoint_ip(sender)));
+      if (!sent) {
+        co_return tl::unexpected(sent.error());
+      }
+      break;
+    }
+    case opcode::kademlia_firewalled_res: {
+      auto response = decode_kademlia_firewalled_res(packet);
+      if (!response) {
+        co_return tl::unexpected(response.error());
+      }
+      observed_external_ip_ = response->ip;
+      break;
+    }
+    case opcode::kademlia_firewalled_ack_res: {
+      auto ack = decode_kademlia_firewalled_ack_res(packet);
+      if (!ack) {
+        co_return tl::unexpected(ack.error());
+      }
+      break;
+    }
+    case opcode::kad2_firewall_udp: {
+      auto result = decode_kad2_firewall_udp(packet);
+      if (!result) {
+        co_return tl::unexpected(result.error());
+      }
+
+      const bool reachable = result->error_code == 0 && result->incoming_port == self_.udp_port;
+      last_udp_firewall_result_ = KadFirewallUdpResult{
+          .error_code = result->error_code,
+          .incoming_port = result->incoming_port,
+          .sender_ip = endpoint_ip(sender),
+          .reachable = reachable,
+          .remote_error = !reachable,
+      };
+      udp_firewall_state_ = reachable ? KadFirewallState::open : KadFirewallState::firewalled;
+      break;
+    }
+    case opcode::kademlia_find_buddy_req: {
+      auto request = decode_kademlia_find_buddy_req(packet);
+      if (!request) {
+        co_return tl::unexpected(request.error());
+      }
+      if (buddy_state_ == KadBuddyState::active) {
+        co_return tl::expected<void, std::error_code>{};
+      }
+
+      Contact firewalled_contact{
+          .id = bitwise_not_id(request->buddy_id),
+          .ip = endpoint_ip(sender),
+          .udp_port = sender.port(),
+          .tcp_port = request->tcp_port,
+          .version = kad2_version,
+      };
+      buddy_ = KadBuddyInfo{
+          .contact = firewalled_contact,
+          .buddy_id = request->buddy_id,
+          .user_hash = request->user_hash,
+          .connect_options = request->has_connect_options ? request->connect_options : std::uint8_t{0},
+      };
+      buddy_state_ = KadBuddyState::active;
+
+      auto sent = co_await socket_.send_to(sender,
+                                          encode_kademlia_find_buddy_res(request->buddy_id, user_hash_,
+                                                                         self_.tcp_port));
+      if (!sent) {
+        co_return tl::unexpected(sent.error());
+      }
+      break;
+    }
+    case opcode::kademlia_find_buddy_res: {
+      auto response = decode_kademlia_find_buddy_res(packet);
+      if (!response) {
+        co_return tl::unexpected(response.error());
+      }
+      break;
+    }
+    case opcode::kademlia_callback_req: {
+      auto request = decode_kademlia_callback_req(packet);
+      if (!request) {
+        co_return tl::unexpected(request.error());
+      }
+      last_callback_ = KadCallbackEvent{
+          .buddy_id = request->buddy_id,
+          .file_id = request->file_id,
+          .requester_ip = endpoint_ip(sender),
+          .requester_tcp_port = request->tcp_port,
+      };
+      break;
+    }
     default:
       co_return protocol_error();
   }

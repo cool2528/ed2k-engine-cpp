@@ -390,3 +390,157 @@ TEST(KadNetwork, PublishNotesThenSearchNotesFindsComment) {
     co_return;
   });
 }
+
+TEST(KadNetwork, FirewallUdpResultUpdatesReachabilityState) {
+  net::IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    KadNetwork checker(rt.executor(), options("00000000000000000000000000000001", 5931));
+    KadNetwork reporter(rt.executor(), options("00000000000000000000000000000002", 5932));
+
+    auto sent_open = co_await reporter.send_udp_firewall_result(checker.self_contact(),
+                                                                checker.self_contact().udp_port, 0);
+    EXPECT_TRUE(sent_open.has_value());
+    if (!sent_open) {
+      co_return;
+    }
+    auto served_open = co_await checker.serve_once(1s);
+    EXPECT_TRUE(served_open.has_value());
+    if (!served_open) {
+      co_return;
+    }
+
+    EXPECT_EQ(checker.udp_firewall_state(), KadFirewallState::open);
+    EXPECT_TRUE(checker.last_udp_firewall_result().has_value());
+    if (!checker.last_udp_firewall_result()) {
+      co_return;
+    }
+    EXPECT_TRUE(checker.last_udp_firewall_result()->reachable);
+    EXPECT_EQ(checker.last_udp_firewall_result()->incoming_port, checker.self_contact().udp_port);
+
+    auto sent_bad_port = co_await reporter.send_udp_firewall_result(checker.self_contact(),
+                                                                    checker.self_contact().udp_port + 1, 0);
+    EXPECT_TRUE(sent_bad_port.has_value());
+    if (!sent_bad_port) {
+      co_return;
+    }
+    auto served_bad_port = co_await checker.serve_once(1s);
+    EXPECT_TRUE(served_bad_port.has_value());
+    if (!served_bad_port) {
+      co_return;
+    }
+
+    EXPECT_EQ(checker.udp_firewall_state(), KadFirewallState::firewalled);
+    EXPECT_TRUE(checker.last_udp_firewall_result().has_value());
+    if (!checker.last_udp_firewall_result()) {
+      co_return;
+    }
+    EXPECT_FALSE(checker.last_udp_firewall_result()->reachable);
+    EXPECT_EQ(checker.last_udp_firewall_result()->sender_ip.to_dotted(), "127.0.0.1");
+    co_return;
+  });
+}
+
+TEST(KadNetwork, TcpFirewalledCheckReceivesExternalIpResponse) {
+  net::IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    KadNetwork requester(rt.executor(), options("00000000000000000000000000000001", 5941));
+    KadNetwork checker(rt.executor(), options("00000000000000000000000000000002", 5942));
+
+    asio::co_spawn(rt.context(), serve_n(checker, 1), asio::detached);
+    auto external_ip = co_await requester.check_tcp_firewall(checker.self_contact(), 1s);
+    EXPECT_TRUE(external_ip.has_value());
+    if (!external_ip) {
+      co_return;
+    }
+
+    EXPECT_EQ(external_ip->to_dotted(), "127.0.0.1");
+    EXPECT_EQ(requester.observed_external_ip()->to_dotted(), "127.0.0.1");
+    co_return;
+  });
+}
+
+TEST(KadNetwork, BuddyRequestEstablishesActiveBuddyOnBothPeers) {
+  net::IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    KadNetwork firewalled(rt.executor(), options("00000000000000000000000000000001", 5951));
+    KadNetwork open(rt.executor(), options("00000000000000000000000000000002", 5952));
+
+    asio::co_spawn(rt.context(), serve_n(open, 1), asio::detached);
+    auto buddy = co_await firewalled.request_buddy(open.self_contact(), 1s);
+    EXPECT_TRUE(buddy.has_value());
+    if (!buddy) {
+      co_return;
+    }
+
+    EXPECT_EQ(firewalled.buddy_state(), KadBuddyState::active);
+    EXPECT_EQ(open.buddy_state(), KadBuddyState::active);
+    EXPECT_TRUE(firewalled.buddy().has_value());
+    EXPECT_TRUE(open.buddy().has_value());
+    if (!firewalled.buddy() || !open.buddy()) {
+      co_return;
+    }
+    EXPECT_EQ(firewalled.buddy()->contact.id, open.self_contact().id);
+    EXPECT_EQ(open.buddy()->contact.id, firewalled.self_contact().id);
+    EXPECT_EQ(firewalled.buddy()->contact.tcp_port, open.self_contact().tcp_port);
+    EXPECT_EQ(open.buddy()->contact.tcp_port, firewalled.self_contact().tcp_port);
+    co_return;
+  });
+}
+
+TEST(KadNetwork, BuddyCanBeMarkedInactive) {
+  net::IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    KadNetwork firewalled(rt.executor(), options("00000000000000000000000000000001", 5961));
+    KadNetwork open(rt.executor(), options("00000000000000000000000000000002", 5962));
+
+    asio::co_spawn(rt.context(), serve_n(open, 1), asio::detached);
+    auto buddy = co_await firewalled.request_buddy(open.self_contact(), 1s);
+    EXPECT_TRUE(buddy.has_value());
+    if (!buddy) {
+      co_return;
+    }
+
+    firewalled.deactivate_buddy();
+    EXPECT_EQ(firewalled.buddy_state(), KadBuddyState::inactive);
+    EXPECT_FALSE(firewalled.buddy().has_value());
+    co_return;
+  });
+}
+
+TEST(KadNetwork, BuddyRecordsKadCallbackRequest) {
+  net::IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    KadNetwork firewalled(rt.executor(), options("00000000000000000000000000000001", 5971));
+    KadNetwork open(rt.executor(), options("00000000000000000000000000000002", 5972));
+    const auto file = kid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    asio::co_spawn(rt.context(), serve_n(open, 1), asio::detached);
+    auto buddy = co_await firewalled.request_buddy(open.self_contact(), 1s);
+    EXPECT_TRUE(buddy.has_value());
+    if (!buddy || !firewalled.buddy()) {
+      co_return;
+    }
+
+    auto sent_callback = co_await firewalled.send_callback(open.self_contact(),
+                                                          firewalled.buddy()->buddy_id, file);
+    EXPECT_TRUE(sent_callback.has_value());
+    if (!sent_callback) {
+      co_return;
+    }
+    auto served_callback = co_await open.serve_once(1s);
+    EXPECT_TRUE(served_callback.has_value());
+    if (!served_callback) {
+      co_return;
+    }
+
+    EXPECT_TRUE(open.last_callback().has_value());
+    if (!open.last_callback()) {
+      co_return;
+    }
+    EXPECT_EQ(open.last_callback()->buddy_id, firewalled.buddy()->buddy_id);
+    EXPECT_EQ(open.last_callback()->file_id, file);
+    EXPECT_EQ(open.last_callback()->requester_ip.to_dotted(), "127.0.0.1");
+    EXPECT_EQ(open.last_callback()->requester_tcp_port, firewalled.self_contact().tcp_port);
+    co_return;
+  });
+}

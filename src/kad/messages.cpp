@@ -66,6 +66,33 @@ tl::expected<void, std::error_code> require_packet(const net::Packet& packet, st
   return {};
 }
 
+tl::expected<void, std::error_code> require_exact_payload(const net::Packet& packet,
+                                                          std::uint8_t opcode,
+                                                          std::size_t size) {
+  auto ok = require_packet(packet, opcode);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+  if (packet.payload.size() != size) {
+    return tl::unexpected(make_error_code(packet.payload.size() < size ? errc::buffer_underflow
+                                                                       : errc::server_protocol_error));
+  }
+  return {};
+}
+
+tl::expected<void, std::error_code> require_min_payload(const net::Packet& packet,
+                                                        std::uint8_t opcode,
+                                                        std::size_t size) {
+  auto ok = require_packet(packet, opcode);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+  if (packet.payload.size() < size) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return {};
+}
+
 tl::expected<void, std::error_code> require_hello_packet(const net::Packet& packet) {
   if (packet.protocol != kad_protocol ||
       (packet.opcode != opcode::kad2_hello_req && packet.opcode != opcode::kad2_hello_res)) {
@@ -610,6 +637,213 @@ tl::expected<KadPublishResponse, std::error_code> decode_kad2_publish_res(const 
     return tl::unexpected(make_error_code(errc::server_protocol_error));
   }
   return response;
+}
+
+net::Packet encode_kademlia_firewalled_req(std::uint16_t tcp_port) {
+  codec::ByteWriter writer;
+  writer.u16(tcp_port);
+  return make_packet(opcode::kademlia_firewalled_req, writer.take());
+}
+
+tl::expected<KadFirewalledRequest, std::error_code> decode_kademlia_firewalled_req(const net::Packet& packet) {
+  auto ok = require_exact_payload(packet, opcode::kademlia_firewalled_req, 2);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  KadFirewalledRequest request;
+  request.tcp_port = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return request;
+}
+
+net::Packet encode_kademlia_firewalled2_req(std::uint16_t tcp_port, const KadID& user_hash,
+                                             std::uint8_t connect_options) {
+  codec::ByteWriter writer;
+  writer.u16(tcp_port);
+  writer.blob(user_hash.bytes());
+  writer.u8(connect_options);
+  return make_packet(opcode::kademlia_firewalled2_req, writer.take());
+}
+
+tl::expected<KadFirewalledRequest, std::error_code> decode_kademlia_firewalled2_req(const net::Packet& packet) {
+  auto ok = require_min_payload(packet, opcode::kademlia_firewalled2_req, 19);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  KadFirewalledRequest request;
+  request.tcp_port = reader.u16();
+  auto user_hash = read_kad_id(reader);
+  if (!user_hash) {
+    return tl::unexpected(user_hash.error());
+  }
+  request.user_hash = *user_hash;
+  request.connect_options = reader.u8();
+  request.has_user_hash = true;
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return request;
+}
+
+net::Packet encode_kademlia_firewalled_res(IPv4 ip) {
+  codec::ByteWriter writer;
+  writer.u32(ipv4_to_wire(ip));
+  return make_packet(opcode::kademlia_firewalled_res, writer.take());
+}
+
+tl::expected<KadFirewalledResponse, std::error_code> decode_kademlia_firewalled_res(const net::Packet& packet) {
+  auto ok = require_exact_payload(packet, opcode::kademlia_firewalled_res, 4);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  KadFirewalledResponse response;
+  response.ip = IPv4::from_wire(reader.u32());
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return response;
+}
+
+net::Packet encode_kademlia_firewalled_ack_res() {
+  return make_packet(opcode::kademlia_firewalled_ack_res, {});
+}
+
+tl::expected<void, std::error_code> decode_kademlia_firewalled_ack_res(const net::Packet& packet) {
+  return require_exact_payload(packet, opcode::kademlia_firewalled_ack_res, 0);
+}
+
+net::Packet encode_kad2_firewall_udp(std::uint8_t error_code, std::uint16_t incoming_port) {
+  codec::ByteWriter writer;
+  writer.u8(error_code);
+  writer.u16(incoming_port);
+  return make_packet(opcode::kad2_firewall_udp, writer.take());
+}
+
+tl::expected<KadFirewallUdp, std::error_code> decode_kad2_firewall_udp(const net::Packet& packet) {
+  auto ok = require_min_payload(packet, opcode::kad2_firewall_udp, 3);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  KadFirewallUdp result;
+  result.error_code = reader.u8();
+  result.incoming_port = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return result;
+}
+
+net::Packet encode_kademlia_find_buddy_req(const KadID& buddy_id, const KadID& user_hash,
+                                            std::uint16_t tcp_port) {
+  codec::ByteWriter writer;
+  writer.blob(buddy_id.bytes());
+  writer.blob(user_hash.bytes());
+  writer.u16(tcp_port);
+  return make_packet(opcode::kademlia_find_buddy_req, writer.take());
+}
+
+net::Packet encode_kademlia_find_buddy_res(const KadID& buddy_id, const KadID& user_hash,
+                                            std::uint16_t tcp_port) {
+  codec::ByteWriter writer;
+  writer.blob(buddy_id.bytes());
+  writer.blob(user_hash.bytes());
+  writer.u16(tcp_port);
+  return make_packet(opcode::kademlia_find_buddy_res, writer.take());
+}
+
+net::Packet encode_kademlia_find_buddy_res(const KadID& buddy_id, const KadID& user_hash,
+                                            std::uint16_t tcp_port, std::uint8_t connect_options) {
+  codec::ByteWriter writer;
+  writer.blob(buddy_id.bytes());
+  writer.blob(user_hash.bytes());
+  writer.u16(tcp_port);
+  writer.u8(connect_options);
+  return make_packet(opcode::kademlia_find_buddy_res, writer.take());
+}
+
+tl::expected<KadBuddyMessage, std::error_code> decode_buddy_message(const net::Packet& packet,
+                                                                    std::uint8_t opcode_value) {
+  auto ok = require_min_payload(packet, opcode_value, 34);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  KadBuddyMessage message;
+  auto buddy_id = read_kad_id(reader);
+  if (!buddy_id) {
+    return tl::unexpected(buddy_id.error());
+  }
+  auto user_hash = read_kad_id(reader);
+  if (!user_hash) {
+    return tl::unexpected(user_hash.error());
+  }
+  message.buddy_id = *buddy_id;
+  message.user_hash = *user_hash;
+  message.tcp_port = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() > 0) {
+    message.connect_options = reader.u8();
+    message.has_connect_options = true;
+  }
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return message;
+}
+
+tl::expected<KadBuddyMessage, std::error_code> decode_kademlia_find_buddy_req(const net::Packet& packet) {
+  return decode_buddy_message(packet, opcode::kademlia_find_buddy_req);
+}
+
+tl::expected<KadBuddyMessage, std::error_code> decode_kademlia_find_buddy_res(const net::Packet& packet) {
+  return decode_buddy_message(packet, opcode::kademlia_find_buddy_res);
+}
+
+net::Packet encode_kademlia_callback_req(const KadID& buddy_id, const KadID& file_id,
+                                          std::uint16_t tcp_port) {
+  codec::ByteWriter writer;
+  writer.blob(buddy_id.bytes());
+  writer.blob(file_id.bytes());
+  writer.u16(tcp_port);
+  return make_packet(opcode::kademlia_callback_req, writer.take());
+}
+
+tl::expected<KadCallbackRequest, std::error_code> decode_kademlia_callback_req(const net::Packet& packet) {
+  auto ok = require_min_payload(packet, opcode::kademlia_callback_req, 34);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  KadCallbackRequest request;
+  auto buddy_id = read_kad_id(reader);
+  if (!buddy_id) {
+    return tl::unexpected(buddy_id.error());
+  }
+  auto file_id = read_kad_id(reader);
+  if (!file_id) {
+    return tl::unexpected(file_id.error());
+  }
+  request.buddy_id = *buddy_id;
+  request.file_id = *file_id;
+  request.tcp_port = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return request;
 }
 
 std::string file_name(const KadSearchEntry& entry) {

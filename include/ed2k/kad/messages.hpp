@@ -48,6 +48,16 @@ inline constexpr std::uint8_t kad2_publish_source_req = 0x44;
 inline constexpr std::uint8_t kad2_publish_notes_req = 0x45;
 inline constexpr std::uint8_t kad2_publish_res = 0x4B;
 inline constexpr std::uint8_t kad2_publish_res_ack = 0x4C;
+inline constexpr std::uint8_t kademlia_firewalled_req = 0x50;
+inline constexpr std::uint8_t kademlia_find_buddy_req = 0x51;
+inline constexpr std::uint8_t kademlia_callback_req = 0x52;
+inline constexpr std::uint8_t kademlia_firewalled2_req = 0x53;
+inline constexpr std::uint8_t kademlia_firewalled_res = 0x58;
+inline constexpr std::uint8_t kademlia_firewalled_ack_res = 0x59;
+inline constexpr std::uint8_t kademlia_find_buddy_res = 0x5A;
+inline constexpr std::uint8_t kad2_ping = 0x60;
+inline constexpr std::uint8_t kad2_pong = 0x61;
+inline constexpr std::uint8_t kad2_firewall_udp = 0x62;
 } // namespace opcode
 
 struct Kad2Request {
@@ -99,6 +109,36 @@ struct KadPublishResponse {
   bool requests_ack = false;
 };
 
+struct KadFirewalledRequest {
+  std::uint16_t tcp_port = 0;
+  KadID user_hash;
+  std::uint8_t connect_options = 0;
+  bool has_user_hash = false;
+};
+
+struct KadFirewalledResponse {
+  IPv4 ip;
+};
+
+struct KadFirewallUdp {
+  std::uint8_t error_code = 0;
+  std::uint16_t incoming_port = 0;
+};
+
+struct KadBuddyMessage {
+  KadID buddy_id;
+  KadID user_hash;
+  std::uint16_t tcp_port = 0;
+  std::uint8_t connect_options = 0;
+  bool has_connect_options = false;
+};
+
+struct KadCallbackRequest {
+  KadID buddy_id;
+  KadID file_id;
+  std::uint16_t tcp_port = 0;
+};
+
 net::Packet encode_kad2_hello_req(const Contact& self);
 net::Packet encode_kad2_hello_res(const Contact& self);
 tl::expected<Contact, std::error_code> decode_kad2_hello(const net::Packet& packet,
@@ -136,6 +176,35 @@ tl::expected<KadPublishNotesRequest, std::error_code> decode_kad2_publish_notes_
 
 net::Packet encode_kad2_publish_res(const KadID& target, std::uint8_t load);
 tl::expected<KadPublishResponse, std::error_code> decode_kad2_publish_res(const net::Packet& packet);
+
+net::Packet encode_kademlia_firewalled_req(std::uint16_t tcp_port);
+tl::expected<KadFirewalledRequest, std::error_code> decode_kademlia_firewalled_req(const net::Packet& packet);
+
+net::Packet encode_kademlia_firewalled2_req(std::uint16_t tcp_port, const KadID& user_hash,
+                                             std::uint8_t connect_options);
+tl::expected<KadFirewalledRequest, std::error_code> decode_kademlia_firewalled2_req(const net::Packet& packet);
+
+net::Packet encode_kademlia_firewalled_res(IPv4 ip);
+tl::expected<KadFirewalledResponse, std::error_code> decode_kademlia_firewalled_res(const net::Packet& packet);
+
+net::Packet encode_kademlia_firewalled_ack_res();
+tl::expected<void, std::error_code> decode_kademlia_firewalled_ack_res(const net::Packet& packet);
+
+net::Packet encode_kad2_firewall_udp(std::uint8_t error_code, std::uint16_t incoming_port);
+tl::expected<KadFirewallUdp, std::error_code> decode_kad2_firewall_udp(const net::Packet& packet);
+
+net::Packet encode_kademlia_find_buddy_req(const KadID& buddy_id, const KadID& user_hash,
+                                            std::uint16_t tcp_port);
+net::Packet encode_kademlia_find_buddy_res(const KadID& buddy_id, const KadID& user_hash,
+                                            std::uint16_t tcp_port);
+net::Packet encode_kademlia_find_buddy_res(const KadID& buddy_id, const KadID& user_hash,
+                                            std::uint16_t tcp_port, std::uint8_t connect_options);
+tl::expected<KadBuddyMessage, std::error_code> decode_kademlia_find_buddy_req(const net::Packet& packet);
+tl::expected<KadBuddyMessage, std::error_code> decode_kademlia_find_buddy_res(const net::Packet& packet);
+
+net::Packet encode_kademlia_callback_req(const KadID& buddy_id, const KadID& file_id,
+                                          std::uint16_t tcp_port);
+tl::expected<KadCallbackRequest, std::error_code> decode_kademlia_callback_req(const net::Packet& packet);
 
 std::string file_name(const KadSearchEntry& entry);
 std::uint64_t file_size(const KadSearchEntry& entry) noexcept;
