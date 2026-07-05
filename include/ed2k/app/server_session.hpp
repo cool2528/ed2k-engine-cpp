@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -13,6 +14,9 @@
 #include "ed2k/server/messages.hpp"
 #include "ed2k/download/download.hpp"
 #include "ed2k/link/ed2k_link.hpp"
+namespace ed2k::kad {
+class KadNetwork;
+}
 namespace ed2k::app {
 struct ServerTarget { IPv4 ip; std::uint16_t port = 0; };
 struct LoginSession {
@@ -36,6 +40,7 @@ struct DownloadOpts {
   std::chrono::milliseconds per_server_timeout = std::chrono::seconds(30);
   std::chrono::milliseconds total_timeout = std::chrono::seconds(120);
   std::uint16_t client_port = 4662;
+  std::optional<std::reference_wrapper<ed2k::kad::KadNetwork>> kad_network;
 };
 // Keep sources whose id is a HighID (!low_id(), i.e. id >= 0x1000000).
 // 保留定义供 CLI/测试复用; download_link 本身(M3)不再调用——LowID 源留给回调路径。

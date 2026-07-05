@@ -104,6 +104,7 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
                    .sources(std::move(gs->sources))
                    .server(lg->conn);
   if(listener) builder.listener(*listener);
+  if(opts.kad_network) builder.kad_network(opts.kad_network->get());
   auto dl = builder.build();
   co_return co_await dl.run(opts.total_timeout, 3);
 }

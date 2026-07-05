@@ -14,6 +14,9 @@
 #include "ed2k/server/connection.hpp"  // ServerConnection (M3 LowID callback)
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/peer/inbound_listener.hpp"  // InboundListener (M3 LowID callback)
+namespace ed2k::kad {
+class KadNetwork;
+}
 namespace ed2k::download {
 
 class Download {
@@ -44,6 +47,7 @@ class MultiSourceDownload {
     Builder& sources(std::vector<server::SourceEndpoint> s) { sources_ = std::move(s); return *this; }
     Builder& server(server::ServerConnection& s) { server_ = std::ref(s); return *this; }
     Builder& listener(peer::InboundListener& l) { listener_ = std::ref(l); return *this; }
+    Builder& kad_network(kad::KadNetwork& k) { kad_network_ = std::ref(k); return *this; }
     Builder& disk_executor(boost::asio::any_io_executor ex) { disk_ex_ = ex; return *this; }
     MultiSourceDownload build();
    private:
@@ -56,6 +60,7 @@ class MultiSourceDownload {
     std::vector<server::SourceEndpoint> sources_;
     std::optional<std::reference_wrapper<server::ServerConnection>> server_;
     std::optional<std::reference_wrapper<peer::InboundListener>> listener_;
+    std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
   };
 
   [[deprecated("Use MultiSourceDownload::Builder")]]
@@ -84,10 +89,12 @@ class MultiSourceDownload {
                       std::optional<AICHHash> aich,
                       std::vector<server::SourceEndpoint> sources,
                       std::optional<std::reference_wrapper<server::ServerConnection>> server_conn,
-                      std::optional<std::reference_wrapper<peer::InboundListener>> listener)
+                      std::optional<std::reference_wrapper<peer::InboundListener>> listener,
+                      std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network)
     : ex_(net_ex), disk_ex_(disk_ex), out_(std::move(out)), hash_(hash), size_(size),
       aich_(std::move(aich)), sources_(std::move(sources)),
-      server_conn_(std::move(server_conn)), listener_(std::move(listener)) {}
+      server_conn_(std::move(server_conn)), listener_(std::move(listener)),
+      kad_network_(std::move(kad_network)) {}
   boost::asio::any_io_executor ex_;
   boost::asio::any_io_executor disk_ex_;   // 默认 = ex_ (同步等效), Builder.disk_executor 注入 disk 池
   std::filesystem::path out_;
@@ -97,6 +104,7 @@ class MultiSourceDownload {
   std::vector<server::SourceEndpoint> sources_;
   std::optional<std::reference_wrapper<server::ServerConnection>> server_conn_;
   std::optional<std::reference_wrapper<peer::InboundListener>> listener_;
+  std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
   friend class Builder;
 };
 

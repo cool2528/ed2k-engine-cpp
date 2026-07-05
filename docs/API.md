@@ -105,9 +105,49 @@ class BlockAllocator {  // per-part block model; blocks never cross a part bound
 
 class MultiSourceDownload {
  public:
+  class Builder {
+   public:
+    Builder& sources(std::vector<server::SourceEndpoint>);
+    Builder& server(server::ServerConnection&);
+    Builder& listener(peer::InboundListener&);
+    Builder& kad_network(kad::KadNetwork&);              // optional Kad source augmentation
+    Builder& disk_executor(boost::asio::any_io_executor);
+    MultiSourceDownload build();
+  };
   void set_disk_executor(boost::asio::any_io_executor);  // inject disk pool (default = network ex)
   awaitable<expected<void, ec>> run(milliseconds total_timeout, std::size_t n_workers);
 };
+```
+
+When a `KadNetwork` is injected, `MultiSourceDownload::run` asks the local routing table for the
+closest contacts to the file hash and appends direct Kad source results before the existing
+multi-source setup loop. Server sources remain first in priority; Kad only augments the candidate list.
+
+## `ed2k/kad` — Kademlia DHT
+
+```cpp
+namespace ed2k::kad {
+class KadID { static tl::expected<KadID, ec> from_hex(std::string_view); std::string to_hex() const; };
+struct Contact { KadID id; IPv4 ip; std::uint16_t udp_port, tcp_port; std::uint8_t version; };
+struct KadSearchEntry { KadID answer_id; std::vector<codec::Tag> tags; };
+
+class KadNetwork {
+ public:
+  awaitable<expected<void, ec>> bootstrap(std::span<const Contact>, milliseconds);
+  awaitable<expected<std::vector<KadSearchEntry>, ec>>
+    search_keyword(std::span<const Contact>, KadID key_id, milliseconds);
+  awaitable<expected<std::vector<KadSearchEntry>, ec>>
+    find_sources(std::span<const Contact>, KadID file_id, std::uint64_t file_size, milliseconds);
+  awaitable<expected<KadPublishResponse, ec>>
+    publish_source(const Contact&, KadID file_id, const KadSearchEntry&, milliseconds);
+  RoutingTable& routing_table();
+};
+
+std::vector<std::byte> write_nodes_dat(std::span<const Contact>);
+tl::expected<std::vector<Contact>, ec> parse_nodes_dat(std::span<const std::byte>);
+std::optional<IPv4> source_ip(const KadSearchEntry&);
+std::uint16_t source_tcp_port(const KadSearchEntry&);
+}
 ```
 
 ## `ed2k/app/server_session.hpp` — high-level orchestration
@@ -120,6 +160,7 @@ struct DownloadOpts {
   std::chrono::milliseconds per_server_timeout = std::chrono::seconds(30);
   std::chrono::milliseconds total_timeout = std::chrono::seconds(120);
   std::uint16_t client_port = 4662;   // InboundListener port (LowID callback)
+  std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network;
 };
 awaitable<expected<LoginSession, ec>>
   login_with_rotation(any_io_executor, std::span<const std::byte> server_met,
@@ -130,7 +171,8 @@ awaitable<expected<void, ec>>
 }
 ```
 `download_link` does: login → `get_sources` → construct `InboundListener` only if LowID sources
-exist (else HighID-only direct connect) → `MultiSourceDownload(...).run(total_timeout, 3)`.
+exist (else HighID-only direct connect) → optionally append Kad direct sources when
+`DownloadOpts::kad_network` is set → `MultiSourceDownload(...).run(total_timeout, 3)`.
 
 ## `ed2k/share` — sharing, upload, credits
 

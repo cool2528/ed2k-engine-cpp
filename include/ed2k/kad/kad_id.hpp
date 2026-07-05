@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -45,6 +46,8 @@ static_assert(sizeof(KadID) == 16);
 
 KadID xor_distance(const KadID& lhs, const KadID& rhs) noexcept;
 bool closer_to_target(const KadID& lhs, const KadID& rhs, const KadID& target) noexcept;
+std::array<std::byte, KadID::size> kad_id_to_uint128_wire(const KadID& id) noexcept;
+KadID kad_id_from_uint128_wire(std::span<const std::byte, KadID::size> wire) noexcept;
 
 } // namespace ed2k::kad
 

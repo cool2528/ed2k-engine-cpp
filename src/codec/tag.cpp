@@ -24,7 +24,7 @@ tl::expected<Tag,std::error_code> read_tag(ByteReader& r){
   std::uint8_t type=r.u8(); Tag t;
   if(type & tagtype::NameFlag){ type&=~tagtype::NameFlag; t.name_id=r.u8(); }
   else { t.name_str=r.string16(); }
-  if(type >= tagtype::Str1 && type <= tagtype::Str16){
+  if(type >= tagtype::Str1 && type <= tagtype::Str22){
     // eMule 短字符串优化：type 即长度(1..16)，无长度前缀
     std::uint8_t n = static_cast<std::uint8_t>(type - tagtype::Str1 + 1);
     auto b = r.blob(n);

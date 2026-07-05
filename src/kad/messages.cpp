@@ -109,12 +109,17 @@ tl::expected<KadID, std::error_code> read_kad_id(codec::ByteReader& reader) {
 
   std::array<std::byte, KadID::size> id_bytes{};
   std::copy(id_blob.begin(), id_blob.end(), id_bytes.begin());
-  return KadID::from_bytes(id_bytes);
+  return kad_id_from_uint128_wire(id_bytes);
+}
+
+void write_kad_id(codec::ByteWriter& writer, const KadID& id) {
+  const auto wire_id = kad_id_to_uint128_wire(id);
+  writer.blob(wire_id);
 }
 
 void write_contact(codec::ByteWriter& writer, const Contact& contact) {
-  writer.blob(contact.id.bytes());
-  writer.u32(ipv4_to_wire(contact.ip));
+  write_kad_id(writer, contact.id);
+  writer.u32(contact.ip.host());
   writer.u16(contact.udp_port);
   writer.u16(contact.tcp_port);
   writer.u8(contact.version);
@@ -137,7 +142,7 @@ tl::expected<std::vector<codec::Tag>, std::error_code> read_tag_list(codec::Byte
 }
 
 void write_search_entry(codec::ByteWriter& writer, const KadSearchEntry& entry) {
-  writer.blob(entry.answer_id.bytes());
+  write_kad_id(writer, entry.answer_id);
   write_tag_list(writer, entry.tags);
 }
 
@@ -165,7 +170,7 @@ tl::expected<Contact, std::error_code> read_contact(codec::ByteReader& reader) {
 
   Contact contact;
   contact.id = *id;
-  contact.ip = IPv4::from_wire(reader.u32());
+  contact.ip = IPv4::from_host(reader.u32());
   contact.udp_port = reader.u16();
   contact.tcp_port = reader.u16();
   contact.version = reader.u8();
@@ -185,7 +190,7 @@ net::Packet make_packet(std::uint8_t opcode, std::vector<std::byte> payload) {
 
 net::Packet encode_hello(std::uint8_t opcode, const Contact& self) {
   codec::ByteWriter writer;
-  writer.blob(self.id.bytes());
+  write_kad_id(writer, self.id);
   writer.u16(self.tcp_port);
   writer.u8(self.version);
   writer.u8(0); // tag count; no SOURCEUPORT/KADMISCOPTIONS tag needed for default ports.
@@ -253,11 +258,76 @@ tl::expected<Contact, std::error_code> decode_kad2_hello(const net::Packet& pack
   return contact;
 }
 
+net::Packet encode_kad2_bootstrap_req() {
+  return make_packet(opcode::kad2_bootstrap_req, {});
+}
+
+tl::expected<void, std::error_code> decode_kad2_bootstrap_req(const net::Packet& packet) {
+  return require_exact_payload(packet, opcode::kad2_bootstrap_req, 0);
+}
+
+net::Packet encode_kad2_bootstrap_res(const Contact& self, std::span<const Contact> contacts) {
+  const auto count = std::min<std::size_t>(contacts.size(), std::numeric_limits<std::uint16_t>::max());
+
+  codec::ByteWriter writer;
+  write_kad_id(writer, self.id);
+  writer.u16(self.tcp_port);
+  writer.u8(self.version);
+  writer.u16(static_cast<std::uint16_t>(count));
+  for (std::size_t i = 0; i < count; ++i) {
+    write_contact(writer, contacts[i]);
+  }
+  return make_packet(opcode::kad2_bootstrap_res, writer.take());
+}
+
+tl::expected<KadBootstrapResponse, std::error_code> decode_kad2_bootstrap_res(
+    const net::Packet& packet, IPv4 sender_ip, std::uint16_t sender_udp_port) {
+  auto ok = require_min_payload(packet, opcode::kad2_bootstrap_res, 21);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto sender_id = read_kad_id(reader);
+  if (!sender_id) {
+    return tl::unexpected(sender_id.error());
+  }
+
+  KadBootstrapResponse response;
+  response.sender.id = *sender_id;
+  response.sender.ip = sender_ip;
+  response.sender.udp_port = sender_udp_port;
+  response.sender.tcp_port = reader.u16();
+  response.sender.version = reader.u8();
+  const auto count = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (response.sender.version < 2) {
+    return tl::unexpected(make_error_code(errc::unsupported_version));
+  }
+  if (reader.remaining() != static_cast<std::size_t>(count) * k_contact_wire_size) {
+    return tl::unexpected(make_error_code(reader.remaining() < static_cast<std::size_t>(count) * k_contact_wire_size
+                                             ? errc::buffer_underflow
+                                             : errc::server_protocol_error));
+  }
+
+  response.contacts.reserve(count);
+  for (std::uint16_t i = 0; i < count; ++i) {
+    auto contact = read_contact(reader);
+    if (!contact) {
+      return tl::unexpected(contact.error());
+    }
+    response.contacts.push_back(*contact);
+  }
+  return response;
+}
+
 net::Packet encode_kad2_req(const KadID& target, const KadID& receiver_id, std::uint8_t count) {
   codec::ByteWriter writer;
   writer.u8(static_cast<std::uint8_t>(count & 0x1Fu));
-  writer.blob(target.bytes());
-  writer.blob(receiver_id.bytes());
+  write_kad_id(writer, target);
+  write_kad_id(writer, receiver_id);
   return make_packet(opcode::kad2_req, writer.take());
 }
 
@@ -294,7 +364,7 @@ net::Packet encode_kad2_res(const KadID& target, std::span<const Contact> contac
   const auto count = std::min<std::size_t>(contacts.size(), std::numeric_limits<std::uint8_t>::max());
 
   codec::ByteWriter writer;
-  writer.blob(target.bytes());
+  write_kad_id(writer, target);
   writer.u8(static_cast<std::uint8_t>(count));
   for (std::size_t i = 0; i < count; ++i) {
     write_contact(writer, contacts[i]);
@@ -338,7 +408,7 @@ tl::expected<Kad2Response, std::error_code> decode_kad2_res(const net::Packet& p
 
 net::Packet encode_kad2_search_key_req(const KadID& target, std::uint16_t start_position) {
   codec::ByteWriter writer;
-  writer.blob(target.bytes());
+  write_kad_id(writer, target);
   writer.u16(static_cast<std::uint16_t>(start_position & 0x7fffu));
   return make_packet(opcode::kad2_search_key_req, writer.take());
 }
@@ -371,7 +441,7 @@ tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_key_req(const
 net::Packet encode_kad2_search_source_req(const KadID& target, std::uint16_t start_position,
                                            std::uint64_t file_size) {
   codec::ByteWriter writer;
-  writer.blob(target.bytes());
+  write_kad_id(writer, target);
   writer.u16(static_cast<std::uint16_t>(start_position & 0x7fffu));
   writer.u64(file_size);
   return make_packet(opcode::kad2_search_source_req, writer.take());
@@ -403,7 +473,7 @@ tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_source_req(co
 
 net::Packet encode_kad2_search_notes_req(const KadID& target, std::uint64_t file_size) {
   codec::ByteWriter writer;
-  writer.blob(target.bytes());
+  write_kad_id(writer, target);
   writer.u64(file_size);
   return make_packet(opcode::kad2_search_notes_req, writer.take());
 }
@@ -436,8 +506,8 @@ net::Packet encode_kad2_search_res(const KadID& sender_id, const KadID& target,
   const auto count = std::min<std::size_t>(entries.size(), std::numeric_limits<std::uint16_t>::max());
 
   codec::ByteWriter writer;
-  writer.blob(sender_id.bytes());
-  writer.blob(target.bytes());
+  write_kad_id(writer, sender_id);
+  write_kad_id(writer, target);
   writer.u16(static_cast<std::uint16_t>(count));
   for (std::size_t i = 0; i < count; ++i) {
     write_search_entry(writer, entries[i]);
@@ -489,7 +559,7 @@ net::Packet encode_kad2_publish_key_req(const KadID& key_id, std::span<const Kad
   const auto count = std::min<std::size_t>(entries.size(), std::numeric_limits<std::uint16_t>::max());
 
   codec::ByteWriter writer;
-  writer.blob(key_id.bytes());
+  write_kad_id(writer, key_id);
   writer.u16(static_cast<std::uint16_t>(count));
   for (std::size_t i = 0; i < count; ++i) {
     write_search_entry(writer, entries[i]);
@@ -534,7 +604,7 @@ tl::expected<KadPublishKeyRequest, std::error_code> decode_kad2_publish_key_req(
 
 net::Packet encode_kad2_publish_source_req(const KadID& file_id, const KadSearchEntry& source) {
   codec::ByteWriter writer;
-  writer.blob(file_id.bytes());
+  write_kad_id(writer, file_id);
   write_search_entry(writer, source);
   return make_packet(opcode::kad2_publish_source_req, writer.take());
 }
@@ -569,7 +639,7 @@ tl::expected<KadPublishSourceRequest, std::error_code> decode_kad2_publish_sourc
 
 net::Packet encode_kad2_publish_notes_req(const KadID& file_id, const KadSearchEntry& note) {
   codec::ByteWriter writer;
-  writer.blob(file_id.bytes());
+  write_kad_id(writer, file_id);
   write_search_entry(writer, note);
   return make_packet(opcode::kad2_publish_notes_req, writer.take());
 }
@@ -604,7 +674,7 @@ tl::expected<KadPublishNotesRequest, std::error_code> decode_kad2_publish_notes_
 
 net::Packet encode_kad2_publish_res(const KadID& target, std::uint8_t load) {
   codec::ByteWriter writer;
-  writer.blob(target.bytes());
+  write_kad_id(writer, target);
   writer.u8(load);
   return make_packet(opcode::kad2_publish_res, writer.take());
 }
@@ -664,7 +734,7 @@ net::Packet encode_kademlia_firewalled2_req(std::uint16_t tcp_port, const KadID&
                                              std::uint8_t connect_options) {
   codec::ByteWriter writer;
   writer.u16(tcp_port);
-  writer.blob(user_hash.bytes());
+  write_kad_id(writer, user_hash);
   writer.u8(connect_options);
   return make_packet(opcode::kademlia_firewalled2_req, writer.take());
 }
@@ -746,8 +816,8 @@ tl::expected<KadFirewallUdp, std::error_code> decode_kad2_firewall_udp(const net
 net::Packet encode_kademlia_find_buddy_req(const KadID& buddy_id, const KadID& user_hash,
                                             std::uint16_t tcp_port) {
   codec::ByteWriter writer;
-  writer.blob(buddy_id.bytes());
-  writer.blob(user_hash.bytes());
+  write_kad_id(writer, buddy_id);
+  write_kad_id(writer, user_hash);
   writer.u16(tcp_port);
   return make_packet(opcode::kademlia_find_buddy_req, writer.take());
 }
@@ -755,8 +825,8 @@ net::Packet encode_kademlia_find_buddy_req(const KadID& buddy_id, const KadID& u
 net::Packet encode_kademlia_find_buddy_res(const KadID& buddy_id, const KadID& user_hash,
                                             std::uint16_t tcp_port) {
   codec::ByteWriter writer;
-  writer.blob(buddy_id.bytes());
-  writer.blob(user_hash.bytes());
+  write_kad_id(writer, buddy_id);
+  write_kad_id(writer, user_hash);
   writer.u16(tcp_port);
   return make_packet(opcode::kademlia_find_buddy_res, writer.take());
 }
@@ -764,8 +834,8 @@ net::Packet encode_kademlia_find_buddy_res(const KadID& buddy_id, const KadID& u
 net::Packet encode_kademlia_find_buddy_res(const KadID& buddy_id, const KadID& user_hash,
                                             std::uint16_t tcp_port, std::uint8_t connect_options) {
   codec::ByteWriter writer;
-  writer.blob(buddy_id.bytes());
-  writer.blob(user_hash.bytes());
+  write_kad_id(writer, buddy_id);
+  write_kad_id(writer, user_hash);
   writer.u16(tcp_port);
   writer.u8(connect_options);
   return make_packet(opcode::kademlia_find_buddy_res, writer.take());
@@ -815,8 +885,8 @@ tl::expected<KadBuddyMessage, std::error_code> decode_kademlia_find_buddy_res(co
 net::Packet encode_kademlia_callback_req(const KadID& buddy_id, const KadID& file_id,
                                           std::uint16_t tcp_port) {
   codec::ByteWriter writer;
-  writer.blob(buddy_id.bytes());
-  writer.blob(file_id.bytes());
+  write_kad_id(writer, buddy_id);
+  write_kad_id(writer, file_id);
   writer.u16(tcp_port);
   return make_packet(opcode::kademlia_callback_req, writer.take());
 }
@@ -858,6 +928,20 @@ std::uint64_t file_size(const KadSearchEntry& entry) noexcept {
     return integer_value(*tag_value);
   }
   return 0;
+}
+
+std::uint8_t source_type(const KadSearchEntry& entry) noexcept {
+  if (const auto* tag_value = find_tag(entry, tag::source_type)) {
+    return static_cast<std::uint8_t>(integer_value(*tag_value));
+  }
+  return 0;
+}
+
+std::optional<IPv4> source_ip(const KadSearchEntry& entry) noexcept {
+  if (const auto* tag_value = find_tag(entry, tag::source_ip)) {
+    return IPv4::from_host(static_cast<std::uint32_t>(integer_value(*tag_value)));
+  }
+  return std::nullopt;
 }
 
 std::uint16_t source_tcp_port(const KadSearchEntry& entry) noexcept {

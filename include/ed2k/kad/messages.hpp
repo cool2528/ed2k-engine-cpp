@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <system_error>
@@ -68,6 +69,11 @@ struct Kad2Request {
 
 struct Kad2Response {
   KadID target;
+  std::vector<Contact> contacts;
+};
+
+struct KadBootstrapResponse {
+  Contact sender;
   std::vector<Contact> contacts;
 };
 
@@ -145,6 +151,12 @@ tl::expected<Contact, std::error_code> decode_kad2_hello(const net::Packet& pack
                                                           IPv4 sender_ip,
                                                           std::uint16_t sender_udp_port);
 
+net::Packet encode_kad2_bootstrap_req();
+tl::expected<void, std::error_code> decode_kad2_bootstrap_req(const net::Packet& packet);
+net::Packet encode_kad2_bootstrap_res(const Contact& self, std::span<const Contact> contacts);
+tl::expected<KadBootstrapResponse, std::error_code> decode_kad2_bootstrap_res(
+    const net::Packet& packet, IPv4 sender_ip, std::uint16_t sender_udp_port);
+
 net::Packet encode_kad2_req(const KadID& target, const KadID& receiver_id, std::uint8_t count);
 tl::expected<Kad2Request, std::error_code> decode_kad2_req(const net::Packet& packet);
 
@@ -208,6 +220,8 @@ tl::expected<KadCallbackRequest, std::error_code> decode_kademlia_callback_req(c
 
 std::string file_name(const KadSearchEntry& entry);
 std::uint64_t file_size(const KadSearchEntry& entry) noexcept;
+std::uint8_t source_type(const KadSearchEntry& entry) noexcept;
+std::optional<IPv4> source_ip(const KadSearchEntry& entry) noexcept;
 std::uint16_t source_tcp_port(const KadSearchEntry& entry) noexcept;
 std::uint16_t source_udp_port(const KadSearchEntry& entry) noexcept;
 

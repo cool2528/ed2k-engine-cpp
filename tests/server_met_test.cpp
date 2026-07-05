@@ -62,8 +62,8 @@ TEST(ServerMet, PreservesUnknownTags){
   EXPECT_EQ(std::get<std::string>(g1.value), std::string("hello"));
 }
 
-// Graceful degradation: an unsupported tag TYPE (e.g. Float 0x04, not
-// implemented by codec::read_tag) must produce a clean error, not a crash.
+// Graceful degradation: an unsupported tag TYPE must produce a clean error,
+// not a crash.
 TEST(ServerMet, UnsupportedTagTypeErrorsNoCrash){
   codec::ByteWriter w;
   w.u8(0x0E);            // valid magic
@@ -71,7 +71,7 @@ TEST(ServerMet, UnsupportedTagTypeErrorsNoCrash){
   w.u32(0x0100007F);     // ip
   w.u16(4661);           // port
   w.u32(1);              // 1 tag
-  w.u8(0x8A);            // type 0x0A (undefined, unsupported) | NameFlag 0x80
+  w.u8(0x8C);            // type 0x0C (undefined, unsupported) | NameFlag 0x80
   w.u8(0x01);            // name_id
   w.u32(0);              // some payload bytes
   auto bytes=w.take();

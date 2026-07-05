@@ -26,6 +26,7 @@ struct KadNetworkOptions {
   std::uint16_t tcp_port = 0;
   std::uint8_t version = kad2_version;
   KadID user_hash;
+  std::uint32_t kad_udp_key = 0x4b414432;
 };
 
 enum class KadFirewallState {
@@ -132,9 +133,28 @@ class KadNetwork {
   void close() noexcept { socket_.close(); }
 
  private:
+  struct ReceivedPacket {
+    net::Packet packet;
+    boost::asio::ip::udp::endpoint sender;
+    std::uint32_t sender_verify_key = 0;
+    bool encrypted = false;
+    bool valid_receiver_key = false;
+  };
+
+  boost::asio::awaitable<tl::expected<void, std::error_code>>
+  send_kad_packet(const Contact& remote, const net::Packet& packet);
+
+  boost::asio::awaitable<tl::expected<void, std::error_code>>
+  send_kad_packet(boost::asio::ip::udp::endpoint remote, const net::Packet& packet,
+                  std::uint32_t receiver_verify_key);
+
+  boost::asio::awaitable<tl::expected<ReceivedPacket, std::error_code>>
+  recv_kad_packet(std::chrono::milliseconds timeout);
+
   net::UdpSocket socket_;
   Contact self_;
   KadID user_hash_;
+  std::uint32_t kad_udp_key_ = 0;
   RoutingTable routing_;
   KadIndexed indexed_;
   KadFirewallState udp_firewall_state_ = KadFirewallState::unknown;

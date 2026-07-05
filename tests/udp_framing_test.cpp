@@ -40,6 +40,17 @@ TEST(UdpFraming, ZlibInflatesAndNormalizes){
   EXPECT_EQ(r->opcode, 0x99);
   EXPECT_EQ(r->payload, plain);
 }
+TEST(UdpFraming, KadPackedInflatesAndNormalizes){
+  auto plain = bytes({0xB9,0xF9,0x17,0xAD,0xE5,0x6B,0x17,0x2E});
+  auto comp = zlib_compress(plain);
+  std::vector<std::byte> dg; dg.push_back(std::byte(0xE5)); dg.push_back(std::byte(0x09));
+  dg.insert(dg.end(), comp.begin(), comp.end());
+  auto r = parse_udp_datagram(dg);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->protocol, 0xE4);
+  EXPECT_EQ(r->opcode, 0x09);
+  EXPECT_EQ(r->payload, plain);
+}
 TEST(UdpFraming, BadZlibFails){
   std::vector<std::byte> dg = bytes({proto::zlib, 0x99, 0xFF,0xFF,0xFF,0xFF});
   auto r = parse_udp_datagram(dg);

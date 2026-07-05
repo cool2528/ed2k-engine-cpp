@@ -77,6 +77,47 @@ ed2k-tool comment "ed2k://|file|shared.bin|1|00112233445566778899aabbccddeeff|/"
 With `--peer`, the command connects to the peer, performs the C2C handshake, sets the requested file
 context, and sends `OP_FILEDESC` over the eMule protocol.
 
+## `kad-bootstrap <nodes.dat>`
+
+Load a KAD `nodes.dat`, create a local Kad2 UDP node, and bootstrap against the listed contacts.
+Prints the loaded seed count, learned routing-table count, and bound UDP port.
+
+```bash
+ed2k-tool kad-bootstrap nodes.dat
+# kad contacts: loaded=42 routing=17 udp_port=4672
+```
+
+## `kad-search <nodes.dat> <keyword>`
+
+Bootstrap from `nodes.dat`, derive the Kad keyword target, and search the Kad network. Results are
+printed as `kad-answer-id  size  name`.
+
+```bash
+ed2k-tool kad-search nodes.dat ubuntu
+```
+
+## `kad-find-sources <nodes.dat> <ed2k-link>`
+
+Bootstrap from `nodes.dat` and ask Kad for sources of the file hash in the link. Direct HighID
+sources are printed with IP, TCP/UDP ports, source type, and Kad answer ID.
+
+```bash
+ed2k-tool kad-find-sources nodes.dat "ed2k://|file|ubuntu.iso|...|/"
+```
+
+## `kad-publish <nodes.dat> <dir> [--port:n]`
+
+Scan a local share directory and publish source + keyword records to the closest Kad contacts.
+The indexer adds the publisher IP from the UDP sender endpoint, matching aMule Kad source publish
+behavior.
+
+- `--port:n` — TCP peer port advertised in `TAG_SOURCEPORT` (default: `4662`).
+
+```bash
+ed2k-tool kad-publish nodes.dat D:\share --port:4662
+# kad published files=3 packets=12
+```
+
 ## `download <ed2k-link> [--out:PATH] [--server:server.met]`
 
 Download a file. Multi-source: the engine gathers sources from the server and downloads from
@@ -104,5 +145,6 @@ ed2k-tool download "ed2k://|file|ubuntu.iso|...|/" --out:ubuntu.iso --server:ser
 
 - `ED2K_LIVE=1` — enable live tests (see README). Not used by the CLI.
 - `ED2K_SOURCE=ip:port` — live-test local aMule peer for direct download / SourceExchange checks.
+- `ED2K_KAD_NODES=PATH` — live-test Kad bootstrap seed file for `LiveKad.*`.
 - `ED2K_UPLOAD_FILE=PATH` and optional `ED2K_UPLOAD_PORT=n` — live upload-session harness: the test
   listens and waits for a real peer to request the file.

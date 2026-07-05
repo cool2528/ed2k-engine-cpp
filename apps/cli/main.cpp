@@ -1,7 +1,10 @@
 #include <cstdio>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <fstream>
 #include <chrono>
@@ -19,10 +22,17 @@
 #include "ed2k/server/connection.hpp"
 #include "ed2k/server/search_query.hpp"
 #include "ed2k/share/known_file.hpp"
+#include "ed2k/kad/keywords.hpp"
+#include "ed2k/kad/messages.hpp"
+#include "ed2k/kad/network.hpp"
+#include "ed2k/kad/nodes_dat.hpp"
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 namespace asio = boost::asio;
 using namespace ed2k;
+static constexpr std::size_t k_kad_bootstrap_seed_limit = 256;
+static constexpr std::chrono::milliseconds k_kad_bootstrap_timeout{1500};
+static constexpr std::chrono::milliseconds k_kad_request_timeout{60000};
 static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool serverlist <server.met>\n"
   "       ed2k-tool parse <ed2k-link>\n"
@@ -31,6 +41,10 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool sources <server.met> <ed2k-link>\n"
   "       ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]\n"
   "       ed2k-tool comment <ed2k-link> --rating:n --comment:text [--peer:ip:port]\n"
+  "       ed2k-tool kad-bootstrap <nodes.dat>\n"
+  "       ed2k-tool kad-search <nodes.dat> <keyword>\n"
+  "       ed2k-tool kad-find-sources <nodes.dat> <ed2k-link>\n"
+  "       ed2k-tool kad-publish <nodes.dat> <dir> [--port:n]\n"
   "       ed2k-tool download <ed2k-link> [--out:PATH] [--server:server.met]"); return 2; }
 static std::vector<std::byte> read_all(const char* p){
   std::ifstream f(p,std::ios::binary); std::vector<std::byte> v;
@@ -62,6 +76,72 @@ static ed2k::peer::HelloInfo cli_hello(){
   h.port = 4662;
   h.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
   return h;
+}
+static ed2k::UserHash cli_user_hash(){
+  return *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+}
+static ed2k::kad::KadID kad_id_from_hash(const ed2k::FileHash& hash){
+  return ed2k::kad::KadID::from_bytes(hash.bytes());
+}
+static ed2k::kad::KadID cli_kad_user_hash(){
+  auto hash = cli_user_hash();
+  return ed2k::kad::KadID::from_bytes(hash.bytes());
+}
+static ed2k::kad::KadNetworkOptions cli_kad_options(std::uint16_t tcp_port){
+  auto user_hash = cli_user_hash();
+  return ed2k::kad::KadNetworkOptions{
+    .id = ed2k::kad::KadID::from_user_hash(user_hash, 1),
+    .ip = ed2k::IPv4::from_dotted("0.0.0.0").value(),
+    .tcp_port = tcp_port,
+    .version = ed2k::kad::kad2_version,
+    .user_hash = ed2k::kad::KadID::from_bytes(user_hash.bytes()),
+  };
+}
+static codec::Tag kad_int_tag(std::uint8_t name_id, std::uint64_t value){
+  codec::Tag tag;
+  tag.name_str = std::string(1, static_cast<char>(name_id));
+  tag.value = value;
+  return tag;
+}
+static codec::Tag kad_string_tag(std::uint8_t name_id, std::string value){
+  codec::Tag tag;
+  tag.name_str = std::string(1, static_cast<char>(name_id));
+  tag.value = std::move(value);
+  return tag;
+}
+static ed2k::kad::KadSearchEntry kad_file_entry(const ed2k::share::KnownFile& file){
+  return ed2k::kad::KadSearchEntry{
+    .answer_id = kad_id_from_hash(file.hash),
+    .tags = {
+      kad_string_tag(ed2k::kad::tag::filename, file.name),
+      kad_int_tag(ed2k::kad::tag::file_size, file.size),
+    },
+  };
+}
+static ed2k::kad::KadSearchEntry kad_source_entry(const ed2k::share::KnownFile& file,
+                                                  std::uint16_t tcp_port,
+                                                  std::uint16_t udp_port){
+  return ed2k::kad::KadSearchEntry{
+    .answer_id = cli_kad_user_hash(),
+    .tags = {
+      kad_int_tag(ed2k::kad::tag::source_type, 1),
+      kad_int_tag(ed2k::kad::tag::source_port, tcp_port),
+      kad_int_tag(ed2k::kad::tag::source_udp_port, udp_port),
+      kad_int_tag(ed2k::kad::tag::file_size, file.size),
+    },
+  };
+}
+static tl::expected<std::vector<ed2k::kad::Contact>, std::error_code>
+load_kad_nodes(const char* path){
+  return ed2k::kad::parse_nodes_dat(read_all(path));
+}
+static asio::awaitable<tl::expected<void, std::error_code>>
+bootstrap_if_needed(ed2k::kad::KadNetwork& network,
+                    const std::vector<ed2k::kad::Contact>& contacts,
+                    std::chrono::milliseconds timeout){
+  if(contacts.empty()) co_return tl::expected<void, std::error_code>{};
+  const auto seed_count = std::min(contacts.size(), k_kad_bootstrap_seed_limit);
+  co_return co_await network.bootstrap(std::span<const ed2k::kad::Contact>(contacts.data(), seed_count), timeout);
 }
 int main(int argc,char** argv){
   if(argc<2) return usage();
@@ -236,6 +316,134 @@ int main(int argc,char** argv){
       if(!sr){ std::printf("error: %s\n", sr.error().message().c_str()); rc=1; }
       else std::printf("sent comment for %s\n", f->hash.to_hex().c_str());
       c.close();
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
+  }
+  if(cmd=="kad-bootstrap"){
+    if(argc<3) return usage();
+    auto contacts = load_kad_nodes(argv[2]);
+    if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
+    ed2k::net::IoRuntime rt; int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(4662));
+      auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
+      if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; }
+      else {
+        std::printf("kad contacts: loaded=%zu routing=%zu udp_port=%u\n",
+          contacts->size(), network.routing_table().size(), network.self_contact().udp_port);
+      }
+      network.close();
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
+  }
+  if(cmd=="kad-search"){
+    if(argc<4) return usage();
+    auto contacts = load_kad_nodes(argv[2]);
+    if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
+    const auto key = ed2k::kad::keyword_id(argv[3]);
+    ed2k::net::IoRuntime rt; int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(4662));
+      auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
+      if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; network.close(); rt.stop(); co_return; }
+      auto peers = network.routing_table().closest_to(key, ed2k::kad::KBucket::capacity);
+      if(peers.empty()){
+        std::printf("(0 results)\n");
+        network.close(); rt.stop(); co_return;
+      }
+      auto results = co_await network.search_keyword(peers, key, k_kad_request_timeout);
+      if(!results){ std::printf("error: %s\n", results.error().message().c_str()); rc=1; }
+      else {
+        for(const auto& entry : *results)
+          std::printf("%s  %12llu  %s\n", entry.answer_id.to_hex().c_str(),
+            (unsigned long long)ed2k::kad::file_size(entry), ed2k::kad::file_name(entry).c_str());
+        std::printf("(%zu results)\n", results->size());
+      }
+      network.close();
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
+  }
+  if(cmd=="kad-find-sources"){
+    if(argc<4) return usage();
+    auto contacts = load_kad_nodes(argv[2]);
+    if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
+    auto pl = parse_link(argv[3]);
+    if(!pl){ std::printf("error: %s\n", pl.error().message().c_str()); return 1; }
+    auto* f = std::get_if<Ed2kFileLink>(&*pl);
+    if(!f){ std::printf("error: not a file link\n"); return 1; }
+    const auto file_id = kad_id_from_hash(f->hash);
+    ed2k::net::IoRuntime rt; int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(4662));
+      auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
+      if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; network.close(); rt.stop(); co_return; }
+      auto peers = network.routing_table().closest_to(file_id, ed2k::kad::KBucket::capacity);
+      if(peers.empty()){
+        std::printf("(0 sources)\n");
+        network.close(); rt.stop(); co_return;
+      }
+      auto sources = co_await network.find_sources(peers, file_id, f->size, k_kad_request_timeout);
+      if(!sources){ std::printf("error: %s\n", sources.error().message().c_str()); rc=1; }
+      else {
+        for(const auto& entry : *sources){
+          auto ip = ed2k::kad::source_ip(entry);
+          std::printf("%s  tcp=%u udp=%u type=%u id=%s\n",
+            ip ? ip->to_dotted().c_str() : "-",
+            ed2k::kad::source_tcp_port(entry),
+            ed2k::kad::source_udp_port(entry),
+            ed2k::kad::source_type(entry),
+            entry.answer_id.to_hex().c_str());
+        }
+        std::printf("(%zu sources)\n", sources->size());
+      }
+      network.close();
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
+  }
+  if(cmd=="kad-publish"){
+    if(argc<4) return usage();
+    auto contacts = load_kad_nodes(argv[2]);
+    if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
+    std::filesystem::path dir = argv[3];
+    std::uint16_t tcp_port = 4662;
+    for(int i=4;i<argc;++i){
+      std::string a=argv[i];
+      if(a.rfind("--port:",0)==0) tcp_port=std::uint16_t(std::stoi(a.substr(7)));
+    }
+    ed2k::share::KnownFileDB db;
+    auto scan = db.scan_dir(dir);
+    if(!scan){ std::printf("error: %s\n", scan.error().message().c_str()); return 1; }
+    ed2k::net::IoRuntime rt; int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(tcp_port));
+      auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
+      if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; network.close(); rt.stop(); co_return; }
+      std::size_t packets = 0;
+      for(const auto& file : db.files()){
+        const auto file_id = kad_id_from_hash(file.hash);
+        auto source = kad_source_entry(file, tcp_port, network.self_contact().udp_port);
+        auto source_peers = network.routing_table().closest_to(file_id, ed2k::kad::KBucket::capacity);
+        for(const auto& peer : source_peers){
+          auto sent = co_await network.publish_source(peer, file_id, source, k_kad_request_timeout);
+          if(sent) ++packets;
+        }
+
+        for(const auto& keyword : ed2k::kad::keywords_for_name(file.name)){
+          const auto key = ed2k::kad::keyword_id(keyword);
+          std::vector<ed2k::kad::KadSearchEntry> entries{kad_file_entry(file)};
+          auto key_peers = network.routing_table().closest_to(key, ed2k::kad::KBucket::capacity);
+          for(const auto& peer : key_peers){
+            auto sent = co_await network.publish_keyword(peer, key, entries, k_kad_request_timeout);
+            if(sent) ++packets;
+          }
+        }
+      }
+      std::printf("kad published files=%zu packets=%zu\n", db.files().size(), packets);
+      network.close();
       rt.stop(); co_return;
     }, asio::detached);
     rt.run(); return rc;

@@ -79,4 +79,29 @@ bool closer_to_target(const KadID& lhs, const KadID& rhs, const KadID& target) n
   return xor_distance(lhs, target) < xor_distance(rhs, target);
 }
 
+std::array<std::byte, KadID::size> kad_id_to_uint128_wire(const KadID& id) noexcept {
+  std::array<std::byte, KadID::size> out{};
+  const auto& bytes = id.bytes();
+  for (std::size_t chunk = 0; chunk < 4; ++chunk) {
+    const auto base = chunk * 4;
+    out[base + 0] = bytes[base + 3];
+    out[base + 1] = bytes[base + 2];
+    out[base + 2] = bytes[base + 1];
+    out[base + 3] = bytes[base + 0];
+  }
+  return out;
+}
+
+KadID kad_id_from_uint128_wire(std::span<const std::byte, KadID::size> wire) noexcept {
+  std::array<std::byte, KadID::size> out{};
+  for (std::size_t chunk = 0; chunk < 4; ++chunk) {
+    const auto base = chunk * 4;
+    out[base + 0] = wire[base + 3];
+    out[base + 1] = wire[base + 2];
+    out[base + 2] = wire[base + 1];
+    out[base + 3] = wire[base + 0];
+  }
+  return KadID::from_bytes(out);
+}
+
 } // namespace ed2k::kad

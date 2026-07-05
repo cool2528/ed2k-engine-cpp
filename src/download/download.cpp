@@ -2,6 +2,7 @@
 #include "ed2k/download/part_file.hpp"
 #include "ed2k/download/block_allocator.hpp"
 #include "ed2k/download/aich_checker.hpp"
+#include "ed2k/kad/network.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/util/error.hpp"
 #include <optional>
@@ -16,6 +17,37 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/experimental/channel.hpp>
 namespace ed2k::download {
+namespace {
+kad::KadID kad_id_from_hash(const FileHash& hash) {
+  return kad::KadID::from_bytes(hash.bytes());
+}
+
+std::uint32_t ipv4_to_wire(IPv4 ip) noexcept {
+  const auto host = ip.host();
+  return ((host & 0x000000ffu) << 24) |
+         ((host & 0x0000ff00u) << 8) |
+         ((host & 0x00ff0000u) >> 8) |
+         ((host & 0xff000000u) >> 24);
+}
+
+bool same_source(const server::SourceEndpoint& lhs, const server::SourceEndpoint& rhs) noexcept {
+  return lhs.id == rhs.id && lhs.port == rhs.port;
+}
+
+std::optional<server::SourceEndpoint> endpoint_from_kad_source(const kad::KadSearchEntry& entry) {
+  const auto type = kad::source_type(entry);
+  if (type != 1 && type != 4) {
+    return std::nullopt;
+  }
+  const auto ip = kad::source_ip(entry);
+  const auto tcp_port = kad::source_tcp_port(entry);
+  if (!ip || tcp_port == 0) {
+    return std::nullopt;
+  }
+  return server::SourceEndpoint{ipv4_to_wire(*ip), tcp_port};
+}
+} // namespace
+
 Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
                    const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source)
   : conn_(ex), out_(out), hash_(hash), size_(size), source_(source) {}
@@ -92,12 +124,14 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
   : ex_(ex), disk_ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich),
     sources_(std::move(sources)),
     server_conn_(server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt),
-    listener_(listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt) {}
+    listener_(listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt),
+    kad_network_(std::nullopt) {}
 
 MultiSourceDownload MultiSourceDownload::Builder::build() {
   return MultiSourceDownload(net_ex_, disk_ex_, std::move(out_), hash_, size_,
                              std::move(aich_), std::move(sources_),
-                             std::move(server_), std::move(listener_));
+                             std::move(server_), std::move(listener_),
+                             std::move(kad_network_));
 }
 
 // === raccoon 多源并发 (P4c-3) ===
@@ -344,6 +378,26 @@ peer_worker(boost::asio::any_io_executor ex,
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
                          std::size_t max_retries){
+  if(kad_network_){
+    auto& kad_network = kad_network_->get();
+    const auto file_id = kad_id_from_hash(hash_);
+    auto peers = kad_network.routing_table().closest_to(file_id, kad::KBucket::capacity);
+    if(!peers.empty()){
+      auto kad_sources = co_await kad_network.find_sources(peers, file_id, size_, total_timeout);
+      if(kad_sources){
+        for(const auto& entry : *kad_sources){
+          auto endpoint = endpoint_from_kad_source(entry);
+          if(!endpoint) continue;
+          const auto duplicate = std::any_of(sources_.begin(), sources_.end(),
+                                             [&](const server::SourceEndpoint& current){
+                                               return same_source(current, *endpoint);
+                                             });
+          if(!duplicate) sources_.push_back(*endpoint);
+        }
+      }
+    }
+  }
+
   // 阶段一: setup — 顺序从首个可用源拿 hashset (失败顺次尝试下一源), 连接复用给该源 worker。
   FetchResult fr;
   std::size_t setup_idx = 0;

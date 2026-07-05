@@ -56,6 +56,10 @@ ed2k-tool parse <ed2k-link>                             # parse an ed2k:// link
 ed2k-tool login <server.met> [--ip:x.x.x.x] [--port:n]  # login to a server (P4c-1)
 ed2k-tool search <server.met> <keyword>                 # keyword search
 ed2k-tool sources <server.met> <ed2k-link>              # get sources for a file
+ed2k-tool kad-bootstrap <nodes.dat>                     # bootstrap Kad routing
+ed2k-tool kad-search <nodes.dat> <keyword>              # Kad keyword search
+ed2k-tool kad-find-sources <nodes.dat> <ed2k-link>      # Kad source lookup
+ed2k-tool kad-publish <nodes.dat> <dir> [--port:n]      # publish share to Kad
 ed2k-tool download <ed2k-link> [--out:PATH] [--server:server.met]  # download
 ```
 
@@ -74,6 +78,11 @@ ed2k-tool login server.met
 ed2k-tool search server.met "ubuntu"
 ed2k-tool sources server.met "ed2k://|file|ubuntu.iso|...|/"
 ed2k-tool download "ed2k://|file|ubuntu.iso|...|/" --out:ubuntu.iso --server:server.met
+
+# Kad bootstrap/search/source lookup
+ed2k-tool kad-bootstrap nodes.dat
+ed2k-tool kad-search nodes.dat "ubuntu"
+ed2k-tool kad-find-sources nodes.dat "ed2k://|file|ubuntu.iso|...|/"
 ```
 
 `download` without `--server` falls back to an internal fallback server list. Downloaded files

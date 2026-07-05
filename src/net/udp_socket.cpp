@@ -18,16 +18,24 @@ bool UdpSocket::is_open() const noexcept { return socket_.is_open(); }
 udp::endpoint UdpSocket::local_endpoint() const { return socket_.local_endpoint(); }
 
 asio::awaitable<tl::expected<void,std::error_code>>
-UdpSocket::send_to(udp::endpoint ep, const Packet& p){
-  auto dg = encode_udp_packet(p);
-  auto [ec,n] = co_await socket_.async_send_to(asio::buffer(dg.data(), dg.size()), ep,
+UdpSocket::send_datagram(udp::endpoint ep, std::span<const std::byte> datagram){
+  auto [ec,n] = co_await socket_.async_send_to(asio::buffer(datagram.data(), datagram.size()), ep,
                                                 asio::as_tuple(asio::use_awaitable));
   (void)n;
   if(ec) co_return tl::unexpected(make_error_code(errc::connection_closed));
   co_return tl::expected<void,std::error_code>{};
 }
-asio::awaitable<tl::expected<std::pair<Packet,udp::endpoint>,std::error_code>>
-UdpSocket::recv_from(std::chrono::milliseconds timeout){
+
+asio::awaitable<tl::expected<void,std::error_code>>
+UdpSocket::send_to(udp::endpoint ep, const Packet& p){
+  auto dg = encode_udp_packet(p);
+  auto sent = co_await send_datagram(ep, dg);
+  if(!sent) co_return tl::unexpected(sent.error());
+  co_return tl::expected<void,std::error_code>{};
+}
+
+asio::awaitable<tl::expected<std::pair<std::vector<std::byte>,udp::endpoint>,std::error_code>>
+UdpSocket::recv_datagram(std::chrono::milliseconds timeout){
   std::vector<std::byte> buf(65536);                  // UDP 数据报 ≤ 64KiB
   udp::endpoint sender;
   auto [ec,n] = co_await socket_.async_receive_from(asio::buffer(buf), sender,
@@ -36,8 +44,16 @@ UdpSocket::recv_from(std::chrono::milliseconds timeout){
     if(ec == asio::error::operation_aborted) co_return tl::unexpected(make_error_code(errc::timed_out));
     co_return tl::unexpected(make_error_code(errc::connection_closed));
   }
-  auto pkt = parse_udp_datagram(std::span<const std::byte>{buf.data(), n});
+  buf.resize(n);
+  co_return std::make_pair(std::move(buf), sender);
+}
+
+asio::awaitable<tl::expected<std::pair<Packet,udp::endpoint>,std::error_code>>
+UdpSocket::recv_from(std::chrono::milliseconds timeout){
+  auto received = co_await recv_datagram(timeout);
+  if(!received) co_return tl::unexpected(received.error());
+  auto pkt = parse_udp_datagram(received->first);
   if(!pkt) co_return tl::unexpected(pkt.error());
-  co_return std::make_pair(std::move(*pkt), sender);
+  co_return std::make_pair(std::move(*pkt), received->second);
 }
 }

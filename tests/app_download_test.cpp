@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
+#include <string>
 #include <vector>
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -24,6 +26,8 @@
 #include "ed2k/server/messages.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include "ed2k/metfile/server_met.hpp"
+#include "ed2k/kad/messages.hpp"
+#include "ed2k/kad/network.hpp"
 #include "ed2k/util/error.hpp"
 #include "crypto/md4.hpp"
 #include "mock_peer.hpp"
@@ -44,6 +48,32 @@ template <class F> static void run_coro(IoRuntime& rt, F&& body){
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
   std::vector<std::byte> v; for(int x:xs) v.push_back(std::byte(x)); return v;
 }
+static ed2k::kad::KadID kad_id(const FileHash& hash){
+  return ed2k::kad::KadID::from_bytes(hash.bytes());
+}
+static ed2k::kad::KadID kad_id(const char* hex){
+  return *ed2k::kad::KadID::from_hex(hex);
+}
+static codec::Tag kad_int_tag(std::uint8_t name_id, std::uint64_t value){
+  codec::Tag tag;
+  tag.name_str = std::string(1, static_cast<char>(name_id));
+  tag.value = value;
+  return tag;
+}
+static ed2k::kad::KadSearchEntry kad_source_entry(const char* source_hex,
+                                                  std::uint16_t tcp_port,
+                                                  std::uint16_t udp_port,
+                                                  std::uint64_t size){
+  return ed2k::kad::KadSearchEntry{
+    .answer_id = kad_id(source_hex),
+    .tags = {
+      kad_int_tag(ed2k::kad::tag::source_type, 1),
+      kad_int_tag(ed2k::kad::tag::source_port, tcp_port),
+      kad_int_tag(ed2k::kad::tag::source_udp_port, udp_port),
+      kad_int_tag(ed2k::kad::tag::file_size, size),
+    },
+  };
+}
 static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t op, std::span<const std::byte> pl){
   Packet p; p.protocol=proto::eDonkey; p.opcode=op; p.payload.assign(pl.begin(),pl.end());
   auto fr=encode_frame(p); auto [e,n]=co_await asio::async_write(s,asio::buffer(fr),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return;
@@ -57,6 +87,10 @@ static asio::awaitable<std::vector<std::byte>> read_frame(tcp::socket& s){
   co_return body;
 }
 static asio::awaitable<void> keep_alive(tcp::socket& s){ std::array<std::byte,1> t; auto [e,n]=co_await asio::async_read(s,asio::buffer(t),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return; }
+static asio::awaitable<void> serve_kad_n(ed2k::kad::KadNetwork& network, int count){
+  for(int i=0;i<count;++i) (void)co_await network.serve_once(500ms);
+  co_return;
+}
 
 // mock peer 提供一个 2-part 文件,part 数据由 fill 决定
 struct MockFile { std::vector<std::byte> d0, d1; PartHash h0, h1; FileHash fhash; };
@@ -151,6 +185,70 @@ TEST(AppDownload, EndToEndHighIdMockDownload){
     co_return;
   });
   // 校验文件存在 + size == PART*2 (内容已由 PartFile part-MD4 校验保证)
+  ASSERT_TRUE(std::filesystem::exists(tmp));
+  EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
+  std::filesystem::remove(tmp);
+}
+
+TEST(AppDownload, KadSourcesCompleteWhenServerReturnsNoSources){
+  auto mf = make_mock_file(0x77, 0x88);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, server::op::IDCHANGE, w.take()); }
+    (void)co_await read_frame(s);   // GETSOURCES
+    codec::ByteWriter w; w.hash16(mf.fhash); w.u8(0);
+    co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
+    co_await keep_alive(s);
+    co_return;
+  });
+
+  ed2k::kad::KadNetwork publisher(rt.executor(), ed2k::kad::KadNetworkOptions{
+    .id = kad_id("00000000000000000000000000000001"),
+    .ip = IPv4::from_dotted("127.0.0.1").value(),
+    .tcp_port = peer.port(),
+    .version = ed2k::kad::kad2_version,
+  });
+  ed2k::kad::KadNetwork indexer(rt.executor(), ed2k::kad::KadNetworkOptions{
+    .id = kad_id(mf.fhash),
+    .ip = IPv4::from_dotted("127.0.0.1").value(),
+    .tcp_port = 4662,
+    .version = ed2k::kad::kad2_version,
+  });
+  ed2k::kad::KadNetwork searcher(rt.executor(), ed2k::kad::KadNetworkOptions{
+    .id = kad_id("00000000000000000000000000000003"),
+    .ip = IPv4::from_dotted("127.0.0.1").value(),
+    .tcp_port = 4663,
+    .version = ed2k::kad::kad2_version,
+  });
+
+  Ed2kFileLink link; link.name="t"; link.size=PART*2; link.hash=mf.fhash;
+  ServerList sl; ServerEntry sv; sv.ip=IPv4::from_dotted("127.0.0.1").value(); sv.port=srv.port(); sl.servers={sv};
+  auto metbytes = write_server_met(sl);
+  auto tmp = std::filesystem::temp_directory_path() / "ed2k_app_dl_kad_sources_test";
+  std::filesystem::remove(tmp);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto source = kad_source_entry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", peer.port(),
+                                   publisher.self_contact().udp_port, link.size);
+    asio::co_spawn(rt.context(), serve_kad_n(indexer, 1), asio::detached);
+    auto published = co_await publisher.publish_source(indexer.self_contact(), kad_id(link.hash), source, 1s);
+    EXPECT_TRUE(published.has_value()) << (published ? "" : published.error().message());
+    if(!published) co_return;
+
+    EXPECT_TRUE(searcher.routing_table().add_or_update(indexer.self_contact()));
+    asio::co_spawn(rt.context(), serve_kad_n(indexer, 2), asio::detached);
+
+    DownloadOpts o; o.out_path=tmp; o.per_server_timeout=3000ms; o.total_timeout=20000ms;
+    o.kad_network = std::ref(searcher);
+    auto r = co_await download_link(rt.executor(), link, metbytes,
+      ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()}, o);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    co_return;
+  });
   ASSERT_TRUE(std::filesystem::exists(tmp));
   EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
   std::filesystem::remove(tmp);

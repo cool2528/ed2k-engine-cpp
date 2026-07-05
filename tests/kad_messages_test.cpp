@@ -63,8 +63,8 @@ TEST(KadMessages, HelloReqUsesKadProtocolAndAmuleLayout) {
   ASSERT_EQ(packet.payload.size(), 20u);
   EXPECT_EQ(bytes_of(packet.payload),
             (std::vector<unsigned>{
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+                0x33, 0x22, 0x11, 0x00, 0x77, 0x66, 0x55, 0x44,
+                0xbb, 0xaa, 0x99, 0x88, 0xff, 0xee, 0xdd, 0xcc,
                 0x36, 0x12, 0x08, 0x00,
             }));
 
@@ -114,14 +114,61 @@ TEST(KadMessages, ReqAndResRoundTripWithReceiverCheckId) {
   EXPECT_EQ(res->contacts[1].ip.to_dotted(), "203.0.113.9");
 }
 
+TEST(KadMessages, BootstrapReqAndResUseAmuleLayout) {
+  const auto self = contact("00112233445566778899aabbccddeeff", "10.1.2.3", 4665, 4662, 8);
+  const auto known = contact("3322110077665544bbaa9988ffeeddcc", "203.0.113.9", 14665, 14662, 9);
+
+  auto req_packet = encode_kad2_bootstrap_req();
+  EXPECT_EQ(req_packet.protocol, kad_protocol);
+  EXPECT_EQ(req_packet.opcode, opcode::kad2_bootstrap_req);
+  EXPECT_TRUE(req_packet.payload.empty());
+  EXPECT_TRUE(decode_kad2_bootstrap_req(req_packet).has_value());
+
+  const std::vector<Contact> contacts{known};
+  auto res_packet = encode_kad2_bootstrap_res(self, contacts);
+  EXPECT_EQ(res_packet.protocol, kad_protocol);
+  EXPECT_EQ(res_packet.opcode, opcode::kad2_bootstrap_res);
+  ASSERT_EQ(res_packet.payload.size(), 46u);
+  EXPECT_EQ(bytes_of(res_packet.payload),
+            (std::vector<unsigned>{
+                0x33, 0x22, 0x11, 0x00, 0x77, 0x66, 0x55, 0x44,
+                0xbb, 0xaa, 0x99, 0x88, 0xff, 0xee, 0xdd, 0xcc,
+                0x36, 0x12, 0x08, 0x01, 0x00,
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+                0x09, 0x71, 0x00, 0xcb, 0x49, 0x39, 0x46, 0x39, 0x09,
+            }));
+
+  auto res = decode_kad2_bootstrap_res(res_packet, *IPv4::from_dotted("198.51.100.7"), 4665);
+  ASSERT_TRUE(res.has_value());
+  EXPECT_EQ(res->sender.id, self.id);
+  EXPECT_EQ(res->sender.ip.to_dotted(), "198.51.100.7");
+  EXPECT_EQ(res->sender.udp_port, 4665);
+  EXPECT_EQ(res->sender.tcp_port, 4662);
+  ASSERT_EQ(res->contacts.size(), 1u);
+  EXPECT_EQ(res->contacts[0], known);
+}
+
 TEST(KadMessages, RejectsMalformedPackets) {
   auto hello = encode_kad2_hello_req(contact("00112233445566778899aabbccddeeff", "10.0.0.1", 4665, 4662));
   hello.protocol = net::proto::eDonkey;
   EXPECT_FALSE(decode_kad2_hello(hello, *IPv4::from_dotted("10.0.0.2"), 4665).has_value());
 
+  auto bootstrap = encode_kad2_bootstrap_req();
+  bootstrap.payload = {std::byte{0x00}};
+  EXPECT_FALSE(decode_kad2_bootstrap_req(bootstrap).has_value());
+
   auto req = encode_kad2_req(kid("0102030405060708090a0b0c0d0e0f10"),
                              kid("101112131415161718191a1b1c1d1e1f"), 0);
   EXPECT_FALSE(decode_kad2_req(req).has_value());
+
+  net::Packet truncated_bootstrap_res;
+  truncated_bootstrap_res.protocol = kad_protocol;
+  truncated_bootstrap_res.opcode = opcode::kad2_bootstrap_res;
+  truncated_bootstrap_res.payload = {std::byte{0x01}};
+  EXPECT_FALSE(decode_kad2_bootstrap_res(truncated_bootstrap_res,
+                                         *IPv4::from_dotted("10.0.0.2"), 4665)
+                   .has_value());
 
   net::Packet truncated_res;
   truncated_res.protocol = kad_protocol;
@@ -267,8 +314,8 @@ TEST(KadMessages, FirewalledAndFirewallUdpUseCurrentAmuleOpcodes) {
   EXPECT_EQ(bytes_of(fw2_packet.payload),
             (std::vector<unsigned>{
                 0x34, 0x12,
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+                0x33, 0x22, 0x11, 0x00, 0x77, 0x66, 0x55, 0x44,
+                0xbb, 0xaa, 0x99, 0x88, 0xff, 0xee, 0xdd, 0xcc,
                 0x0d,
             }));
 
