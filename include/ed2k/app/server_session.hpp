@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -10,6 +11,8 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include "ed2k/core/hash.hpp"
+#include "ed2k/infra/ip_filter.hpp"
+#include "ed2k/infra/proxy.hpp"
 #include "ed2k/server/connection.hpp"
 #include "ed2k/server/messages.hpp"
 #include "ed2k/download/download.hpp"
@@ -39,7 +42,10 @@ boost::asio::awaitable<tl::expected<LoginSession, std::error_code>>
                       std::span<const std::byte> server_met_bytes,
                       std::optional<ServerTarget> override,
                       const ed2k::server::LoginParams& p,
-                      std::chrono::milliseconds per_server_timeout);
+                      std::chrono::milliseconds per_server_timeout,
+                      std::optional<ed2k::infra::ProxyConfig> proxy = std::nullopt,
+                      std::shared_ptr<const ed2k::infra::IPFilter> ip_filter = nullptr,
+                      std::uint8_t ip_filter_level = 127);
 
 // M2 download orchestration options. client_port is the InboundListener port
 // (M3, Task 7); M2 only exercises HighID sources so it is unused on the wire.
@@ -49,6 +55,9 @@ struct DownloadOpts {
   std::chrono::milliseconds total_timeout = std::chrono::seconds(120);
   std::uint16_t client_port = 4662;
   std::optional<std::reference_wrapper<ed2k::kad::KadNetwork>> kad_network;
+  std::optional<ed2k::infra::ProxyConfig> proxy;
+  std::shared_ptr<const ed2k::infra::IPFilter> ip_filter;
+  std::uint8_t ip_filter_level = 127;
 };
 // Keep sources whose id is a HighID (!low_id(), i.e. id >= 0x1000000).
 // 保留定义供 CLI/测试复用; download_link 本身(M3)不再调用——LowID 源留给回调路径。

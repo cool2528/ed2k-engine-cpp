@@ -55,12 +55,18 @@ login_with_rotation(boost::asio::any_io_executor ex,
                     std::span<const std::byte> met_bytes,
                     std::optional<ServerTarget> override,
                     const ed2k::server::LoginParams& p,
-                    std::chrono::milliseconds per_server_timeout){
+                    std::chrono::milliseconds per_server_timeout,
+                    std::optional<ed2k::infra::ProxyConfig> proxy,
+                    std::shared_ptr<const ed2k::infra::IPFilter> ip_filter,
+                    std::uint8_t ip_filter_level){
   auto targets = build_targets(met_bytes, override);
   std::error_code last = make_error_code(errc::connect_failed);
   for(const auto& t : targets){
     ed2k::server::ServerConnection conn(ex);
-    auto r = co_await conn.connect_and_login(t.ip, t.port, p, per_server_timeout);
+    conn.set_ip_filter(ip_filter, ip_filter_level);
+    auto r = proxy
+      ? co_await conn.connect_and_login_via_proxy(*proxy, t.ip, t.port, p, per_server_timeout)
+      : co_await conn.connect_and_login(t.ip, t.port, p, per_server_timeout);
     if(r.has_value()) co_return LoginSession{std::move(conn), *r};
     last = r.error();
     conn.close();
@@ -81,7 +87,8 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
               const DownloadOpts& opts){
   ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=opts.client_port;
   p.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
-  auto lg = co_await login_with_rotation(ex, met_bytes, override, p, opts.per_server_timeout);
+  auto lg = co_await login_with_rotation(ex, met_bytes, override, p, opts.per_server_timeout,
+                                         opts.proxy, opts.ip_filter, opts.ip_filter_level);
   if(!lg) co_return tl::unexpected(lg.error());
   auto gs = co_await lg->conn.get_sources(link.hash, link.size, opts.per_server_timeout);
   if(!gs) co_return tl::unexpected(gs.error());
@@ -115,6 +122,7 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
                    .server(lg->conn);
   if(listener) builder.listener(*listener);
   if(opts.kad_network) builder.kad_network(opts.kad_network->get());
+  if(opts.ip_filter) builder.ip_filter(opts.ip_filter, opts.ip_filter_level);
   auto dl = builder.build();
   co_return co_await dl.run(opts.total_timeout, 3);
 }

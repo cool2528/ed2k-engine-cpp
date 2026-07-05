@@ -10,14 +10,19 @@
 #include <chrono>
 #include <optional>
 #include <cstddef>
+#include <memory>
 #include "ed2k/version.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/app/server_session.hpp"
+#include "ed2k/infra/collection.hpp"
+#include "ed2k/infra/http_download.hpp"
 #include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/infra/preferences.hpp"
+#include "ed2k/infra/proxy.hpp"
+#include "ed2k/infra/scheduler.hpp"
 #include "ed2k/infra/statistics.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
@@ -37,6 +42,7 @@ static constexpr std::size_t k_kad_bootstrap_seed_limit = 256;
 static constexpr std::chrono::milliseconds k_kad_bootstrap_timeout{1500};
 static constexpr std::chrono::milliseconds k_kad_request_timeout{60000};
 static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
+  "       ed2k-tool [--config <preferences.dat>] [--ipfilter <ipfilter.dat>] [--proxy <uri>] [--obfuscation] <command> ...\n"
   "       ed2k-tool serverlist <server.met>\n"
   "       ed2k-tool parse <ed2k-link>\n"
   "       ed2k-tool login <server.met> [--ip:x.x.x.x] [--port:n]\n"
@@ -47,6 +53,9 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool ipfilter <ipfilter.dat> [--block-check:ip] [--level:n]\n"
   "       ed2k-tool config <preferences.dat> [--set:key=value]\n"
   "       ed2k-tool stats <statistics.dat>\n"
+  "       ed2k-tool collection list <collection> | collection create <collection> <ed2k-link>...\n"
+  "       ed2k-tool schedule list <rules.txt> | schedule add <rules.txt> <rule>\n"
+  "       ed2k-tool update-serverlist <url> <dest>\n"
   "       ed2k-tool kad-bootstrap <nodes.dat>\n"
   "       ed2k-tool kad-search <nodes.dat> <keyword>\n"
   "       ed2k-tool kad-find-sources <nodes.dat> <ed2k-link>\n"
@@ -56,6 +65,16 @@ static std::vector<std::byte> read_all(const char* p){
   std::ifstream f(p,std::ios::binary); std::vector<std::byte> v;
   f.seekg(0,std::ios::end); auto n=f.tellg(); f.seekg(0);
   if(n>0){ v.resize(std::size_t(n)); f.read(reinterpret_cast<char*>(v.data()),n); } return v;
+}
+static std::string read_text_file(const std::filesystem::path& path){
+  std::ifstream f(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+static bool write_text_file(const std::filesystem::path& path, std::string_view text, bool append = false){
+  std::ofstream f(path, std::ios::binary | (append ? std::ios::app : std::ios::trunc));
+  if(!f) return false;
+  f.write(text.data(), static_cast<std::streamsize>(text.size()));
+  return static_cast<bool>(f);
 }
 static std::string hex_bytes(std::span<const std::byte> data){
   static constexpr char d[] = "0123456789abcdef";
@@ -93,7 +112,17 @@ static ed2k::kad::KadID cli_kad_user_hash(){
   auto hash = cli_user_hash();
   return ed2k::kad::KadID::from_bytes(hash.bytes());
 }
-static ed2k::kad::KadNetworkOptions cli_kad_options(std::uint16_t tcp_port){
+static ed2k::server::LoginParams cli_login_params(const ed2k::infra::Preferences& prefs){
+  ed2k::server::LoginParams p;
+  p.nickname = prefs.nickname;
+  p.client_port = prefs.tcp_port;
+  p.user_hash = cli_user_hash();
+  return p;
+}
+static ed2k::kad::KadNetworkOptions cli_kad_options(
+    std::uint16_t tcp_port,
+    std::shared_ptr<const ed2k::infra::IPFilter> ip_filter = nullptr,
+    std::uint8_t ip_filter_level = 127){
   auto user_hash = cli_user_hash();
   return ed2k::kad::KadNetworkOptions{
     .id = ed2k::kad::KadID::from_user_hash(user_hash, 1),
@@ -101,6 +130,8 @@ static ed2k::kad::KadNetworkOptions cli_kad_options(std::uint16_t tcp_port){
     .tcp_port = tcp_port,
     .version = ed2k::kad::kad2_version,
     .user_hash = ed2k::kad::KadID::from_bytes(user_hash.bytes()),
+    .ip_filter = std::move(ip_filter),
+    .ip_filter_level = ip_filter_level,
   };
 }
 static codec::Tag kad_int_tag(std::uint8_t name_id, std::uint64_t value){
@@ -169,6 +200,82 @@ static bool apply_preference_set(ed2k::infra::Preferences& prefs, std::string_vi
   else return false;
   return true;
 }
+struct CliGlobals {
+  std::optional<std::filesystem::path> config_path;
+  std::optional<std::filesystem::path> ipfilter_path;
+  std::optional<ed2k::infra::ProxyConfig> proxy;
+  bool obfuscation = false;
+  bool valid = true;
+  std::vector<std::string> args;
+};
+static CliGlobals parse_cli_globals(int argc, char** argv){
+  CliGlobals out;
+  for(int i=1;i<argc;++i){
+    std::string a=argv[i];
+    if(a=="--config"){
+      if(i+1>=argc){ out.valid=false; return out; }
+      out.config_path = argv[++i];
+    } else if(a.rfind("--config:",0)==0) {
+      out.config_path = a.substr(9);
+    } else if(a=="--ipfilter"){
+      if(i+1>=argc){ out.valid=false; return out; }
+      out.ipfilter_path = argv[++i];
+    } else if(a.rfind("--ipfilter:",0)==0) {
+      out.ipfilter_path = a.substr(11);
+    } else if(a=="--proxy"){
+      if(i+1>=argc){ out.valid=false; return out; }
+      auto parsed = ed2k::infra::ProxyConfig::parse(argv[++i]);
+      if(!parsed){ out.valid=false; return out; }
+      out.proxy = *parsed;
+    } else if(a.rfind("--proxy:",0)==0) {
+      auto parsed = ed2k::infra::ProxyConfig::parse(a.substr(8));
+      if(!parsed){ out.valid=false; return out; }
+      out.proxy = *parsed;
+    } else if(a=="--obfuscation") {
+      out.obfuscation = true;
+    } else {
+      out.args.push_back(std::move(a));
+    }
+  }
+  return out;
+}
+static bool looks_like_option(std::string_view text){
+  return text.rfind("--", 0) == 0;
+}
+static std::string join_args(char** argv, int first, int argc){
+  std::string out;
+  for(int i=first;i<argc;++i){
+    if(i != first) out.push_back(' ');
+    out += argv[i];
+  }
+  return out;
+}
+static tl::expected<ed2k::infra::Preferences, std::error_code>
+load_cli_preferences(const CliGlobals& globals){
+  auto prefs = ed2k::infra::Preferences::defaults();
+  if(globals.config_path && std::filesystem::exists(*globals.config_path)){
+    auto loaded = ed2k::infra::Preferences::load(*globals.config_path);
+    if(!loaded) return tl::unexpected(loaded.error());
+    prefs = std::move(*loaded);
+  }
+  if(globals.obfuscation){
+    prefs.enable_obfuscation = true;
+    prefs.request_obfuscation = true;
+  }
+  return prefs;
+}
+static tl::expected<std::shared_ptr<const ed2k::infra::IPFilter>, std::error_code>
+load_cli_ip_filter(const CliGlobals& globals, const ed2k::infra::Preferences& prefs){
+  std::optional<std::filesystem::path> path = globals.ipfilter_path;
+  if(!path && prefs.enable_ip_filter && !prefs.ipfilter_dat_path.empty() &&
+     std::filesystem::exists(prefs.ipfilter_dat_path)){
+    path = prefs.ipfilter_dat_path;
+  }
+  if(!path) return std::shared_ptr<const ed2k::infra::IPFilter>{};
+  auto filter = ed2k::infra::IPFilter::load(*path);
+  if(!filter) return tl::unexpected(filter.error());
+  return std::make_shared<ed2k::infra::IPFilter>(std::move(*filter));
+}
 static tl::expected<std::vector<ed2k::kad::Contact>, std::error_code>
 load_kad_nodes(const char* path){
   return ed2k::kad::parse_nodes_dat(read_all(path));
@@ -182,8 +289,18 @@ bootstrap_if_needed(ed2k::kad::KadNetwork& network,
   co_return co_await network.bootstrap(std::span<const ed2k::kad::Contact>(contacts.data(), seed_count), timeout);
 }
 int main(int argc,char** argv){
+  auto globals = parse_cli_globals(argc, argv);
+  if(!globals.valid) return usage();
+  std::vector<std::string> arg_storage = std::move(globals.args);
+  std::vector<char*> arg_ptrs;
+  arg_ptrs.push_back(argv[0]);
+  for(auto& arg : arg_storage) arg_ptrs.push_back(arg.data());
+  argc = static_cast<int>(arg_ptrs.size());
+  argv = arg_ptrs.data();
   if(argc<2) return usage();
   std::string cmd=argv[1];
+  auto startup_prefs = load_cli_preferences(globals);
+  if(!startup_prefs){ std::printf("error: %s\n", startup_prefs.error().message().c_str()); return 1; }
   if(cmd=="hash"){
     if(argc<3) return usage();
     bool red=false, aich=false;
@@ -223,12 +340,20 @@ int main(int argc,char** argv){
     return 0;
   }
   if(cmd=="ipfilter"){
-    if(argc<3) return usage();
-    auto filter = ed2k::infra::IPFilter::load(argv[2]);
+    if(argc<3 && !globals.ipfilter_path) return usage();
+    std::filesystem::path path;
+    int option_start = 3;
+    if(globals.ipfilter_path && (argc<3 || looks_like_option(argv[2]))){
+      path = *globals.ipfilter_path;
+      option_start = 2;
+    } else {
+      path = argv[2];
+    }
+    auto filter = ed2k::infra::IPFilter::load(path);
     if(!filter){ std::printf("error: %s\n", filter.error().message().c_str()); return 1; }
     std::optional<IPv4> check_ip;
     std::uint8_t level = 127;
-    for(int i=3;i<argc;++i){
+    for(int i=option_start;i<argc;++i){
       std::string a=argv[i];
       if(a.rfind("--block-check:",0)==0){
         auto ip = IPv4::from_dotted(a.substr(14));
@@ -249,8 +374,15 @@ int main(int argc,char** argv){
     return 0;
   }
   if(cmd=="config"){
-    if(argc<3) return usage();
-    const std::filesystem::path path = argv[2];
+    if(argc<3 && !globals.config_path) return usage();
+    std::filesystem::path path;
+    int option_start = 3;
+    if(globals.config_path && (argc<3 || looks_like_option(argv[2]))){
+      path = *globals.config_path;
+      option_start = 2;
+    } else {
+      path = argv[2];
+    }
     ed2k::infra::Preferences prefs = ed2k::infra::Preferences::defaults();
     if(std::filesystem::exists(path)){
       auto loaded = ed2k::infra::Preferences::load(path);
@@ -258,7 +390,7 @@ int main(int argc,char** argv){
       prefs = std::move(*loaded);
     }
     bool changed = false;
-    for(int i=3;i<argc;++i){
+    for(int i=option_start;i<argc;++i){
       std::string a=argv[i];
       if(a.rfind("--set:",0)==0){
         if(!apply_preference_set(prefs, a.substr(6))){
@@ -276,6 +408,77 @@ int main(int argc,char** argv){
                 prefs.nickname.c_str(), prefs.tcp_port, prefs.udp_port,
                 prefs.enable_kad ? 1 : 0, prefs.ip_filter_level);
     return 0;
+  }
+  if(cmd=="collection"){
+    if(argc<4) return usage();
+    std::string sub = argv[2];
+    const std::filesystem::path path = argv[3];
+    if(sub=="create"){
+      if(argc<5) return usage();
+      ed2k::infra::Collection collection;
+      for(int i=4;i<argc;++i){
+        auto parsed = parse_link(argv[i]);
+        if(!parsed){ std::printf("error: %s\n", parsed.error().message().c_str()); return 1; }
+        auto* file = std::get_if<Ed2kFileLink>(&*parsed);
+        if(!file){ std::printf("error: not a file link\n"); return 1; }
+        collection.files.push_back(*file);
+      }
+      if(!write_text_file(path, ed2k::infra::write_collection_text(collection))){
+        std::printf("error: io error\n");
+        return 1;
+      }
+      std::printf("collection files=%zu\n", collection.files.size());
+      return 0;
+    }
+    if(sub=="list"){
+      auto text = read_text_file(path);
+      auto collection = ed2k::infra::parse_collection_text(text);
+      if(!collection){
+        auto bytes = read_all(path.string().c_str());
+        collection = ed2k::infra::parse_collection_binary(bytes);
+      }
+      if(!collection){ std::printf("error: %s\n", collection.error().message().c_str()); return 1; }
+      for(const auto& file : collection->files) std::printf("%s\n", to_string(file).c_str());
+      std::printf("(%zu files)\n", collection->files.size());
+      return 0;
+    }
+    return usage();
+  }
+  if(cmd=="schedule"){
+    if(argc<4) return usage();
+    std::string sub = argv[2];
+    const std::filesystem::path path = argv[3];
+    if(sub=="add"){
+      if(argc<5) return usage();
+      auto rule = join_args(argv, 4, argc);
+      auto parsed = ed2k::infra::SchedulerRule::parse(rule);
+      if(!parsed){ std::printf("error: %s\n", parsed.error().message().c_str()); return 1; }
+      if(!write_text_file(path, rule + "\n", true)){
+        std::printf("error: io error\n");
+        return 1;
+      }
+      std::printf("schedule added\n");
+      return 0;
+    }
+    if(sub=="list"){
+      auto text = read_text_file(path);
+      std::printf("%s", text.c_str());
+      return 0;
+    }
+    return usage();
+  }
+  if(cmd=="update-serverlist"){
+    if(argc<4) return usage();
+    ed2k::net::IoRuntime rt;
+    int rc=0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      ed2k::infra::HTTPDownload http(rt.executor());
+      auto r = co_await http.fetch(argv[2], argv[3], std::chrono::milliseconds(15000));
+      if(!r){ std::printf("error: %s\n", r.error().message().c_str()); rc=1; }
+      else std::printf("updated %s\n", argv[3]);
+      rt.stop(); co_return;
+    }, asio::detached);
+    rt.run(); return rc;
   }
   if(cmd=="stats"){
     if(argc<3) return usage();
@@ -298,12 +501,16 @@ int main(int argc,char** argv){
     std::string metpath = argv[2];
     for(int i=3;i<argc;++i){ std::string a=argv[i]; if(a.rfind("--ip:",0)==0){ auto ip=IPv4::from_dotted(a.substr(4)); if(ip){ ed2k::app::ServerTarget t; t.ip=*ip; ov=t; } } else if(a.rfind("--port:",0)==0 && ov){ ov->port=std::uint16_t(std::stoi(a.substr(7))); } }
     auto metbytes = read_all(metpath.c_str());
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt;
-    ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=4662;
-    p.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+    auto p = cli_login_params(*startup_prefs);
     std::optional<ed2k::server::LoginResult> res;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      auto r = co_await ed2k::app::login_with_rotation(rt.executor(), metbytes, ov, p, std::chrono::milliseconds(15000));
+      auto r = co_await ed2k::app::login_with_rotation(
+        rt.executor(), metbytes, ov, p,
+        std::chrono::milliseconds(startup_prefs->connect_timeout_ms),
+        globals.proxy, *global_filter, startup_prefs->ip_filter_level);
       if(r) res = r->result;
       else std::printf("error: %s\n", r.error().message().c_str());
       rt.stop(); co_return;
@@ -317,10 +524,15 @@ int main(int argc,char** argv){
     if(argc<4) return usage();
     auto metbytes = read_all(argv[2]);
     std::string kw = argv[3];
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt;
     int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      auto lg = co_await ed2k::app::login_with_rotation(rt.executor(), metbytes, std::nullopt, []{ ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=4662; p.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210"); return p; }(), std::chrono::milliseconds(15000));
+      auto lg = co_await ed2k::app::login_with_rotation(
+        rt.executor(), metbytes, std::nullopt, cli_login_params(*startup_prefs),
+        std::chrono::milliseconds(startup_prefs->connect_timeout_ms),
+        globals.proxy, *global_filter, startup_prefs->ip_filter_level);
       if(!lg){ std::printf("error: %s\n", lg.error().message().c_str()); rc=1; rt.stop(); co_return; }
       auto sr = co_await lg->conn.search(ed2k::server::Keyword{kw}, std::chrono::milliseconds(15000));
       if(!sr){ std::printf("error: %s\n", sr.error().message().c_str()); rc=1; rt.stop(); co_return; }
@@ -338,10 +550,14 @@ int main(int argc,char** argv){
     if(!pl){ std::printf("error: %s\n", pl.error().message().c_str()); return 1; }
     auto* f = std::get_if<Ed2kFileLink>(&*pl);
     if(!f){ std::printf("error: not a file link\n"); return 1; }
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=4662; p.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
-      auto lg = co_await ed2k::app::login_with_rotation(rt.executor(), metbytes, std::nullopt, p, std::chrono::milliseconds(15000));
+      auto lg = co_await ed2k::app::login_with_rotation(
+        rt.executor(), metbytes, std::nullopt, cli_login_params(*startup_prefs),
+        std::chrono::milliseconds(startup_prefs->connect_timeout_ms),
+        globals.proxy, *global_filter, startup_prefs->ip_filter_level);
       if(!lg){ std::printf("error: %s\n", lg.error().message().c_str()); rc=1; rt.stop(); co_return; }
       auto gs = co_await lg->conn.get_sources(f->hash, f->size, std::chrono::milliseconds(15000));
       if(!gs){ std::printf("error: %s\n", gs.error().message().c_str()); rc=1; rt.stop(); co_return; }
@@ -372,11 +588,14 @@ int main(int argc,char** argv){
     auto scan = db.scan_dir(dir);
     if(!scan){ std::printf("error: %s\n", scan.error().message().c_str()); return 1; }
     if(db.files().empty()){ std::printf("error: no regular files in %s\n", dir.string().c_str()); return 1; }
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=4662;
-      p.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
-      auto lg = co_await ed2k::app::login_with_rotation(rt.executor(), metbytes, ov, p, std::chrono::milliseconds(15000));
+      auto lg = co_await ed2k::app::login_with_rotation(
+        rt.executor(), metbytes, ov, cli_login_params(*startup_prefs),
+        std::chrono::milliseconds(startup_prefs->connect_timeout_ms),
+        globals.proxy, *global_filter, startup_prefs->ip_filter_level);
       if(!lg){ std::printf("error: %s\n", lg.error().message().c_str()); rc=1; rt.stop(); co_return; }
       auto pr = co_await lg->conn.publish_files(db.files());
       if(!pr){ std::printf("error: %s\n", pr.error().message().c_str()); rc=1; }
@@ -411,9 +630,12 @@ int main(int argc,char** argv){
         f->hash.to_hex().c_str(), *rating, comment.c_str(), hex_bytes(payload).c_str());
       return 0;
     }
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
       ed2k::peer::C2CConnection c(rt.executor());
+      c.set_ip_filter(*global_filter, startup_prefs->ip_filter_level);
       auto cr = co_await c.connect(peer->first, peer->second, std::chrono::milliseconds(15000));
       if(!cr){ std::printf("error: %s\n", cr.error().message().c_str()); rc=1; rt.stop(); co_return; }
       auto hs = co_await c.handshake(cli_hello(), std::chrono::milliseconds(15000));
@@ -432,9 +654,12 @@ int main(int argc,char** argv){
     if(argc<3) return usage();
     auto contacts = load_kad_nodes(argv[2]);
     if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(4662));
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(
+        startup_prefs->tcp_port, *global_filter, startup_prefs->ip_filter_level));
       auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
       if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; }
       else {
@@ -451,9 +676,12 @@ int main(int argc,char** argv){
     auto contacts = load_kad_nodes(argv[2]);
     if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
     const auto key = ed2k::kad::keyword_id(argv[3]);
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(4662));
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(
+        startup_prefs->tcp_port, *global_filter, startup_prefs->ip_filter_level));
       auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
       if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; network.close(); rt.stop(); co_return; }
       auto peers = network.routing_table().closest_to(key, ed2k::kad::KBucket::capacity);
@@ -483,9 +711,12 @@ int main(int argc,char** argv){
     auto* f = std::get_if<Ed2kFileLink>(&*pl);
     if(!f){ std::printf("error: not a file link\n"); return 1; }
     const auto file_id = kad_id_from_hash(f->hash);
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(4662));
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(
+        startup_prefs->tcp_port, *global_filter, startup_prefs->ip_filter_level));
       auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
       if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; network.close(); rt.stop(); co_return; }
       auto peers = network.routing_table().closest_to(file_id, ed2k::kad::KBucket::capacity);
@@ -517,7 +748,7 @@ int main(int argc,char** argv){
     auto contacts = load_kad_nodes(argv[2]);
     if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
     std::filesystem::path dir = argv[3];
-    std::uint16_t tcp_port = 4662;
+    std::uint16_t tcp_port = startup_prefs->tcp_port;
     for(int i=4;i<argc;++i){
       std::string a=argv[i];
       if(a.rfind("--port:",0)==0) tcp_port=std::uint16_t(std::stoi(a.substr(7)));
@@ -525,9 +756,12 @@ int main(int argc,char** argv){
     ed2k::share::KnownFileDB db;
     auto scan = db.scan_dir(dir);
     if(!scan){ std::printf("error: %s\n", scan.error().message().c_str()); return 1; }
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(tcp_port));
+      ed2k::kad::KadNetwork network(rt.executor(), cli_kad_options(
+        tcp_port, *global_filter, startup_prefs->ip_filter_level));
       auto bootstrapped = co_await bootstrap_if_needed(network, *contacts, k_kad_bootstrap_timeout);
       if(!bootstrapped){ std::printf("error: %s\n", bootstrapped.error().message().c_str()); rc=1; network.close(); rt.stop(); co_return; }
       std::size_t packets = 0;
@@ -572,9 +806,18 @@ int main(int argc,char** argv){
       if(a.rfind("--out:",0)==0) out = a.substr(6);
       else if(a.rfind("--server:",0)==0){ metbytes = read_all(a.substr(9).c_str()); }
     }
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
-      ed2k::app::DownloadOpts o; o.out_path=out; o.total_timeout=std::chrono::seconds(300);
+      ed2k::app::DownloadOpts o;
+      o.out_path=out;
+      o.per_server_timeout=std::chrono::milliseconds(startup_prefs->connect_timeout_ms);
+      o.total_timeout=std::chrono::seconds(300);
+      o.client_port=startup_prefs->tcp_port;
+      o.proxy=globals.proxy;
+      o.ip_filter=*global_filter;
+      o.ip_filter_level=startup_prefs->ip_filter_level;
       auto r = co_await ed2k::app::download_link(rt.executor(), *f, metbytes, ov, o);
       if(!r){ std::printf("error: %s\n", r.error().message().c_str()); rc=1; }
       else std::printf("downloaded %s\n", out.string().c_str());

@@ -66,6 +66,25 @@ ServerConnection::connect_and_login(IPv4 ip, std::uint16_t port, const LoginPara
   co_return lr;
 }
 
+asio::awaitable<tl::expected<LoginResult,std::error_code>>
+ServerConnection::connect_and_login_via_proxy(const infra::ProxyConfig& proxy,
+                                              IPv4 ip,
+                                              std::uint16_t port,
+                                              const LoginParams& p,
+                                              std::chrono::milliseconds timeout){
+  auto cr = co_await conn_.connect_via_proxy(proxy, ip, port, timeout);
+  if(!cr) co_return tl::unexpected(cr.error());
+  net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::LOGINREQUEST; req.payload = encode_login(p);
+  auto sr = co_await conn_.send(req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(op::IDCHANGE, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  auto ic = decode_id_change(rp->payload);
+  if(!ic) co_return tl::unexpected(ic.error());
+  LoginResult lr; lr.client_id = ic->id; lr.flags = ic->flags; lr.high_id = ic->high_id();
+  co_return lr;
+}
+
 asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
 ServerConnection::search(const SearchExpr& expr, std::chrono::milliseconds timeout){
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::SEARCHREQUEST; req.payload = encode_search(expr);

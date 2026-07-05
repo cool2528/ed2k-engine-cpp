@@ -11,6 +11,7 @@
 #include <boost/asio/awaitable.hpp>
 #include "ed2k/core/hash.hpp"          // MD4Hash/IPv4/FileHash
 #include "ed2k/infra/ip_filter.hpp"
+#include "ed2k/infra/proxy.hpp"
 #include "ed2k/net/connection.hpp"     // net::Connection
 #include "ed2k/server/messages.hpp"    // LoginParams/SearchResultItem/FoundSources/decode_*
 #include "ed2k/server/search_query.hpp"// SearchExpr
@@ -35,6 +36,12 @@ class ServerConnection {
 
   boost::asio::awaitable<tl::expected<LoginResult,std::error_code>>
     connect_and_login(IPv4 ip, std::uint16_t port, const LoginParams&, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<LoginResult,std::error_code>>
+    connect_and_login_via_proxy(const infra::ProxyConfig& proxy,
+                                IPv4 ip,
+                                std::uint16_t port,
+                                const LoginParams&,
+                                std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
     search(const SearchExpr&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<FoundSources,std::error_code>>
