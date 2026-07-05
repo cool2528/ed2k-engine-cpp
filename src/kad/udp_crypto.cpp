@@ -1,11 +1,11 @@
 #include "ed2k/kad/udp_crypto.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <random>
 
 #include "ed2k/crypto/md5.hpp"
+#include "ed2k/crypto/rc4.hpp"
 #include "ed2k/kad/messages.hpp"
 #include "ed2k/net/packet.hpp"
 #include "ed2k/util/error.hpp"
@@ -69,55 +69,20 @@ std::array<std::byte, 16> key_by_receiver_verify(std::uint32_t receiver_verify_k
   return crypto::md5(key_data);
 }
 
-class Rc4 {
- public:
-  explicit Rc4(std::span<const std::byte, 16> key) {
-    for (std::size_t n = 0; n < state_.size(); ++n) {
-      state_[n] = static_cast<std::uint8_t>(n);
-    }
-
-    std::uint8_t j = 0;
-    for (std::size_t n = 0; n < state_.size(); ++n) {
-      j = static_cast<std::uint8_t>(j + state_[n] + std::to_integer<std::uint8_t>(key[n % key.size()]));
-      std::swap(state_[n], state_[j]);
-    }
+void rc4_append(crypto::RC4& rc4, std::span<const std::byte> input, std::vector<std::byte>& output) {
+  if (input.empty()) {
+    return;
   }
+  const auto offset = output.size();
+  output.insert(output.end(), input.begin(), input.end());
+  rc4.process(std::span<std::byte>(output.data() + offset, input.size()));
+}
 
-  void crypt(std::span<const std::byte> input, std::vector<std::byte>& output) {
-    output.reserve(output.size() + input.size());
-    for (auto value : input) {
-      output.push_back(std::byte(std::to_integer<std::uint8_t>(value) ^ next()));
-    }
-  }
-
-  std::vector<std::byte> crypt(std::span<const std::byte> input) {
-    std::vector<std::byte> output;
-    crypt(input, output);
-    return output;
-  }
-
-  std::byte crypt_byte(std::byte value) {
-    return std::byte(std::to_integer<std::uint8_t>(value) ^ next());
-  }
-
-  void discard(std::size_t count) {
-    for (std::size_t n = 0; n < count; ++n) {
-      (void)next();
-    }
-  }
-
- private:
-  std::uint8_t next() {
-    i_ = static_cast<std::uint8_t>(i_ + 1u);
-    j_ = static_cast<std::uint8_t>(j_ + state_[i_]);
-    std::swap(state_[i_], state_[j_]);
-    return state_[static_cast<std::uint8_t>(state_[i_] + state_[j_])];
-  }
-
-  std::array<std::uint8_t, 256> state_{};
-  std::uint8_t i_ = 0;
-  std::uint8_t j_ = 0;
-};
+std::vector<std::byte> rc4_process(crypto::RC4& rc4, std::span<const std::byte> input) {
+  std::vector<std::byte> output(input.begin(), input.end());
+  rc4.process(output);
+  return output;
+}
 
 std::uint8_t normalized_marker(const KadUdpEncryptOptions& options) noexcept {
   const bool receiver_key_mode = !options.target_id.has_value();
@@ -162,7 +127,7 @@ encode_kad_obfuscated_datagram(std::span<const std::byte> clear_datagram,
   const auto random_key_part = options.random_key_part == 0 ? random_u16() : options.random_key_part;
   const auto key = receiver_key_mode ? key_by_receiver_verify(options.receiver_verify_key, random_key_part)
                                      : key_by_target_id(*options.target_id, random_key_part);
-  Rc4 rc4(key);
+  crypto::RC4 rc4(key);
 
   std::vector<std::byte> encoded;
   encoded.reserve(clear_datagram.size() + k_header_without_padding + k_kad_verify_keys_size);
@@ -171,17 +136,17 @@ encode_kad_obfuscated_datagram(std::span<const std::byte> clear_datagram,
 
   std::array<std::byte, 4> magic{};
   write_u32_le(magic, k_magic_udp_sync_client);
-  rc4.crypt(magic, encoded);
+  rc4_append(rc4, magic, encoded);
 
-  encoded.push_back(rc4.crypt_byte(std::byte{0x00}));
+  encoded.push_back(rc4.process_byte(std::byte{0x00}));
 
   std::array<std::byte, 4> verify{};
   write_u32_le(verify, options.receiver_verify_key);
-  rc4.crypt(verify, encoded);
+  rc4_append(rc4, verify, encoded);
   write_u32_le(verify, options.sender_verify_key);
-  rc4.crypt(verify, encoded);
+  rc4_append(rc4, verify, encoded);
 
-  rc4.crypt(clear_datagram, encoded);
+  rc4_append(rc4, clear_datagram, encoded);
   return encoded;
 }
 
@@ -214,14 +179,14 @@ decode_kad_obfuscated_datagram(std::span<const std::byte> datagram,
       continue;
     }
 
-    Rc4 rc4(*key);
-    const auto magic = rc4.crypt(datagram.subspan(3, 4));
+    crypto::RC4 rc4(*key);
+    const auto magic = rc4_process(rc4, datagram.subspan(3, 4));
     if (magic.size() != 4 ||
         read_u32_le(magic.data()) != k_magic_udp_sync_client) {
       continue;
     }
 
-    const auto pad_len = std::to_integer<std::uint8_t>(rc4.crypt_byte(datagram[7]));
+    const auto pad_len = std::to_integer<std::uint8_t>(rc4.process_byte(datagram[7]));
     const auto encrypted_remaining = datagram.size() - k_header_without_padding;
     if (encrypted_remaining <= static_cast<std::size_t>(pad_len) + k_kad_verify_keys_size) {
       KadUdpDecodeResult result;
@@ -230,13 +195,13 @@ decode_kad_obfuscated_datagram(std::span<const std::byte> datagram,
     }
     rc4.discard(pad_len);
 
-    auto receiver_key_bytes = rc4.crypt(datagram.subspan(k_header_without_padding + pad_len, 4));
-    auto sender_key_bytes = rc4.crypt(datagram.subspan(k_header_without_padding + pad_len + 4, 4));
+    auto receiver_key_bytes = rc4_process(rc4, datagram.subspan(k_header_without_padding + pad_len, 4));
+    auto sender_key_bytes = rc4_process(rc4, datagram.subspan(k_header_without_padding + pad_len + 4, 4));
     const auto receiver_key = read_u32_le(receiver_key_bytes.data());
     const auto sender_key = read_u32_le(sender_key_bytes.data());
 
     const auto payload_offset = k_header_without_padding + pad_len + k_kad_verify_keys_size;
-    auto payload = rc4.crypt(datagram.subspan(payload_offset));
+    auto payload = rc4_process(rc4, datagram.subspan(payload_offset));
 
     KadUdpDecodeResult result;
     result.datagram = std::move(payload);
