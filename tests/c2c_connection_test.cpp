@@ -3,6 +3,7 @@
 #include <chrono>
 #include <exception>
 #include <initializer_list>
+#include <memory>
 #include <utility>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
@@ -16,6 +17,7 @@
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/framing.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/util/error.hpp"
 #include "mock_peer.hpp"   // P2 ed2k::test::MockPeer
@@ -33,6 +35,28 @@ template <class F> static void run_coro(IoRuntime& rt, F&& body){
     [&](std::exception_ptr e){ rt.stop(); if(e) std::rethrow_exception(e); });
   rt.run(); rt.restart();
   EXPECT_TRUE(done);
+}
+
+TEST(C2CConnection, IpFilterRejectsConnectBeforeTcpDial) {
+  IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    auto filter = std::make_shared<ed2k::infra::IPFilter>();
+    filter->add(ed2k::infra::IPRange{
+        .start = *IPv4::from_dotted("127.0.0.1"),
+        .end = *IPv4::from_dotted("127.0.0.1"),
+        .level = 200,
+        .name = "loopback",
+    });
+    C2CConnection c(rt.executor());
+    c.set_ip_filter(filter, 127);
+
+    auto r = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), 9, 50ms);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::ip_filtered));
+    }
+    co_return;
+  });
 }
 static std::vector<std::byte> bytes(std::initializer_list<int> xs){
   std::vector<std::byte> v; for(int x:xs) v.push_back(std::byte(x)); return v;

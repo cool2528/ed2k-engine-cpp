@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <exception>
+#include <memory>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -15,6 +16,7 @@
 #include "ed2k/net/framing.hpp"
 #include "ed2k/server/messages.hpp"
 #include "ed2k/server/search_query.hpp"
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/util/error.hpp"
@@ -49,6 +51,32 @@ static asio::awaitable<void> keep_alive(tcp::socket& s){
   (void)e;(void)n; co_return;
 }
 static std::vector<std::byte> msg_payload(std::string_view s){ codec::ByteWriter w; w.string16(s); return w.take(); }
+
+TEST(ServerConnection, IpFilterRejectsLoginBeforeTcpConnect) {
+  IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    auto filter = std::make_shared<ed2k::infra::IPFilter>();
+    filter->add(ed2k::infra::IPRange{
+        .start = *IPv4::from_dotted("127.0.0.1"),
+        .end = *IPv4::from_dotted("127.0.0.1"),
+        .level = 200,
+        .name = "loopback",
+    });
+    ServerConnection c(rt.executor());
+    c.set_ip_filter(filter, 127);
+    LoginParams p;
+    p.nickname = "ed2k";
+    p.client_port = 4662;
+    p.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+
+    auto r = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), 9, p, 50ms);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::ip_filtered));
+    }
+    co_return;
+  });
+}
 static std::vector<std::byte> status_payload(std::uint32_t u, std::uint32_t f){ codec::ByteWriter w; w.u32(u); w.u32(f); return w.take(); }
 static std::vector<std::byte> idchange_payload(std::uint32_t id, std::uint32_t flags){ codec::ByteWriter w; w.u32(id); w.u32(flags); return w.take(); }
 static std::vector<std::byte> cb_payload(std::uint32_t ip, std::uint16_t port){ codec::ByteWriter w; w.u32_be(ip); w.u16(port); return w.take(); }

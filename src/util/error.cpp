@@ -25,6 +25,7 @@ struct Ed2kCategory : std::error_category {
       case errc::file_not_found: return "file not found";
       case errc::upload_queued: return "upload queued";
       case errc::block_corrupt: return "block corrupt";
+      case errc::ip_filtered: return "ip filtered";
     }
     return "unknown ed2k error";
   }

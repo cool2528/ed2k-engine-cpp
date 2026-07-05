@@ -1,10 +1,12 @@
 #pragma once
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <system_error>
 #include <tl/expected.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/net/connection.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/share/client_credits.hpp"
@@ -44,6 +46,7 @@ class UploadSession {
 
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     run(std::chrono::milliseconds timeout);
+  void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
 
  private:
   boost::asio::awaitable<tl::expected<void, std::error_code>>
@@ -66,6 +69,8 @@ class UploadSession {
   UploadQueue* queue_ = nullptr;
   UploadBandwidthThrottler* throttler_ = nullptr;
   ClientCredits* credits_ = nullptr;
+  std::shared_ptr<const infra::IPFilter> ip_filter_;
+  std::uint8_t ip_filter_level_ = 127;
 };
 
 } // namespace ed2k::share

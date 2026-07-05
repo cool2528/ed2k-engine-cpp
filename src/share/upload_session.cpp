@@ -145,6 +145,11 @@ UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
     throttler_(throttler),
     credits_(credits) {}
 
+void UploadSession::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
+  ip_filter_ = std::move(filter);
+  ip_filter_level_ = level;
+}
+
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handshake(std::chrono::milliseconds timeout) {
   auto rp = co_await conn_.recv(timeout);
@@ -409,6 +414,13 @@ UploadSession::send_requested_parts(const KnownFile& file, const ed2k::peer::Req
 
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::run(std::chrono::milliseconds timeout) {
+  if (ip_filter_) {
+    auto remote = conn_.remote_ip();
+    if (remote && ip_filter_->blocked(*remote, ip_filter_level_)) {
+      conn_.close();
+      co_return tl::unexpected(make_error_code(errc::ip_filtered));
+    }
+  }
   auto hs = co_await handshake(timeout);
   if(!hs) co_return tl::unexpected(hs.error());
   while(true) {

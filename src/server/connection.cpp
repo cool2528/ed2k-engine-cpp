@@ -9,6 +9,9 @@ using clock_type = std::chrono::steady_clock;
 
 ServerConnection::ServerConnection(asio::any_io_executor ex) : conn_(ex) {}
 void ServerConnection::on_event(std::function<void(const ServerEvent&)> sink){ on_event_ = std::move(sink); }
+void ServerConnection::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
+  conn_.set_ip_filter(std::move(filter), level);
+}
 void ServerConnection::close() noexcept { conn_.close(); }
 bool ServerConnection::is_open() const noexcept { return conn_.is_open(); }
 

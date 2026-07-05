@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <system_error>
@@ -12,6 +13,7 @@
 #include <boost/asio/ip/udp.hpp>
 #include <tl/expected.hpp>
 
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/kad/indexed.hpp"
 #include "ed2k/kad/messages.hpp"
 #include "ed2k/kad/routing_table.hpp"
@@ -27,6 +29,8 @@ struct KadNetworkOptions {
   std::uint8_t version = kad2_version;
   KadID user_hash;
   std::uint32_t kad_udp_key = 0x4b414432;
+  std::shared_ptr<const infra::IPFilter> ip_filter;
+  std::uint8_t ip_filter_level = 127;
 };
 
 enum class KadFirewallState {
@@ -151,12 +155,16 @@ class KadNetwork {
   boost::asio::awaitable<tl::expected<ReceivedPacket, std::error_code>>
   recv_kad_packet(std::chrono::milliseconds timeout);
 
+  bool ip_filtered(IPv4 ip) const noexcept;
+
   net::UdpSocket socket_;
   Contact self_;
   KadID user_hash_;
   std::uint32_t kad_udp_key_ = 0;
   RoutingTable routing_;
   KadIndexed indexed_;
+  std::shared_ptr<const infra::IPFilter> ip_filter_;
+  std::uint8_t ip_filter_level_ = 127;
   KadFirewallState udp_firewall_state_ = KadFirewallState::unknown;
   std::optional<KadFirewallUdpResult> last_udp_firewall_result_;
   std::optional<IPv4> observed_external_ip_;

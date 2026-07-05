@@ -83,6 +83,9 @@ accumulate_blocks(net::Connection& conn, const FileHash& h,
 
 C2CConnection::C2CConnection(asio::any_io_executor ex) : conn_(ex) {}
 void C2CConnection::close() noexcept { conn_.close(); }
+void C2CConnection::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
+  conn_.set_ip_filter(std::move(filter), level);
+}
 
 asio::awaitable<tl::expected<void,std::error_code>>
 C2CConnection::connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout){

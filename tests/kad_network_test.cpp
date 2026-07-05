@@ -14,6 +14,7 @@
 #include "ed2k/codec/tag.hpp"
 #include "ed2k/kad/messages.hpp"
 #include "ed2k/kad/network.hpp"
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/udp_socket.hpp"
 #include "ed2k/util/error.hpp"
@@ -229,6 +230,30 @@ TEST(KadNetwork, HelloRoundTripUpdatesRoutingTables) {
     EXPECT_EQ(remote->tcp_port, 5502);
     EXPECT_NE(a.routing_table().find(b.self_contact().id), nullptr);
     EXPECT_NE(b.routing_table().find(a.self_contact().id), nullptr);
+    co_return;
+  });
+}
+
+TEST(KadNetwork, IpFilterRejectsOutboundUdpBeforeSend) {
+  net::IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    auto filter = std::make_shared<ed2k::infra::IPFilter>();
+    filter->add(ed2k::infra::IPRange{
+        .start = loopback_ip(),
+        .end = loopback_ip(),
+        .level = 200,
+        .name = "loopback",
+    });
+    auto opts = options("00000000000000000000000000000001", 5591);
+    opts.ip_filter = filter;
+    opts.ip_filter_level = 127;
+    KadNetwork network(rt.executor(), opts);
+
+    auto r = co_await network.send_hello(udp::endpoint(asio::ip::address_v4::loopback(), 5592), 50ms);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::ip_filtered));
+    }
     co_return;
   });
 }

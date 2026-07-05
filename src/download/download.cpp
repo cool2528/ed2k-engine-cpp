@@ -52,8 +52,15 @@ Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path&
                    const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source)
   : conn_(ex), out_(out), hash_(hash), size_(size), source_(source) {}
 
+void Download::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
+  ip_filter_ = std::move(filter);
+  ip_filter_level_ = level;
+  conn_.set_ip_filter(ip_filter_, ip_filter_level_);
+}
+
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 Download::run(std::chrono::milliseconds timeout){
+  conn_.set_ip_filter(ip_filter_, ip_filter_level_);
   IPv4 ip = IPv4::from_wire(source_.id);
   auto cr = co_await conn_.connect(ip, source_.port, timeout);
   if(!cr) co_return tl::unexpected(cr.error());
@@ -125,13 +132,15 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
     sources_(std::move(sources)),
     server_conn_(server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt),
     listener_(listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt),
-    kad_network_(std::nullopt) {}
+    kad_network_(std::nullopt),
+    ip_filter_(nullptr),
+    ip_filter_level_(127) {}
 
 MultiSourceDownload MultiSourceDownload::Builder::build() {
   return MultiSourceDownload(net_ex_, disk_ex_, std::move(out_), hash_, size_,
                              std::move(aich_), std::move(sources_),
                              std::move(server_), std::move(listener_),
-                             std::move(kad_network_));
+                             std::move(kad_network_), std::move(ip_filter_), ip_filter_level_);
 }
 
 // === raccoon 多源并发 (P4c-3) ===
@@ -153,7 +162,9 @@ fetch_hashset(boost::asio::any_io_executor ex,
               std::uint64_t size,
               std::chrono::milliseconds timeout,
               std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
-              std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener){
+              std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
+              std::shared_ptr<const infra::IPFilter> ip_filter,
+              std::uint8_t ip_filter_level){
   bool accepted = false;   // LowID 回调路径下我方是 TCP acceptor, 握手角色随之翻转
   std::optional<ed2k::peer::C2CConnection> conn_opt;
   if(source.low_id()){
@@ -166,6 +177,7 @@ fetch_hashset(boost::asio::any_io_executor ex,
     accepted = true;
   } else {
     ed2k::peer::C2CConnection c(ex);
+    c.set_ip_filter(ip_filter, ip_filter_level);
     auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
     if(!cr) co_return tl::unexpected(cr.error());
     conn_opt.emplace(std::move(c));
@@ -248,6 +260,8 @@ peer_worker(boost::asio::any_io_executor ex,
             std::chrono::milliseconds timeout, std::size_t max_retries,
             std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
             std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
+            std::shared_ptr<const infra::IPFilter> ip_filter,
+            std::uint8_t ip_filter_level,
             ResultCh& done_ch){
   auto finish = [&](std::error_code ec){
     st.set_error(ec);        // 首个失败错误 (单网络线程 → 无竞争)
@@ -274,6 +288,7 @@ peer_worker(boost::asio::any_io_executor ex,
       accepted = true;
     } else {
       ed2k::peer::C2CConnection c(ex);
+      c.set_ip_filter(ip_filter, ip_filter_level);
       auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
       if(!cr){ finish(cr.error()); co_return; }
       conn_opt.emplace(std::move(c));
@@ -388,6 +403,7 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
         for(const auto& entry : *kad_sources){
           auto endpoint = endpoint_from_kad_source(entry);
           if(!endpoint) continue;
+          if(ip_filter_ && ip_filter_->blocked(IPv4::from_wire(endpoint->id), ip_filter_level_)) continue;
           const auto duplicate = std::any_of(sources_.begin(), sources_.end(),
                                              [&](const server::SourceEndpoint& current){
                                                return same_source(current, *endpoint);
@@ -404,7 +420,7 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   std::error_code setup_err = make_error_code(errc::connect_failed);
   for(; setup_idx < sources_.size(); ++setup_idx){
     auto r = co_await fetch_hashset(ex_, sources_[setup_idx], hash_, size_, total_timeout,
-                                    server_conn_, listener_);
+                                    server_conn_, listener_, ip_filter_, ip_filter_level_);
     if(r){ fr = std::move(*r); break; }
     setup_err = r.error();
   }
@@ -426,7 +442,8 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
     if(i == setup_idx){ pre_conn = std::move(fr.conn); pre_parts = std::move(fr.fs_parts); }
     boost::asio::co_spawn(ex_,
       peer_worker(ex_, sources_[i], std::move(pre_conn), std::move(pre_parts), st,
-                  total_timeout, max_retries, server_conn_, listener_, done_ch),
+                  total_timeout, max_retries, server_conn_, listener_,
+                  ip_filter_, ip_filter_level_, done_ch),
       boost::asio::detached);
   }
   // 收集 N 个完成信号 (worker 退出即 try_send; run 挂起在 async_receive, 网络线程跑 worker)。

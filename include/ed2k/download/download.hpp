@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -10,6 +11,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include "ed2k/core/hash.hpp"
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/server/messages.hpp"   // SourceEndpoint
 #include "ed2k/server/connection.hpp"  // ServerConnection (M3 LowID callback)
 #include "ed2k/peer/c2c_connection.hpp"
@@ -23,6 +25,7 @@ class Download {
  public:
   Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
            const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source);
+  void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(std::chrono::milliseconds timeout);
  private:
   ed2k::peer::C2CConnection conn_;
@@ -30,6 +33,8 @@ class Download {
   FileHash hash_;
   std::uint64_t size_;
   ed2k::server::SourceEndpoint source_;
+  std::shared_ptr<const infra::IPFilter> ip_filter_;
+  std::uint8_t ip_filter_level_ = 127;
 };
 
 // R1-3 S2: Builder 构造 + 注入引用替换裸指针。server/listener 用 optional<reference_wrapper>
@@ -49,6 +54,11 @@ class MultiSourceDownload {
     Builder& listener(peer::InboundListener& l) { listener_ = std::ref(l); return *this; }
     Builder& kad_network(kad::KadNetwork& k) { kad_network_ = std::ref(k); return *this; }
     Builder& disk_executor(boost::asio::any_io_executor ex) { disk_ex_ = ex; return *this; }
+    Builder& ip_filter(std::shared_ptr<const infra::IPFilter> f, std::uint8_t level = 127) {
+      ip_filter_ = std::move(f);
+      ip_filter_level_ = level;
+      return *this;
+    }
     MultiSourceDownload build();
    private:
     friend class MultiSourceDownload;
@@ -61,6 +71,8 @@ class MultiSourceDownload {
     std::optional<std::reference_wrapper<server::ServerConnection>> server_;
     std::optional<std::reference_wrapper<peer::InboundListener>> listener_;
     std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
+    std::shared_ptr<const infra::IPFilter> ip_filter_;
+    std::uint8_t ip_filter_level_ = 127;
   };
 
   [[deprecated("Use MultiSourceDownload::Builder")]]
@@ -90,11 +102,14 @@ class MultiSourceDownload {
                       std::vector<server::SourceEndpoint> sources,
                       std::optional<std::reference_wrapper<server::ServerConnection>> server_conn,
                       std::optional<std::reference_wrapper<peer::InboundListener>> listener,
-                      std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network)
+                      std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network,
+                      std::shared_ptr<const infra::IPFilter> ip_filter,
+                      std::uint8_t ip_filter_level)
     : ex_(net_ex), disk_ex_(disk_ex), out_(std::move(out)), hash_(hash), size_(size),
       aich_(std::move(aich)), sources_(std::move(sources)),
       server_conn_(std::move(server_conn)), listener_(std::move(listener)),
-      kad_network_(std::move(kad_network)) {}
+      kad_network_(std::move(kad_network)), ip_filter_(std::move(ip_filter)),
+      ip_filter_level_(ip_filter_level) {}
   boost::asio::any_io_executor ex_;
   boost::asio::any_io_executor disk_ex_;   // 默认 = ex_ (同步等效), Builder.disk_executor 注入 disk 池
   std::filesystem::path out_;
@@ -105,6 +120,8 @@ class MultiSourceDownload {
   std::optional<std::reference_wrapper<server::ServerConnection>> server_conn_;
   std::optional<std::reference_wrapper<peer::InboundListener>> listener_;
   std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
+  std::shared_ptr<const infra::IPFilter> ip_filter_;
+  std::uint8_t ip_filter_level_ = 127;
   friend class Builder;
 };
 

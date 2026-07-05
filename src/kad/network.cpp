@@ -227,10 +227,19 @@ KadNetwork::KadNetwork(asio::any_io_executor ex, KadNetworkOptions options)
       }),
       user_hash_(fallback_user_hash(options)),
       kad_udp_key_(options.kad_udp_key == 0 ? 0x4b414432u : options.kad_udp_key),
-      routing_(options.id) {}
+      routing_(options.id),
+      ip_filter_(std::move(options.ip_filter)),
+      ip_filter_level_(options.ip_filter_level) {}
+
+bool KadNetwork::ip_filtered(IPv4 ip) const noexcept {
+  return ip_filter_ && ip_filter_->blocked(ip, ip_filter_level_);
+}
 
 asio::awaitable<tl::expected<void, std::error_code>>
 KadNetwork::send_kad_packet(const Contact& remote, const net::Packet& packet) {
+  if (ip_filtered(remote.ip)) {
+    co_return tl::unexpected(make_error_code(errc::ip_filtered));
+  }
   const auto endpoint = endpoint_from_contact(remote);
   if (remote.version >= 6) {
     trace_packet("tx", endpoint, packet, "target-id-obfuscated");
@@ -260,9 +269,12 @@ KadNetwork::send_kad_packet(const Contact& remote, const net::Packet& packet) {
 asio::awaitable<tl::expected<void, std::error_code>>
 KadNetwork::send_kad_packet(udp::endpoint remote, const net::Packet& packet,
                             std::uint32_t receiver_verify_key) {
+  const auto remote_ip = endpoint_ip(remote);
+  if (ip_filtered(remote_ip)) {
+    co_return tl::unexpected(make_error_code(errc::ip_filtered));
+  }
   if (receiver_verify_key != 0) {
     trace_packet("tx", remote, packet, "receiver-key-obfuscated");
-    const auto remote_ip = endpoint_ip(remote);
     auto encoded = encode_kad_obfuscated_datagram(net::encode_udp_packet(packet),
                                                   KadUdpEncryptOptions{
                                                       .receiver_verify_key = receiver_verify_key,

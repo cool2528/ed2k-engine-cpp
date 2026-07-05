@@ -22,6 +22,8 @@ std::optional<std::filesystem::path> find_tool() {
       cwd / exe,
       cwd / "Debug" / exe,
       cwd / "Release" / exe,
+      cwd / "build" / "default" / "Debug" / exe,
+      cwd / "build" / "default" / "Release" / exe,
       cwd.parent_path() / exe,
       cwd.parent_path() / "Debug" / exe,
       cwd.parent_path() / "Release" / exe,
@@ -75,6 +77,29 @@ TEST(CliKad, BootstrapAcceptsNodesDatFile) {
   const std::string redirect = " > /dev/null";
 #endif
   const auto command = shell_path(*tool) + " kad-bootstrap " + shell_path(path) + redirect;
+  EXPECT_EQ(shell_exit_code(std::system(command.c_str())), 0);
+  std::filesystem::remove(path);
+}
+
+TEST(CliIPFilter, BlockCheckAcceptsIpfilterDat) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_cli_ipfilter.dat";
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << "1.2.3.0,1.2.3.255,128,bad range\n";
+  }
+
+#ifdef _WIN32
+  const std::string redirect = " > NUL";
+#else
+  const std::string redirect = " > /dev/null";
+#endif
+  const auto command = shell_path(*tool) + " ipfilter " + shell_path(path) +
+                       " --block-check:1.2.3.4 --level:127" + redirect;
   EXPECT_EQ(shell_exit_code(std::system(command.c_str())), 0);
   std::filesystem::remove(path);
 }

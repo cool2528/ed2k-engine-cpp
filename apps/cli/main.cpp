@@ -16,6 +16,7 @@
 #include "ed2k/link/ed2k_link.hpp"
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/app/server_session.hpp"
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
@@ -41,6 +42,7 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool sources <server.met> <ed2k-link>\n"
   "       ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]\n"
   "       ed2k-tool comment <ed2k-link> --rating:n --comment:text [--peer:ip:port]\n"
+  "       ed2k-tool ipfilter <ipfilter.dat> [--block-check:ip] [--level:n]\n"
   "       ed2k-tool kad-bootstrap <nodes.dat>\n"
   "       ed2k-tool kad-search <nodes.dat> <keyword>\n"
   "       ed2k-tool kad-find-sources <nodes.dat> <ed2k-link>\n"
@@ -182,6 +184,32 @@ int main(int argc,char** argv){
       std::printf("server: %s:%u\n", s->ip.to_dotted().c_str(), s->port);
     else if(auto* sl=std::get_if<ServerListLink>(&*r))
       std::printf("serverlist: %s\n", sl->url.c_str());
+    return 0;
+  }
+  if(cmd=="ipfilter"){
+    if(argc<3) return usage();
+    auto filter = ed2k::infra::IPFilter::load(argv[2]);
+    if(!filter){ std::printf("error: %s\n", filter.error().message().c_str()); return 1; }
+    std::optional<IPv4> check_ip;
+    std::uint8_t level = 127;
+    for(int i=3;i<argc;++i){
+      std::string a=argv[i];
+      if(a.rfind("--block-check:",0)==0){
+        auto ip = IPv4::from_dotted(a.substr(14));
+        if(!ip){ std::printf("error: invalid block-check ip\n"); return 1; }
+        check_ip = *ip;
+      } else if(a.rfind("--level:",0)==0){
+        auto v = std::stoul(a.substr(8));
+        if(v > 255){ std::printf("error: level must be 0..255\n"); return 1; }
+        level = static_cast<std::uint8_t>(v);
+      }
+    }
+    if(check_ip){
+      std::printf("%s: %s\n", check_ip->to_dotted().c_str(),
+                  filter->blocked(*check_ip, level) ? "blocked" : "allowed");
+    } else {
+      std::printf("ipfilter ranges: %zu\n", filter->ranges().size());
+    }
     return 0;
   }
   if(cmd=="login"){

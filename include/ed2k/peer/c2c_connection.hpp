@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <array>
+#include <memory>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -10,6 +11,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include "ed2k/core/hash.hpp"
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/net/connection.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 namespace ed2k::peer {
@@ -17,6 +19,7 @@ class C2CConnection {
  public:
   explicit C2CConnection(boost::asio::any_io_executor ex);
   explicit C2CConnection(boost::asio::ip::tcp::socket&& s) : conn_(std::move(s)) {}
+  void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<HelloInfo,std::error_code>>

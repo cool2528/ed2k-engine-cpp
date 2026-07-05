@@ -2,6 +2,7 @@
 #include "ed2k/net/framing.hpp"
 #include "ed2k/util/error.hpp"
 #include <array>
+#include <utility>
 #include <vector>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -17,9 +18,25 @@ using tcp = asio::ip::tcp;
 Connection::Connection(asio::any_io_executor ex) : socket_(ex) {}
 void Connection::close() noexcept { boost::system::error_code ig; socket_.cancel(ig); socket_.close(ig); }
 bool Connection::is_open() const noexcept { return socket_.is_open(); }
+void Connection::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
+  ip_filter_ = std::move(filter);
+  ip_filter_level_ = level;
+}
+
+std::optional<IPv4> Connection::remote_ip() const {
+  boost::system::error_code ec;
+  auto endpoint = socket_.remote_endpoint(ec);
+  if (ec || !endpoint.address().is_v4()) {
+    return std::nullopt;
+  }
+  return IPv4::from_host(endpoint.address().to_v4().to_uint());
+}
 
 asio::awaitable<tl::expected<void,std::error_code>>
 Connection::connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout){
+  if (ip_filter_ && ip_filter_->blocked(ip, ip_filter_level_)) {
+    co_return tl::unexpected(make_error_code(errc::ip_filtered));
+  }
   tcp::endpoint ep(asio::ip::address_v4(ip.host()), port);
   auto [ec] = co_await socket_.async_connect(
       ep, asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));

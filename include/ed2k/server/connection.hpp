@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
 #include "ed2k/core/hash.hpp"          // MD4Hash/IPv4/FileHash
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/net/connection.hpp"     // net::Connection
 #include "ed2k/server/messages.hpp"    // LoginParams/SearchResultItem/FoundSources/decode_*
 #include "ed2k/server/search_query.hpp"// SearchExpr
@@ -29,6 +31,7 @@ class ServerConnection {
  public:
   explicit ServerConnection(boost::asio::any_io_executor ex);
   void on_event(std::function<void(const ServerEvent&)> sink);
+  void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
 
   boost::asio::awaitable<tl::expected<LoginResult,std::error_code>>
     connect_and_login(IPv4 ip, std::uint16_t port, const LoginParams&, std::chrono::milliseconds timeout);

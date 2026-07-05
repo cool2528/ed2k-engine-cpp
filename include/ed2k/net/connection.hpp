@@ -1,6 +1,8 @@
 #pragma once
 #include <chrono>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <system_error>
 #include <utility>
 #include <boost/asio/any_io_executor.hpp>
@@ -8,6 +10,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <tl/expected.hpp>
 #include "ed2k/core/hash.hpp"     // IPv4
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/net/packet.hpp"
 namespace ed2k::net {
 class Connection {
@@ -29,9 +32,13 @@ class Connection {
   boost::asio::awaitable<tl::expected<Packet,std::error_code>>
     recv(std::chrono::milliseconds timeout);
   boost::asio::any_io_executor executor() { return socket_.get_executor(); }
+  void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
+  std::optional<IPv4> remote_ip() const;
   void close() noexcept;
   bool is_open() const noexcept;
  private:
   boost::asio::ip::tcp::socket socket_;
+  std::shared_ptr<const infra::IPFilter> ip_filter_;
+  std::uint8_t ip_filter_level_ = 127;
 };
 }

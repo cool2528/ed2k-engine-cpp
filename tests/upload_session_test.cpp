@@ -4,6 +4,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
@@ -15,6 +16,7 @@
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/framing.hpp"
+#include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/download/aich_checker.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
@@ -82,6 +84,44 @@ static KnownFile known_file_for(const std::filesystem::path& path, std::span<con
   f.path = path;
   f.size = data.size();
   return f;
+}
+
+TEST(UploadSession, IpFilterRejectsRemoteBeforeHandshake) {
+  net::IoRuntime rt;
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    tcp::acceptor acceptor(rt.context(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+    KnownFileDB db;
+    auto filter = std::make_shared<ed2k::infra::IPFilter>();
+    filter->add(ed2k::infra::IPRange{
+        .start = *IPv4::from_dotted("127.0.0.1"),
+        .end = *IPv4::from_dotted("127.0.0.1"),
+        .level = 200,
+        .name = "loopback",
+    });
+
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+      auto [accept_ec, socket] = co_await acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      EXPECT_FALSE(accept_ec);
+      if (accept_ec) {
+        co_return;
+      }
+      UploadSession session(std::move(socket), db, hello("server"));
+      session.set_ip_filter(filter, 127);
+      auto r = co_await session.run(200ms);
+      EXPECT_FALSE(r.has_value());
+      if (!r) {
+        EXPECT_EQ(r.error(), make_error_code(errc::ip_filtered));
+      }
+      co_return;
+    }, asio::detached);
+
+    tcp::socket client(rt.context());
+    auto [connect_ec] = co_await client.async_connect(
+        tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), acceptor.local_endpoint().port()),
+        asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(connect_ec);
+    co_return;
+  });
 }
 
 static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t opcode, std::span<const std::byte> payload, std::uint8_t proto_val = ed2k::net::proto::eDonkey){
