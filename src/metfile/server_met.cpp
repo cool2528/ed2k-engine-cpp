@@ -1,5 +1,6 @@
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/codec/byte_io.hpp"
+#include <unordered_set>
 namespace ed2k {
 using namespace ed2k::codec;
 namespace {
@@ -74,5 +75,23 @@ std::vector<std::byte> write_server_met(const ServerList& list){
     write_taglist(w, e.extra);
   }
   return w.take();
+}
+
+ServerList merge_server_list(ServerList existing,
+                             std::span<const std::pair<IPv4, std::uint16_t>> fetched){
+  std::unordered_set<std::uint64_t> seen;
+  seen.reserve(existing.servers.size() + fetched.size());
+  auto key=[](IPv4 ip, std::uint16_t port){
+    return (std::uint64_t(ip.host()) << 16) | port;
+  };
+  for(const auto& server : existing.servers) seen.insert(key(server.ip, server.port));
+  for(const auto& [ip, port] : fetched){
+    if(!seen.insert(key(ip, port)).second) continue;
+    ServerEntry entry;
+    entry.ip = ip;
+    entry.port = port;
+    existing.servers.push_back(std::move(entry));
+  }
+  return existing;
 }
 }

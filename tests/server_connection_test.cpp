@@ -80,6 +80,15 @@ TEST(ServerConnection, IpFilterRejectsLoginBeforeTcpConnect) {
 static std::vector<std::byte> status_payload(std::uint32_t u, std::uint32_t f){ codec::ByteWriter w; w.u32(u); w.u32(f); return w.take(); }
 static std::vector<std::byte> idchange_payload(std::uint32_t id, std::uint32_t flags){ codec::ByteWriter w; w.u32(id); w.u32(flags); return w.take(); }
 static std::vector<std::byte> cb_payload(std::uint32_t ip, std::uint16_t port){ codec::ByteWriter w; w.u32_be(ip); w.u16(port); return w.take(); }
+static std::vector<std::byte> server_list_payload(std::initializer_list<std::pair<std::uint32_t, std::uint16_t>> entries){
+  codec::ByteWriter w;
+  w.u8(static_cast<std::uint8_t>(entries.size()));
+  for(auto [ip, port] : entries){
+    w.u32_be(ip);
+    w.u16(port);
+  }
+  return w.take();
+}
 
 TEST(ServerConnection, LoginHighId){
   IoRuntime rt;
@@ -249,6 +258,40 @@ TEST(ServerConnection, GetSourcesRoundTrip){
     EXPECT_TRUE(r->sources[1].low_id());
     c.close(); co_return;
   });
+}
+TEST(ServerConnection, GetServerListRoundTrip){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  std::uint8_t captured_opcode = 0;
+  std::size_t captured_payload_size = 0;
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                                       // LOGINREQUEST
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0u));
+    auto f = co_await read_frame(s);                                    // GETSERVERLIST
+    if(!f.empty()){
+      captured_opcode = std::to_integer<std::uint8_t>(f[0]);
+      captured_payload_size = f.size() - 1u;
+    }
+    co_await ed2k::test::send_packet(s, op::SERVERLIST,
+      server_list_payload({{0x01020304u, 0x1234u}, {0x05060708u, 0x5678u}}));
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    LoginParams p; p.nickname="u";
+    auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+    auto r = co_await c.get_server_list(2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->size(), 2u); if(r->size()!=2u) co_return;
+    EXPECT_EQ((*r)[0].first.host(), 0x01020304u);
+    EXPECT_EQ((*r)[0].second, 0x1234u);
+    EXPECT_EQ((*r)[1].first.host(), 0x05060708u);
+    EXPECT_EQ((*r)[1].second, 0x5678u);
+    c.close(); co_return;
+  });
+  EXPECT_EQ(captured_opcode, op::GETSERVERLIST);
+  EXPECT_EQ(captured_payload_size, 0u);
 }
 TEST(ServerConnection, CallbackRequestedEmitted){
   IoRuntime rt;

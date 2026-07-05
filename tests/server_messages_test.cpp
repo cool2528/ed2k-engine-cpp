@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <array>
 #include "ed2k/server/messages.hpp"
+#include "ed2k/server/opcodes.hpp"
 #include "ed2k/server/search_query.hpp"
 #include "ed2k/share/known_file.hpp"
 using namespace ed2k; using namespace ed2k::server;
@@ -45,6 +46,8 @@ TEST(ServerMessages, EncodeCallbackRequest){
   EXPECT_EQ(encode_callback_request(0x12345678), bytes({0x78,0x56,0x34,0x12}));
 }
 TEST(ServerMessages, EncodeGetServerList){
+  EXPECT_EQ(op::GETSERVERLIST, 0x14u);
+  EXPECT_EQ(op::SERVERLIST, 0x32u);
   EXPECT_TRUE(encode_get_server_list().empty());
 }
 TEST(ServerMessages, EncodeOfferFilesUsesAichAndUint64SizeTags){

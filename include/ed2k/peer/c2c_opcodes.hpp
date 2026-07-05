@@ -3,6 +3,9 @@
 namespace ed2k::peer {
 namespace op {
 constexpr std::uint8_t HELLO             = 0x01;
+// Same opcode byte as HELLO, but these are sent under OP_EMULEPROT (0xC5).
+constexpr std::uint8_t EMULEINFO         = 0x01;
+constexpr std::uint8_t EMULEINFOANSWER   = 0x02;
 constexpr std::uint8_t HELLOANSWER       = 0x4C;
 constexpr std::uint8_t SETREQFILEID      = 0x4F;
 constexpr std::uint8_t FILESTATUS        = 0x50;

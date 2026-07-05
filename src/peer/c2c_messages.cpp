@@ -15,6 +15,16 @@ constexpr std::uint8_t CT_EMULECOMPAT_OPTIONS = 0xEF;
 constexpr std::uint8_t CT_EMULE_MISCOPTIONS1 = 0xFA;
 constexpr std::uint8_t CT_EMULE_VERSION = 0xFB;
 constexpr std::uint8_t CT_EMULE_MISCOPTIONS2 = 0xFE;
+constexpr std::uint8_t ET_COMPRESSION = 0x20;
+constexpr std::uint8_t ET_UDPPORT = 0x21;
+constexpr std::uint8_t ET_UDPVER = 0x22;
+constexpr std::uint8_t ET_SOURCEEXCHANGE = 0x23;
+constexpr std::uint8_t ET_COMMENTS = 0x24;
+constexpr std::uint8_t ET_EXTENDEDREQUEST = 0x25;
+constexpr std::uint8_t ET_COMPATIBLECLIENT = 0x26;
+constexpr std::uint8_t ET_FEATURES = 0x27;
+constexpr std::uint8_t ET_MOD_VERSION = 0x55;
+constexpr std::uint8_t ET_OS_INFO = 0x94;
 constexpr std::uint32_t SO_AMULE = 3;
 constexpr std::uint32_t SOURCEEXCHANGE2_VERSION = 4;
 
@@ -58,6 +68,15 @@ std::uint32_t misc_options2(const HelloInfo& h) {
          (large_files << 4);
 }
 }
+ClientSoftware MuleInfo::client_software() const {
+  switch(compatible_client){
+    case static_cast<std::uint32_t>(ClientSoftware::EMule): return ClientSoftware::EMule;
+    case static_cast<std::uint32_t>(ClientSoftware::AMule): return ClientSoftware::AMule;
+    case static_cast<std::uint32_t>(ClientSoftware::Lphant): return ClientSoftware::Lphant;
+    default: return ClientSoftware::Unknown;
+  }
+}
+
 std::vector<std::byte> encode_hello(const HelloInfo& h){
   ByteWriter w;
   w.hash16(h.user_hash);
@@ -82,6 +101,24 @@ std::vector<std::byte> encode_hello_packet(const HelloInfo& h){
   auto body = encode_hello(h);
   body.insert(body.begin(), std::byte{0x10});
   return body;
+}
+std::vector<std::byte> encode_mule_info(const MuleInfo& info){
+  ByteWriter w;
+  w.u8(info.version);
+  w.u8(info.protocol_version);
+  std::vector<Tag> tags;
+  tags.push_back(u32_tag(ET_COMPRESSION, info.compression ? 1u : 0u));
+  tags.push_back(u32_tag(ET_UDPVER, info.udp_version));
+  tags.push_back(u32_tag(ET_UDPPORT, info.udp_port));
+  tags.push_back(u32_tag(ET_SOURCEEXCHANGE, info.source_exchange_version));
+  tags.push_back(u32_tag(ET_COMMENTS, info.comments ? 1u : 0u));
+  tags.push_back(u32_tag(ET_EXTENDEDREQUEST, info.extended_requests_version));
+  tags.push_back(u32_tag(ET_FEATURES, info.features));
+  tags.push_back(u32_tag(ET_COMPATIBLECLIENT, info.compatible_client));
+  tags.push_back(string_tag(ET_MOD_VERSION, info.mod_version));
+  w.u32(static_cast<std::uint32_t>(tags.size()));
+  codec::write_taglist(w, tags);
+  return w.take();
 }
 std::vector<std::byte> encode_set_req_file(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_hashset_request(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
@@ -173,16 +210,71 @@ tl::expected<HelloInfo,std::error_code> decode_hello_answer(std::span<const std:
   for(auto& t : *tags){
     if(t.name_id == tag::CT_NAME && std::holds_alternative<std::string>(t.value)) h.nickname = std::get<std::string>(t.value);
     else if(t.name_id == tag::CT_VERSION && std::holds_alternative<std::uint64_t>(t.value)) h.version = static_cast<std::uint32_t>(std::get<std::uint64_t>(t.value));
+    else if(t.name_id == CT_EMULE_MISCOPTIONS1 && std::holds_alternative<std::uint64_t>(t.value)){
+      const auto options = std::get<std::uint64_t>(t.value);
+      h.supports_aich = ((options >> 29) & 0x07u) != 0;
+      h.supports_compression = ((options >> 20) & 0x0fu) != 0;
+      h.source_exchange_version = static_cast<std::uint32_t>((options >> 12) & 0x0fu);
+      h.supports_comments = ((options >> 4) & 0x0fu) != 0;
+      h.supports_multipacket = ((options >> 1) & 0x01u) != 0;
+    }
     else if(t.name_id == CT_EMULE_MISCOPTIONS2 && std::holds_alternative<std::uint64_t>(t.value)){
       const auto options = std::get<std::uint64_t>(t.value);
       h.supports_obfuscation = ((options >> 7) & 0x01u) != 0;
       h.requests_obfuscation = ((options >> 8) & 0x01u) != 0;
       h.requires_obfuscation = ((options >> 9) & 0x01u) != 0;
+      h.supports_source_exchange2 = ((options >> 10) & 0x01u) != 0;
+      h.supports_ext_multipacket = ((options >> 5) & 0x01u) != 0;
+      h.supports_large_files = ((options >> 4) & 0x01u) != 0;
     }
   }
   if(r.remaining() >= 6){ h.server_ip = IPv4::from_host(r.u32_be()); h.server_port = r.u16(); }
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return h;
+}
+tl::expected<MuleInfo,std::error_code> decode_mule_info(std::span<const std::byte> data){
+  ByteReader r(data);
+  MuleInfo info;
+  info.compression = false;
+  info.udp_version = 0;
+  info.udp_port = 0;
+  info.source_exchange_version = 0;
+  info.comments = false;
+  info.extended_requests_version = 0;
+  info.features = 0;
+  info.compatible_client = static_cast<std::uint32_t>(ClientSoftware::Unknown);
+  info.mod_version.clear();
+  info.os_info.clear();
+  info.version = r.u8();
+  info.protocol_version = r.u8();
+  const auto tag_count = r.u32();
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  if(info.protocol_version != 0x01 && info.protocol_version != 0xFF)
+    return tl::unexpected(make_error_code(errc::unsupported_version));
+  auto tags = codec::read_taglist(r, tag_count);
+  if(!tags) return tl::unexpected(tags.error());
+  for(const auto& t : *tags){
+    if(t.name_id == ET_MOD_VERSION && std::holds_alternative<std::string>(t.value)) {
+      info.mod_version = std::get<std::string>(t.value);
+    } else if(t.name_id == ET_OS_INFO && std::holds_alternative<std::string>(t.value)) {
+      info.os_info = std::get<std::string>(t.value);
+    } else if(std::holds_alternative<std::uint64_t>(t.value)) {
+      const auto value = std::get<std::uint64_t>(t.value);
+      switch(t.name_id){
+        case ET_COMPRESSION: info.compression = value != 0; break;
+        case ET_UDPVER: info.udp_version = static_cast<std::uint32_t>(value); break;
+        case ET_UDPPORT: info.udp_port = static_cast<std::uint16_t>(value); break;
+        case ET_SOURCEEXCHANGE: info.source_exchange_version = static_cast<std::uint32_t>(value); break;
+        case ET_COMMENTS: info.comments = value != 0; break;
+        case ET_EXTENDEDREQUEST: info.extended_requests_version = static_cast<std::uint32_t>(value); break;
+        case ET_FEATURES: info.features = static_cast<std::uint32_t>(value); break;
+        case ET_COMPATIBLECLIENT: info.compatible_client = static_cast<std::uint32_t>(value); break;
+        default: break;
+      }
+    }
+  }
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return info;
 }
 tl::expected<FileStatus,std::error_code> decode_file_status(std::span<const std::byte> data){
   ByteReader r(data);

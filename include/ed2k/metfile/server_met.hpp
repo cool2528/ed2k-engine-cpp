@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 #include <tl/expected.hpp>
 #include "ed2k/core/hash.hpp"
@@ -25,4 +26,6 @@ struct ServerEntry {
 struct ServerList { std::vector<ServerEntry> servers; };
 tl::expected<ServerList,std::error_code> parse_server_met(std::span<const std::byte>);
 std::vector<std::byte> write_server_met(const ServerList&);
+ServerList merge_server_list(ServerList existing,
+                             std::span<const std::pair<IPv4, std::uint16_t>> fetched);
 }

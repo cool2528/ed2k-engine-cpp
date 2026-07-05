@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <array>
 #include <memory>
+#include <optional>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -15,6 +16,11 @@
 #include "ed2k/net/connection.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 namespace ed2k::peer {
+struct C2CHandshakeResult {
+  HelloInfo hello;
+  MuleInfo mule_info;
+};
+
 class C2CConnection {
  public:
   explicit C2CConnection(boost::asio::any_io_executor ex);
@@ -24,12 +30,18 @@ class C2CConnection {
     connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<HelloInfo,std::error_code>>
     handshake(const HelloInfo& mine, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<C2CHandshakeResult,std::error_code>>
+    handshake_with_mule_info(const HelloInfo& mine, const MuleInfo& mule_info, std::chrono::milliseconds timeout);
   // acceptor 模式握手:对端(TCP 主动方,如 LowID 回调里拨入 InboundListener 的源)
   // 先发 HELLO,我方解码后回 HELLOANSWER。HELLO 与 HELLOANSWER 线格式相同
   // (aMule ProcessHelloPacket 同一例程处理二者),故复用 decode_hello_answer/
   // encode_hello,仅由调用方在 net::Packet 上设置 op::HELLO/op::HELLOANSWER。
   boost::asio::awaitable<tl::expected<HelloInfo,std::error_code>>
     handshake_acceptor(const HelloInfo& mine, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<C2CHandshakeResult,std::error_code>>
+    handshake_acceptor_with_mule_info(const HelloInfo& mine, const MuleInfo& mule_info, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<MuleInfo,std::error_code>>
+    exchange_mule_info(const MuleInfo& mine, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<FileStatus,std::error_code>>
     request_file(const FileHash&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<PartHash>,std::error_code>>
@@ -56,7 +68,7 @@ class C2CConnection {
   void close() noexcept;
  private:
   boost::asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
-    pump_until(std::uint8_t want, std::chrono::milliseconds budget);
+    pump_until(std::uint8_t want, std::chrono::milliseconds budget, std::optional<std::uint8_t> protocol = std::nullopt);
   ed2k::net::Connection conn_;
 };
 }

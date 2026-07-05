@@ -53,8 +53,8 @@ static std::vector<std::byte> bytes(std::initializer_list<int> xs){
 static std::vector<std::byte> idchange_payload(std::uint32_t id, std::uint32_t flags){
   codec::ByteWriter w; w.u32(id); w.u32(flags); return w.take();
 }
-static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t op, std::span<const std::byte> pl){
-  Packet p; p.protocol=proto::eDonkey; p.opcode=op; p.payload.assign(pl.begin(),pl.end());
+static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t op, std::span<const std::byte> pl, std::uint8_t proto_val = proto::eDonkey){
+  Packet p; p.protocol=proto_val; p.opcode=op; p.payload.assign(pl.begin(),pl.end());
   auto fr=encode_frame(p); auto [e,n]=co_await asio::async_write(s,asio::buffer(fr),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return;
 }
 static asio::awaitable<std::vector<std::byte>> read_frame(tcp::socket& s){
@@ -280,7 +280,7 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
     if(opcode == op::AICHFILEHASHREQ){
       // OP_AICHFILEHASHANS = file_hash(16) + master_hash(20)
       codec::ByteWriter w; w.hash16(mf.fhash); w.hash20(master.bytes());
-      co_await send_pkt(s, op::AICHFILEHASHANS, w.take());
+      co_await send_pkt(s, op::AICHFILEHASHANS, w.take(), proto::eMule);
       continue;
     }
     if(opcode == op::AICHREQUEST){
@@ -296,7 +296,7 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
       w.u16(static_cast<std::uint16_t>(rec.size()));
       for(const auto& p : rec){ w.u16(static_cast<std::uint16_t>(p.identifier)); w.hash20(p.hash); }
       w.u16(0);   // count32
-      co_await send_pkt(s, op::AICHANSWER, w.take());
+      co_await send_pkt(s, op::AICHANSWER, w.take(), proto::eMule);
       continue;
     }
     if(opcode == op::REQUESTPARTS){

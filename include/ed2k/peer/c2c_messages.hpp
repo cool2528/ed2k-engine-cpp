@@ -25,6 +25,40 @@ struct HelloInfo {
   bool supports_obfuscation = false;
   bool requests_obfuscation = false;
   bool requires_obfuscation = false;
+  bool supports_aich = false;
+  bool supports_compression = false;
+  std::uint32_t source_exchange_version = 0;
+  bool supports_comments = false;
+  bool supports_multipacket = false;
+  bool supports_source_exchange2 = false;
+  bool supports_ext_multipacket = false;
+  bool supports_large_files = false;
+};
+
+enum class ClientSoftware : std::uint32_t {
+  EMule = 0,
+  AMule = 3,
+  Lphant = 0x14,
+  Unknown = 0x36,
+};
+
+struct MuleInfo {
+  std::uint8_t version = 0x3C;
+  std::uint8_t protocol_version = 0x01;
+  bool compression = true;
+  std::uint32_t udp_version = 4;
+  std::uint16_t udp_port = 0;
+  std::uint32_t source_exchange_version = 3;
+  bool comments = true;
+  std::uint32_t extended_requests_version = 2;
+  std::uint32_t features = 0x03;
+  std::uint32_t compatible_client = static_cast<std::uint32_t>(ClientSoftware::AMule);
+  std::string mod_version;
+  std::string os_info;
+
+  ClientSoftware client_software() const;
+  bool supports_obfuscation() const { return (features & 0x03u) != 0; }
+  bool supports_preview() const { return (features & 0x80u) != 0; }
 };
 
 // C→C 编码：返回 payload（opcode 由调用方设入 net::Packet）
@@ -35,6 +69,7 @@ struct HelloInfo {
 // 发 OP_HELLO 用 encode_hello_packet；发 OP_HELLOANSWER 用 encode_hello。解码同理(decode_hello / decode_hello_answer)。
 std::vector<std::byte> encode_hello(const HelloInfo&);          // HELLOANSWER body(无 0x10 前导)/HELLO body
 std::vector<std::byte> encode_hello_packet(const HelloInfo&);   // OP_HELLO payload = [0x10] + encode_hello(h)
+std::vector<std::byte> encode_mule_info(const MuleInfo&);
 std::vector<std::byte> encode_set_req_file(const FileHash&);
 std::vector<std::byte> encode_hashset_request(const FileHash&);
 std::vector<std::byte> encode_request_filename(const FileHash&);
@@ -73,6 +108,7 @@ struct PreviewAnswer { FileHash hash; std::vector<std::vector<std::byte>> frames
 
 tl::expected<HelloInfo,std::error_code>          decode_hello(std::span<const std::byte>);        // OP_HELLO(校验并跳过 0x10 前导)
 tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>); // OP_HELLOANSWER(无前导)
+tl::expected<MuleInfo,std::error_code>           decode_mule_info(std::span<const std::byte>);
 tl::expected<FileStatus,std::error_code>         decode_file_status(std::span<const std::byte>);
 tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(const FileHash& expected, std::span<const std::byte>);
 tl::expected<FileNameAnswer,std::error_code>     decode_req_filename_answer(std::span<const std::byte>);

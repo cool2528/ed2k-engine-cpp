@@ -120,6 +120,28 @@ TEST(ServerMet, WritesObfuscationTagsAsAmuleWidths){
   EXPECT_NE(std::search(bytes.begin(), bytes.end(), udp_port_tag.begin(), udp_port_tag.end()), bytes.end());
 }
 
+TEST(ServerMet, MergeServerListDedupesFetchedServersAndPreservesExistingMetadata){
+  ServerList existing;
+  ServerEntry seed;
+  seed.ip = *IPv4::from_dotted("10.20.30.40");
+  seed.port = 4661;
+  seed.name = "seed";
+  seed.udp_flags = 0x00000620u;
+  existing.servers = {seed};
+
+  auto merged = merge_server_list(existing, std::array{
+    std::pair{*IPv4::from_dotted("10.20.30.40"), std::uint16_t{4661}},
+    std::pair{*IPv4::from_dotted("10.20.30.41"), std::uint16_t{4662}},
+    std::pair{*IPv4::from_dotted("10.20.30.41"), std::uint16_t{4662}},
+  });
+
+  ASSERT_EQ(merged.servers.size(), 2u);
+  EXPECT_EQ(merged.servers[0].name, "seed");
+  EXPECT_EQ(merged.servers[0].udp_flags, 0x00000620u);
+  EXPECT_EQ(merged.servers[1].ip, *IPv4::from_dotted("10.20.30.41"));
+  EXPECT_EQ(merged.servers[1].port, 4662u);
+}
+
 // Graceful degradation: an unsupported tag TYPE must produce a clean error,
 // not a crash.
 TEST(ServerMet, UnsupportedTagTypeErrorsNoCrash){

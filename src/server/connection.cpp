@@ -104,6 +104,15 @@ ServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_found_sources(rp->payload);
 }
+asio::awaitable<tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::error_code>>
+ServerConnection::get_server_list(std::chrono::milliseconds timeout){
+  net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::GETSERVERLIST; req.payload = encode_get_server_list();
+  auto sr = co_await conn_.send(req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await pump_until(op::SERVERLIST, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  co_return decode_server_list(rp->payload);
+}
 asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::callback_request(std::uint32_t client_id, std::chrono::milliseconds timeout){
   (void)timeout;

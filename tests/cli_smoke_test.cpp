@@ -97,6 +97,15 @@ std::string read_text(const std::filesystem::path& path) {
   return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+std::vector<std::byte> read_bytes(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  const auto size = static_cast<std::size_t>(in.tellg());
+  in.seekg(0);
+  std::vector<std::byte> bytes(size);
+  in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  return bytes;
+}
+
 void write_bytes(const std::filesystem::path& path, std::span<const std::byte> bytes) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -120,6 +129,30 @@ asio::awaitable<bool> read_ed2k_frame(tcp::socket& s) {
   auto [b_ec, b_n] = co_await asio::async_read(s, asio::buffer(body), asio::as_tuple(asio::use_awaitable));
   (void)b_n;
   co_return !b_ec;
+}
+
+asio::awaitable<std::vector<std::byte>> read_ed2k_body(tcp::socket& s) {
+  std::array<std::byte, 5> hdr{};
+  auto [h_ec, h_n] = co_await asio::async_read(s, asio::buffer(hdr), asio::as_tuple(asio::use_awaitable));
+  (void)h_n;
+  if (h_ec) co_return std::vector<std::byte>{};
+  auto header = ed2k::net::parse_header(hdr);
+  if (!header) co_return std::vector<std::byte>{};
+  std::vector<std::byte> body(header->size);
+  auto [b_ec, b_n] = co_await asio::async_read(s, asio::buffer(body), asio::as_tuple(asio::use_awaitable));
+  (void)b_n;
+  if (b_ec) co_return std::vector<std::byte>{};
+  co_return body;
+}
+
+std::vector<std::byte> tcp_server_list_payload(std::initializer_list<std::pair<std::uint32_t, std::uint16_t>> entries) {
+  ed2k::codec::ByteWriter w;
+  w.u8(static_cast<std::uint8_t>(entries.size()));
+  for (auto [ip, port] : entries) {
+    w.u32_be(ip);
+    w.u16(port);
+  }
+  return w.take();
 }
 } // namespace
 
@@ -311,6 +344,60 @@ TEST(CliUpdate, ServerlistFetchesHttpUrl) {
   }
   EXPECT_EQ(read_text(path), "server-list");
   std::filesystem::remove(path);
+}
+
+TEST(CliServerList, GetServerlistFetchesTcpListAndUpdatesMetFile) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+
+  ed2k::net::IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::uint8_t captured_opcode = 0;
+  std::size_t captured_payload_size = 0;
+  server.serve([&](tcp::socket s) -> asio::awaitable<void> {
+    (void)co_await read_ed2k_body(s); // LOGINREQUEST
+    co_await ed2k::test::send_packet(s, ed2k::server::op::IDCHANGE, idchange_payload(0x01000000u, 0x0119u));
+    auto request = co_await read_ed2k_body(s);
+    if (!request.empty()) {
+      captured_opcode = std::to_integer<std::uint8_t>(request[0]);
+      captured_payload_size = request.size() - 1u;
+    }
+    co_await ed2k::test::send_packet(
+      s,
+      ed2k::server::op::SERVERLIST,
+      tcp_server_list_payload({{0x7F000001u, server.port()}, {0x0A000002u, 4242}}));
+    co_return;
+  });
+  std::thread io_thread([&] { rt.run(); });
+
+  ed2k::ServerList list;
+  ed2k::ServerEntry seed;
+  seed.ip = *ed2k::IPv4::from_dotted("127.0.0.1");
+  seed.port = server.port();
+  seed.name = "seed";
+  list.servers = {seed};
+  const auto met_path = std::filesystem::temp_directory_path() / "ed2k_cli_get_serverlist.met";
+  write_bytes(met_path, ed2k::write_server_met(list));
+
+  const auto command = shell_path(*tool) + " get-serverlist " + shell_arg(shell_path(met_path)) + quiet_redirect();
+  EXPECT_EQ(shell_exit_code(std::system(command.c_str())), 0);
+
+  rt.stop();
+  if (io_thread.joinable()) {
+    io_thread.join();
+  }
+
+  auto merged = ed2k::parse_server_met(read_bytes(met_path));
+  ASSERT_TRUE(merged.has_value()) << merged.error().message();
+  ASSERT_EQ(merged->servers.size(), 2u);
+  EXPECT_EQ(merged->servers[0].name, "seed");
+  EXPECT_EQ(merged->servers[1].ip, *ed2k::IPv4::from_dotted("10.0.0.2"));
+  EXPECT_EQ(merged->servers[1].port, 4242u);
+  EXPECT_EQ(captured_opcode, ed2k::server::op::GETSERVERLIST);
+  EXPECT_EQ(captured_payload_size, 0u);
+  std::filesystem::remove(met_path);
 }
 
 TEST(CliProxy, GlobalProxyRoutesLoginThroughSocks5) {

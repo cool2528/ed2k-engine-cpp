@@ -46,6 +46,8 @@ class ServerConnection {
     search(const SearchExpr&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<FoundSources,std::error_code>>
     get_sources(const FileHash&, std::uint64_t size, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::error_code>>
+    get_server_list(std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     callback_request(std::uint32_t client_id, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<void,std::error_code>>

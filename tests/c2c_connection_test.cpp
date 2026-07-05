@@ -119,6 +119,51 @@ TEST(C2CConnection, HandshakeRoundTrip){
     c.close(); co_return;
   });
 }
+TEST(C2CConnection, HandshakeWithMuleInfoUsesEmuleProtocolForOpcodeCollision){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  std::uint8_t captured_proto = 0;
+  std::uint8_t captured_opcode = 0;
+  std::optional<MuleInfo> captured_info;
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                       // HELLO under OP_EDONKEYPROT
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(peer_hello()));
+
+    auto [proto_byte, body] = co_await read_frame_proto(s);
+    captured_proto = proto_byte;
+    if(!body.empty()){
+      captured_opcode = std::to_integer<std::uint8_t>(body[0]);
+      auto decoded = decode_mule_info(std::span<const std::byte>(body).subspan(1));
+      EXPECT_TRUE(decoded.has_value());
+      if(decoded) captured_info = *decoded;
+    }
+
+    MuleInfo answer;
+    answer.version = 0x3C;
+    answer.udp_port = 4672;
+    answer.features = 0x03;
+    answer.mod_version = "remote";
+    co_await send_pkt(s, op::EMULEINFOANSWER, encode_mule_info(answer), proto::eMule);
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    MuleInfo mine;
+    mine.version = 0x3C;
+    mine.udp_port = 4672;
+    mine.mod_version = "local";
+    auto r = co_await c.handshake_with_mule_info(peer_hello(), mine, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->hello.nickname, "peer");
+    EXPECT_EQ(r->mule_info.mod_version, "remote");
+    c.close(); co_return;
+  });
+  EXPECT_EQ(captured_proto, proto::eMule);
+  EXPECT_EQ(captured_opcode, op::EMULEINFO);
+  ASSERT_TRUE(captured_info.has_value());
+  EXPECT_EQ(captured_info->mod_version, "local");
+}
 TEST(C2CConnection, RequestFileStatus){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{

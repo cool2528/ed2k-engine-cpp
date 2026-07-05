@@ -46,6 +46,7 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool serverlist <server.met>\n"
   "       ed2k-tool parse <ed2k-link>\n"
   "       ed2k-tool login <server.met> [--ip:x.x.x.x] [--port:n]\n"
+  "       ed2k-tool get-serverlist <server.met>\n"
   "       ed2k-tool search <server.met> <keyword>\n"
   "       ed2k-tool sources <server.met> <ed2k-link>\n"
   "       ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]\n"
@@ -65,6 +66,12 @@ static std::vector<std::byte> read_all(const char* p){
   std::ifstream f(p,std::ios::binary); std::vector<std::byte> v;
   f.seekg(0,std::ios::end); auto n=f.tellg(); f.seekg(0);
   if(n>0){ v.resize(std::size_t(n)); f.read(reinterpret_cast<char*>(v.data()),n); } return v;
+}
+static bool write_all_bytes(const std::filesystem::path& path, std::span<const std::byte> bytes){
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  if(!f) return false;
+  f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  return static_cast<bool>(f);
 }
 static std::string read_text_file(const std::filesystem::path& path){
   std::ifstream f(path, std::ios::binary);
@@ -323,6 +330,48 @@ int main(int argc,char** argv){
     for(auto& s:list->servers)
       std::printf("%-22s %-6u %-8u %s\n",(s.ip.to_dotted()).c_str(),s.port,s.max_users,s.name.c_str());
     std::printf("(%zu servers)\n", list->servers.size());
+    return 0;
+  }
+  if(cmd=="get-serverlist"){
+    if(argc<3) return usage();
+    const std::filesystem::path met_path = argv[2];
+    auto metbytes = read_all(argv[2]);
+    auto existing = parse_server_met(metbytes);
+    if(!existing){ std::printf("error: %s\n", existing.error().message().c_str()); return 1; }
+    auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
+    if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
+    ed2k::net::IoRuntime rt;
+    auto p = cli_login_params(*startup_prefs);
+    std::optional<std::vector<std::pair<IPv4, std::uint16_t>>> fetched;
+    int rc = 0;
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+      auto login = co_await ed2k::app::login_with_rotation(
+        rt.executor(), metbytes, std::nullopt, p,
+        std::chrono::milliseconds(startup_prefs->connect_timeout_ms),
+        globals.proxy, *global_filter, startup_prefs->ip_filter_level);
+      if(!login){
+        std::printf("error: %s\n", login.error().message().c_str());
+        rc = 1;
+        rt.stop();
+        co_return;
+      }
+      auto list = co_await login->conn.get_server_list(std::chrono::milliseconds(startup_prefs->connect_timeout_ms));
+      login->conn.close();
+      if(!list){
+        std::printf("error: %s\n", list.error().message().c_str());
+        rc = 1;
+      } else {
+        fetched = std::move(*list);
+      }
+      rt.stop();
+      co_return;
+    }, asio::detached);
+    rt.run();
+    if(rc != 0 || !fetched) return 1;
+    auto merged = merge_server_list(std::move(*existing), std::span<const std::pair<IPv4, std::uint16_t>>(*fetched));
+    auto out = write_server_met(merged);
+    if(!write_all_bytes(met_path, out)){ std::printf("error: io error\n"); return 1; }
+    std::printf("updated %s (%zu servers)\n", met_path.string().c_str(), merged.servers.size());
     return 0;
   }
   if(cmd=="parse"){

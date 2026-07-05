@@ -118,6 +118,50 @@ TEST(C2CMessages, EncodeHelloAdvertisesObfuscationBitsWhenEnabled){
   EXPECT_EQ((*misc2 >> 8) & 0x01u, 1u);
   EXPECT_EQ((*misc2 >> 9) & 0x01u, 1u);
 }
+TEST(C2CMessages, EncodeMuleInfoUsesAmuleTagOrderAndTypes){
+  MuleInfo info;
+  info.version = 0x3C;
+  info.udp_port = 4672;
+  info.features = 0x83;
+  info.mod_version = "ed2k-engine-cpp";
+
+  auto out = encode_mule_info(info);
+  std::vector<std::byte> want;
+  auto app=[&](const std::vector<std::byte>& b){ want.insert(want.end(), b.begin(), b.end()); };
+  app(bytes({0x3C, 0x01}));
+  app(bytes({9,0,0,0}));
+  app(bytes({0x83,0x20, 1,0,0,0}));              // ET_COMPRESSION
+  app(bytes({0x83,0x22, 4,0,0,0}));              // ET_UDPVER
+  app(bytes({0x83,0x21, 0x40,0x12,0,0}));        // ET_UDPPORT = 4672
+  app(bytes({0x83,0x23, 3,0,0,0}));              // ET_SOURCEEXCHANGE
+  app(bytes({0x83,0x24, 1,0,0,0}));              // ET_COMMENTS
+  app(bytes({0x83,0x25, 2,0,0,0}));              // ET_EXTENDEDREQUEST
+  app(bytes({0x83,0x27, 0x83,0,0,0}));           // ET_FEATURES: crypto + preview
+  app(bytes({0x83,0x26, 3,0,0,0}));              // ET_COMPATIBLECLIENT = aMule
+  app(bytes({0x82,0x55, 15,0,'e','d','2','k','-','e','n','g','i','n','e','-','c','p','p'}));
+  EXPECT_EQ(out, want);
+}
+TEST(C2CMessages, DecodeMuleInfoRecognizesClientAndFeatures){
+  MuleInfo info;
+  info.version = 0x3C;
+  info.udp_port = 4672;
+  info.features = 0x83;
+  info.mod_version = "ed2k-engine-cpp";
+
+  auto decoded = decode_mule_info(encode_mule_info(info));
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->version, 0x3Cu);
+  EXPECT_EQ(decoded->protocol_version, 0x01u);
+  EXPECT_EQ(decoded->udp_version, 4u);
+  EXPECT_EQ(decoded->udp_port, 4672u);
+  EXPECT_EQ(decoded->source_exchange_version, 3u);
+  EXPECT_EQ(decoded->extended_requests_version, 2u);
+  EXPECT_EQ(decoded->compatible_client, 3u);
+  EXPECT_EQ(decoded->mod_version, "ed2k-engine-cpp");
+  EXPECT_EQ(decoded->client_software(), ClientSoftware::AMule);
+  EXPECT_TRUE(decoded->supports_obfuscation());
+  EXPECT_TRUE(decoded->supports_preview());
+}
 TEST(C2CMessages, EncodeHelloPacket){
   // OP_HELLO payload = [0x10 hashsize] + encode_hello body(aMule SendHelloPacket: WriteUInt8(16) 后 SendHelloTypePacket)。
   HelloInfo h;
@@ -396,6 +440,29 @@ TEST(C2CMessages, DecodeHelloAnswerReadsObfuscationBits){
   EXPECT_TRUE(out->supports_obfuscation);
   EXPECT_TRUE(out->requests_obfuscation);
   EXPECT_TRUE(out->requires_obfuscation);
+}
+TEST(C2CMessages, DecodeHelloAnswerReadsEmuleFeatureBits){
+  ByteWriter w;
+  w.hash16(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
+  w.u32(0x01020304u);
+  w.u16(0x1234u);
+  w.u32(2);
+  w.u8(0x83); w.u8(0xFA);
+  w.u32((1u << 29) | (3u << 12) | (1u << 4) | (1u << 1));
+  w.u8(0x83); w.u8(0xFE);
+  w.u32((1u << 10) | (1u << 5) | (1u << 4));
+  w.u32(0);
+  w.u16(0);
+
+  auto out=decode_hello_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_TRUE(out->supports_aich);
+  EXPECT_EQ(out->source_exchange_version, 3u);
+  EXPECT_TRUE(out->supports_comments);
+  EXPECT_TRUE(out->supports_multipacket);
+  EXPECT_TRUE(out->supports_source_exchange2);
+  EXPECT_TRUE(out->supports_ext_multipacket);
+  EXPECT_TRUE(out->supports_large_files);
 }
 TEST(C2CMessages, DecodeHello){
   // OP_HELLO 帧 = [0x10] + body(hash+id+port+tagcount+tags+server_ip+server_port)。
