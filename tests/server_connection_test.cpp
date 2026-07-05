@@ -323,6 +323,7 @@ TEST(ServerConnection, PublishFilesSendsOfferFilesFrame){
     codec::ByteReader r(f2);
     captured_opcode = r.u8();
     captured_count = r.u32();
+    co_await ed2k::test::send_packet(s, op::SERVERMESSAGE, msg_payload("ack"));
     co_await keep_alive(s); co_return;
   });
   run_coro(rt, [&]() -> asio::awaitable<void>{
@@ -339,6 +340,8 @@ TEST(ServerConnection, PublishFilesSendsOfferFilesFrame){
     std::array files{f};
     auto pr = co_await c.publish_files(files);
     EXPECT_TRUE(pr.has_value()) << (pr ? "" : pr.error().message());
+    // Drain the ACK so the server has definitely read OFFERFILES before close.
+    (void)co_await c.receive_events(2s);
     c.close(); co_return;
   });
   EXPECT_EQ(captured_opcode, op::OFFERFILES);
