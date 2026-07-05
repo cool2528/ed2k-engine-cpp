@@ -18,7 +18,15 @@ namespace ed2k::kad {
 class KadNetwork;
 }
 namespace ed2k::app {
-struct ServerTarget { IPv4 ip; std::uint16_t port = 0; };
+struct ServerTarget {
+  IPv4 ip;
+  std::uint16_t port = 0;
+  std::uint32_t udp_flags = 0;
+  std::uint32_t udp_key = 0;
+  std::uint32_t udp_key_ip = 0;
+  std::uint16_t tcp_obf_port = 0;
+  std::uint16_t udp_obf_port = 0;
+};
 struct LoginSession {
   ed2k::server::ServerConnection conn;
   ed2k::server::LoginResult result;

@@ -55,6 +55,28 @@ TEST(AppServerSession, BuildTargetsParsesMet){
   EXPECT_EQ(v[0].port, 1u);
   EXPECT_EQ(v[1].port, 2u);
 }
+TEST(AppServerSession, BuildTargetsPreservesServerObfuscationMetadata){
+  ServerList sl;
+  ServerEntry server;
+  server.ip=IPv4::from_dotted("10.0.0.1").value();
+  server.port=4661;
+  server.udp_flags=0x00000600u;
+  server.udp_key=0x11223344u;
+  server.udp_key_ip=0x0A000001u;
+  server.tcp_obf_port=4665;
+  server.udp_obf_port=4675;
+  sl.servers={server};
+
+  auto v = build_targets(write_server_met(sl), std::nullopt);
+  ASSERT_FALSE(v.empty());
+  EXPECT_EQ(v[0].ip, server.ip);
+  EXPECT_EQ(v[0].port, server.port);
+  EXPECT_EQ(v[0].udp_flags, server.udp_flags);
+  EXPECT_EQ(v[0].udp_key, server.udp_key);
+  EXPECT_EQ(v[0].udp_key_ip, server.udp_key_ip);
+  EXPECT_EQ(v[0].tcp_obf_port, server.tcp_obf_port);
+  EXPECT_EQ(v[0].udp_obf_port, server.udp_obf_port);
+}
 TEST(AppServerSession, LoginSucceedsOnOverride){
   ed2k::net::IoRuntime rt;
   ed2k::test::MockServer srv(rt.context());

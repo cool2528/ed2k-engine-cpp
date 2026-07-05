@@ -2,6 +2,27 @@
 #include "ed2k/codec/byte_io.hpp"
 namespace ed2k {
 using namespace ed2k::codec;
+namespace {
+void write_u32_tag(ByteWriter& w, std::uint8_t id, std::uint32_t value){
+  w.u8(tagtype::Uint32 | tagtype::NameFlag);
+  w.u8(id);
+  w.u32(value);
+}
+void write_u16_tag(ByteWriter& w, std::uint8_t id, std::uint16_t value){
+  w.u8(tagtype::Uint16 | tagtype::NameFlag);
+  w.u8(id);
+  w.u16(value);
+}
+bool numeric_tag(const Tag& t){
+  return std::holds_alternative<std::uint64_t>(t.value);
+}
+std::uint32_t numeric32(const Tag& t){
+  return static_cast<std::uint32_t>(std::get<std::uint64_t>(t.value));
+}
+std::uint16_t numeric16(const Tag& t){
+  return static_cast<std::uint16_t>(std::get<std::uint64_t>(t.value));
+}
+}
 tl::expected<ServerList,std::error_code> parse_server_met(std::span<const std::byte> data){
   ByteReader r(data);
   std::uint8_t magic=r.u8();
@@ -17,6 +38,11 @@ tl::expected<ServerList,std::error_code> parse_server_met(std::span<const std::b
       if(t.name_id==stag::Name && std::holds_alternative<std::string>(t.value)) e.name=std::get<std::string>(t.value);
       else if(t.name_id==stag::Description && std::holds_alternative<std::string>(t.value)) e.description=std::get<std::string>(t.value);
       else if(t.name_id==stag::MaxUsers && std::holds_alternative<std::uint64_t>(t.value)) e.max_users=std::uint32_t(std::get<std::uint64_t>(t.value));
+      else if(t.name_id==stag::UdpFlags && numeric_tag(t)) e.udp_flags=numeric32(t);
+      else if(t.name_id==stag::UdpKey && numeric_tag(t)) e.udp_key=numeric32(t);
+      else if(t.name_id==stag::UdpKeyIp && numeric_tag(t)) e.udp_key_ip=numeric32(t);
+      else if(t.name_id==stag::TcpPortObfuscation && numeric_tag(t)) e.tcp_obf_port=numeric16(t);
+      else if(t.name_id==stag::UdpPortObfuscation && numeric_tag(t)) e.udp_obf_port=numeric16(t);
       else e.extra.push_back(std::move(t));
     }
     if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
@@ -32,9 +58,20 @@ std::vector<std::byte> write_server_met(const ServerList& list){
     if(!e.name.empty()){ codec::Tag t; t.name_id=stag::Name; t.value=e.name; tags.push_back(t); }
     if(!e.description.empty()){ codec::Tag t; t.name_id=stag::Description; t.value=e.description; tags.push_back(t); }
     if(e.max_users){ codec::Tag t; t.name_id=stag::MaxUsers; t.value=std::uint64_t(e.max_users); tags.push_back(t); }
-    for(auto& t:e.extra) tags.push_back(t);
-    w.u32(std::uint32_t(tags.size()));
+    std::uint32_t tag_count = std::uint32_t(tags.size() + e.extra.size());
+    if(e.udp_flags) ++tag_count;
+    if(e.udp_key) ++tag_count;
+    if(e.udp_key_ip) ++tag_count;
+    if(e.tcp_obf_port) ++tag_count;
+    if(e.udp_obf_port) ++tag_count;
+    w.u32(tag_count);
     write_taglist(w, tags);
+    if(e.udp_flags) write_u32_tag(w, stag::UdpFlags, e.udp_flags);
+    if(e.udp_key) write_u32_tag(w, stag::UdpKey, e.udp_key);
+    if(e.udp_key_ip) write_u32_tag(w, stag::UdpKeyIp, e.udp_key_ip);
+    if(e.tcp_obf_port) write_u16_tag(w, stag::TcpPortObfuscation, e.tcp_obf_port);
+    if(e.udp_obf_port) write_u16_tag(w, stag::UdpPortObfuscation, e.udp_obf_port);
+    write_taglist(w, e.extra);
   }
   return w.take();
 }

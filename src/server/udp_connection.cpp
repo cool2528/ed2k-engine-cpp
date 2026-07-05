@@ -1,4 +1,6 @@
 #include "ed2k/server/udp_connection.hpp"
+#include "ed2k/net/udp_framing.hpp"
+#include "ed2k/net/udp_obfuscation.hpp"
 #include "ed2k/util/error.hpp"
 #include <chrono>
 namespace ed2k::server {
@@ -7,9 +9,58 @@ using udp = asio::ip::udp;
 using clock_type = std::chrono::steady_clock;
 
 UdpServerConnection::UdpServerConnection(asio::any_io_executor ex, IPv4 ip, std::uint16_t port)
-  : sock_(ex), server_(udp::endpoint(asio::ip::address_v4(ip.host()), port)) {}
+  : UdpServerConnection(ex, ip, port, UdpServerObfuscation{}) {}
+UdpServerConnection::UdpServerConnection(asio::any_io_executor ex, IPv4 ip, std::uint16_t port,
+                                         UdpServerObfuscation obfuscation)
+  : sock_(ex),
+    plain_server_(udp::endpoint(asio::ip::address_v4(ip.host()), port)),
+    obfuscation_(obfuscation) {}
 void UdpServerConnection::on_event(std::function<void(const UdpEvent&)> sink){ on_event_ = std::move(sink); }
 void UdpServerConnection::close() noexcept { sock_.close(); }
+
+udp::endpoint UdpServerConnection::obfuscated_endpoint() const {
+  return udp::endpoint(plain_server_.address(), obfuscation_.udp_port);
+}
+
+asio::awaitable<tl::expected<void,std::error_code>>
+UdpServerConnection::send_request(const ed2k::net::Packet& request, bool obfuscated){
+  if(obfuscated && obfuscation_.enabled()){
+    auto clear = ed2k::net::encode_udp_packet(request);
+    auto encoded = ed2k::net::encode_server_udp_obfuscated_datagram(
+        clear,
+        ed2k::net::ServerUdpObfuscationOptions{
+            .base_key = obfuscation_.udp_key,
+            .direction = ed2k::net::ServerUdpObfuscationDirection::client_to_server,
+            .random_key_part = obfuscation_.random_key_part,
+            .marker = obfuscation_.marker,
+        });
+    if(!encoded) co_return tl::unexpected(encoded.error());
+    auto sr = co_await sock_.send_datagram(obfuscated_endpoint(), *encoded);
+    if(!sr) co_return tl::unexpected(sr.error());
+    co_return tl::expected<void,std::error_code>{};
+  }
+  auto sr = co_await sock_.send_to(plain_server_, request);
+  if(!sr) co_return tl::unexpected(sr.error());
+  co_return tl::expected<void,std::error_code>{};
+}
+
+asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
+UdpServerConnection::request_response(const ed2k::net::Packet& request, std::uint8_t want,
+                                      std::chrono::milliseconds timeout){
+  if(obfuscation_.enabled()){
+    auto sr = co_await send_request(request, true);
+    if(!sr) co_return tl::unexpected(sr.error());
+    auto probe_timeout = obfuscation_.probe_timeout;
+    if(probe_timeout.count() <= 0 || probe_timeout > timeout) probe_timeout = timeout;
+    auto rp = co_await pump_until(want, probe_timeout);
+    if(rp || !obfuscation_.fallback_plain || rp.error() != make_error_code(errc::timed_out)){
+      co_return rp;
+    }
+  }
+  auto sr = co_await send_request(request, false);
+  if(!sr) co_return tl::unexpected(sr.error());
+  co_return co_await pump_until(want, timeout);
+}
 
 asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
 UdpServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds budget){
@@ -17,10 +68,25 @@ UdpServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds bud
   while(true){
     auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
     if(rem.count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
-    auto rp = co_await sock_.recv_from(rem);
+    auto rp = co_await sock_.recv_datagram(rem);
     if(!rp) co_return tl::unexpected(rp.error());
-    auto [pkt, sender] = std::move(*rp);
-    if(sender != server_) continue;              // 过滤非目标源
+    auto [datagram, sender] = std::move(*rp);
+    const bool from_plain = sender == plain_server_;
+    const bool from_obfuscated = obfuscation_.enabled() && sender == obfuscated_endpoint();
+    if(!from_plain && !from_obfuscated) continue; // 过滤非目标源
+    if(obfuscation_.enabled()){
+      auto decoded = ed2k::net::decode_server_udp_obfuscated_datagram(
+          datagram,
+          ed2k::net::ServerUdpObfuscationDecodeOptions{
+              .base_key = obfuscation_.udp_key,
+              .direction = ed2k::net::ServerUdpObfuscationDirection::server_to_client,
+          });
+      if(!decoded) co_return tl::unexpected(decoded.error());
+      datagram = std::move(decoded->datagram);
+    }
+    auto parsed = ed2k::net::parse_udp_datagram(datagram);
+    if(!parsed) co_return tl::unexpected(parsed.error());
+    auto pkt = std::move(*parsed);
     if(pkt.opcode == want) co_return std::move(pkt);
     if(pkt.opcode == udpop::INVALID_LOWID){
       if(on_event_){
@@ -36,9 +102,7 @@ asio::awaitable<tl::expected<UdpSearchResult,std::error_code>>
 UdpServerConnection::global_search(const SearchExpr& expr, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::GLOBSEARCHREQ2;
   req.payload = encode_glob_search_req(expr);
-  auto sr = co_await sock_.send_to(server_, req);
-  if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(udpop::GLOBSEARCHRES, timeout);
+  auto rp = co_await request_response(req, udpop::GLOBSEARCHRES, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_glob_search_res(rp->payload);
 }
@@ -46,9 +110,7 @@ asio::awaitable<tl::expected<FoundSources,std::error_code>>
 UdpServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::GLOBGETSOURCES2;
   req.payload = encode_get_sources_req(h, size);
-  auto sr = co_await sock_.send_to(server_, req);
-  if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(udpop::GLOBFOUNDSOURCES, timeout);
+  auto rp = co_await request_response(req, udpop::GLOBFOUNDSOURCES, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   auto v = decode_glob_found_sources(rp->payload);
   if(!v) co_return tl::unexpected(v.error());
@@ -59,9 +121,7 @@ asio::awaitable<tl::expected<ServerStat,std::error_code>>
 UdpServerConnection::server_status(std::uint32_t challenge, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::GLOBSERVSTATREQ;
   req.payload = encode_server_status_req(challenge);
-  auto sr = co_await sock_.send_to(server_, req);
-  if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(udpop::GLOBSERVSTATRES, timeout);
+  auto rp = co_await request_response(req, udpop::GLOBSERVSTATRES, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_server_stat(rp->payload, challenge);
 }
@@ -69,9 +129,7 @@ asio::awaitable<tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::err
 UdpServerConnection::server_list(IPv4 ask_ip, std::uint16_t ask_port, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::SERVER_LIST_REQ;
   req.payload = encode_server_list_req(ask_ip, ask_port);
-  auto sr = co_await sock_.send_to(server_, req);
-  if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(udpop::SERVER_LIST_RES, timeout);
+  auto rp = co_await request_response(req, udpop::SERVER_LIST_RES, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_server_list(rp->payload);
 }
@@ -79,9 +137,7 @@ asio::awaitable<tl::expected<ServerDesc,std::error_code>>
 UdpServerConnection::server_desc(std::uint32_t challenge, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::SERVER_DESC_REQ;
   req.payload = encode_server_desc_req(challenge);
-  auto sr = co_await sock_.send_to(server_, req);
-  if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(udpop::SERVER_DESC_RES, timeout);
+  auto rp = co_await request_response(req, udpop::SERVER_DESC_RES, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_server_desc(rp->payload, challenge);
 }

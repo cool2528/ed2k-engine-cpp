@@ -43,11 +43,17 @@ constexpr std::uint32_t misc_options1() {
          (multipacket << 1);
 }
 
-constexpr std::uint32_t misc_options2() {
+std::uint32_t misc_options2(const HelloInfo& h) {
   const std::uint32_t source_exchange2 = 1;
   const std::uint32_t ext_multipacket = 1;
   const std::uint32_t large_files = 1;
+  const std::uint32_t crypt_support = h.supports_obfuscation ? 1u : 0u;
+  const std::uint32_t crypt_request = h.requests_obfuscation ? 1u : 0u;
+  const std::uint32_t crypt_require = h.requires_obfuscation ? 1u : 0u;
   return (source_exchange2 << 10) |
+         (crypt_require << 9) |
+         (crypt_request << 8) |
+         (crypt_support << 7) |
          (ext_multipacket << 5) |
          (large_files << 4);
 }
@@ -62,7 +68,7 @@ std::vector<std::byte> encode_hello(const HelloInfo& h){
   tags.push_back(u32_tag(tag::CT_VERSION, h.version));
   tags.push_back(u32_tag(CT_EMULE_VERSION, emule_version_2_3_3()));
   tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS1, misc_options1()));
-  tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS2, misc_options2()));
+  tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS2, misc_options2(h)));
   tags.push_back(u32_tag(CT_EMULECOMPAT_OPTIONS, 0));
   w.u32(static_cast<std::uint32_t>(tags.size()));
   codec::write_taglist(w, tags);
@@ -167,6 +173,12 @@ tl::expected<HelloInfo,std::error_code> decode_hello_answer(std::span<const std:
   for(auto& t : *tags){
     if(t.name_id == tag::CT_NAME && std::holds_alternative<std::string>(t.value)) h.nickname = std::get<std::string>(t.value);
     else if(t.name_id == tag::CT_VERSION && std::holds_alternative<std::uint64_t>(t.value)) h.version = static_cast<std::uint32_t>(std::get<std::uint64_t>(t.value));
+    else if(t.name_id == CT_EMULE_MISCOPTIONS2 && std::holds_alternative<std::uint64_t>(t.value)){
+      const auto options = std::get<std::uint64_t>(t.value);
+      h.supports_obfuscation = ((options >> 7) & 0x01u) != 0;
+      h.requests_obfuscation = ((options >> 8) & 0x01u) != 0;
+      h.requires_obfuscation = ((options >> 9) & 0x01u) != 0;
+    }
   }
   if(r.remaining() >= 6){ h.server_ip = IPv4::from_host(r.u32_be()); h.server_port = r.u16(); }
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));

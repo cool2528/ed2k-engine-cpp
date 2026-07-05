@@ -35,7 +35,17 @@ std::vector<ServerTarget> build_targets(std::span<const std::byte> met_bytes,
   };
   if(override) push(*override);
   if(auto sl = parse_server_met(met_bytes)){
-    for(const auto& s : sl->servers) push({s.ip, s.port});
+    for(const auto& s : sl->servers) {
+      ServerTarget t;
+      t.ip = s.ip;
+      t.port = s.port;
+      t.udp_flags = s.udp_flags;
+      t.udp_key = s.udp_key;
+      t.udp_key_ip = s.udp_key_ip;
+      t.tcp_obf_port = s.tcp_obf_port;
+      t.udp_obf_port = s.udp_obf_port;
+      push(t);
+    }
   }
   for(const auto& t : fallback_servers()) push(t);
   return out;

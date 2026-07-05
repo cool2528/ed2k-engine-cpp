@@ -88,6 +88,36 @@ TEST(C2CMessages, EncodeHelloAdvertisesEmuleSourceExchange2){
   EXPECT_EQ((*misc2 >> 5) & 0x01u, 1u);   // Extended multipacket.
   EXPECT_EQ((*misc2 >> 4) & 0x01u, 1u);   // Large files.
 }
+TEST(C2CMessages, EncodeHelloAdvertisesObfuscationBitsWhenEnabled){
+  HelloInfo h;
+  h.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  h.client_id=0x01020304u;
+  h.port=0x1234u;
+  h.nickname="u";
+  h.supports_obfuscation = true;
+  h.requests_obfuscation = true;
+  h.requires_obfuscation = true;
+
+  auto out=encode_hello(h);
+  ed2k::codec::ByteReader r(out);
+  (void)r.hash16();
+  (void)r.u32();
+  (void)r.u16();
+  const auto tag_count = r.u32();
+  auto tags = ed2k::codec::read_taglist(r, tag_count);
+  ASSERT_TRUE(tags.has_value());
+
+  std::optional<std::uint64_t> misc2;
+  for(const auto& tag : *tags) {
+    if(tag.name_id == 0xFE && std::holds_alternative<std::uint64_t>(tag.value)) {
+      misc2 = std::get<std::uint64_t>(tag.value);
+    }
+  }
+  ASSERT_TRUE(misc2.has_value());
+  EXPECT_EQ((*misc2 >> 7) & 0x01u, 1u);
+  EXPECT_EQ((*misc2 >> 8) & 0x01u, 1u);
+  EXPECT_EQ((*misc2 >> 9) & 0x01u, 1u);
+}
 TEST(C2CMessages, EncodeHelloPacket){
   // OP_HELLO payload = [0x10 hashsize] + encode_hello body(aMule SendHelloPacket: WriteUInt8(16) 后 SendHelloTypePacket)。
   HelloInfo h;
@@ -326,6 +356,24 @@ TEST(C2CMessages, DecodeHelloAnswer){
   EXPECT_TRUE(out->server_ip.has_value());
   EXPECT_EQ(out->server_ip->host(), 0x7F000001u);
   EXPECT_EQ(out->server_port, 0x4662u);
+}
+TEST(C2CMessages, DecodeHelloAnswerReadsObfuscationBits){
+  ByteWriter w;
+  w.hash16(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
+  w.u32(0x01020304u);
+  w.u16(0x1234u);
+  w.u32(1);
+  w.u8(0x83);
+  w.u8(0xFE);
+  w.u32((1u << 7) | (1u << 8) | (1u << 9));
+  w.u32(0);
+  w.u16(0);
+
+  auto out=decode_hello_answer(w.take());
+  ASSERT_TRUE(out.has_value());
+  EXPECT_TRUE(out->supports_obfuscation);
+  EXPECT_TRUE(out->requests_obfuscation);
+  EXPECT_TRUE(out->requires_obfuscation);
 }
 TEST(C2CMessages, DecodeHello){
   // OP_HELLO 帧 = [0x10] + body(hash+id+port+tagcount+tags+server_ip+server_port)。

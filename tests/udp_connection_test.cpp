@@ -1,13 +1,19 @@
 #include <gtest/gtest.h>
+#include <array>
 #include <chrono>
 #include <exception>
+#include <span>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include "ed2k/server/udp_connection.hpp"
 #include "ed2k/net/runtime.hpp"
+#include "ed2k/net/udp_framing.hpp"
+#include "ed2k/net/udp_obfuscation.hpp"
 #include "ed2k/server/udp_messages.hpp"
 #include "ed2k/server/search_query.hpp"
 #include "ed2k/codec/byte_io.hpp"
@@ -122,6 +128,98 @@ TEST(UdpConnection, ServerStatusChallengeOk){
     auto r = co_await c.server_status(0xCAFEBABEu, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     EXPECT_EQ(r->users, 100u);
+    c.close(); co_return;
+  });
+}
+TEST(UdpConnection, ServerStatusUsesObfuscatedUdpPortAndDecodesResponse){
+  IoRuntime rt;
+  udp::socket obfuscated_server(rt.context(), udp::endpoint(asio::ip::address_v4::loopback(), 0));
+  const auto obfuscated_port = obfuscated_server.local_endpoint().port();
+  const auto udp_key = 0x11223344u;
+  bool saw_encrypted_request = false;
+
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    std::array<std::byte, 1024> buffer{};
+    udp::endpoint sender;
+    auto [ec, n] = co_await obfuscated_server.async_receive_from(
+        asio::buffer(buffer), sender, asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec);
+    std::span<const std::byte> received{buffer.data(), n};
+    EXPECT_NE(received[0], std::byte{proto::eDonkey});
+
+    auto decoded = decode_server_udp_obfuscated_datagram(
+        received,
+        ServerUdpObfuscationDecodeOptions{
+            .base_key = udp_key,
+            .direction = ServerUdpObfuscationDirection::client_to_server,
+        });
+    EXPECT_TRUE(decoded.has_value());
+    if(!decoded) co_return;
+    saw_encrypted_request = decoded->encrypted;
+    auto request = parse_udp_datagram(decoded->datagram);
+    EXPECT_TRUE(request.has_value());
+    if(!request) co_return;
+    EXPECT_EQ(request->opcode, udpop::GLOBSERVSTATREQ);
+    EXPECT_EQ(request->payload, encode_server_status_req(0xCAFEBABEu));
+
+    codec::ByteWriter w; w.u32(0xCAFEBABEu); w.u32(100); w.u32(5000);
+    Packet response{proto::eDonkey, udpop::GLOBSERVSTATRES, w.take()};
+    auto encrypted = encode_server_udp_obfuscated_datagram(
+        encode_udp_packet(response),
+        ServerUdpObfuscationOptions{
+            .base_key = udp_key,
+            .direction = ServerUdpObfuscationDirection::server_to_client,
+            .random_key_part = 0x2211,
+            .marker = 0x24,
+        });
+    EXPECT_TRUE(encrypted.has_value());
+    if(!encrypted) co_return;
+    co_await obfuscated_server.async_send_to(asio::buffer(*encrypted), sender,
+                                             asio::as_tuple(asio::use_awaitable));
+    co_return;
+  }, asio::detached);
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), 9,
+                          UdpServerObfuscation{
+                              .udp_key = udp_key,
+                              .udp_port = obfuscated_port,
+                              .random_key_part = 0xbeef,
+                              .marker = 0x42,
+                          });
+    auto r = co_await c.server_status(0xCAFEBABEu, 2s);
+    EXPECT_TRUE(r.has_value());
+    if(!r) co_return;
+    EXPECT_EQ(r->users, 100u);
+    EXPECT_TRUE(saw_encrypted_request);
+    c.close(); co_return;
+  });
+}
+
+TEST(UdpConnection, ServerStatusFallsBackToPlainUdpWhenObfuscatedProbeTimesOut){
+  IoRuntime rt;
+  udp::socket drop_obfuscated(rt.context(), udp::endpoint(asio::ip::address_v4::loopback(), 0));
+  ed2k::test::MockUdpServer plain_server(rt.context());
+  plain_server.serve([](udp::socket& s, const Packet&, const udp::endpoint& from) -> asio::awaitable<void>{
+    codec::ByteWriter w; w.u32(0xCAFEBABEu); w.u32(42); w.u32(5000);
+    co_await ed2k::test::send_packet_to(s, from, udpop::GLOBSERVSTATRES, w.take());
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), plain_server.port(),
+                          UdpServerObfuscation{
+                              .udp_key = 0x11223344u,
+                              .udp_port = drop_obfuscated.local_endpoint().port(),
+                              .probe_timeout = 50ms,
+                              .fallback_plain = true,
+                              .random_key_part = 0xbeef,
+                              .marker = 0x42,
+                          });
+    auto r = co_await c.server_status(0xCAFEBABEu, 2s);
+    EXPECT_TRUE(r.has_value());
+    if(!r) co_return;
+    EXPECT_EQ(r->users, 42u);
     c.close(); co_return;
   });
 }

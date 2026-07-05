@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <fstream>
@@ -60,6 +61,63 @@ TEST(ServerMet, PreservesUnknownTags){
   EXPECT_EQ(g1.name_str, named.name_str);
   ASSERT_TRUE(std::holds_alternative<std::string>(g1.value));
   EXPECT_EQ(std::get<std::string>(g1.value), std::string("hello"));
+}
+
+TEST(ServerMet, ParsesObfuscationTags){
+  codec::ByteWriter w;
+  w.u8(0xE0);
+  w.u32(1);
+  w.u32_be((*IPv4::from_dotted("10.20.30.40")).host());
+  w.u16(4661);
+  w.u32(5);
+  w.u8(codec::tagtype::Uint32 | codec::tagtype::NameFlag); w.u8(stag::UdpFlags); w.u32(0x00000620u);
+  w.u8(codec::tagtype::Uint32 | codec::tagtype::NameFlag); w.u8(stag::UdpKey); w.u32(0x11223344u);
+  w.u8(codec::tagtype::Uint32 | codec::tagtype::NameFlag); w.u8(stag::UdpKeyIp); w.u32(0x0A141E28u);
+  w.u8(codec::tagtype::Uint16 | codec::tagtype::NameFlag); w.u8(stag::TcpPortObfuscation); w.u16(4665);
+  w.u8(codec::tagtype::Uint16 | codec::tagtype::NameFlag); w.u8(stag::UdpPortObfuscation); w.u16(4675);
+
+  auto out = parse_server_met(w.take());
+  ASSERT_TRUE(out.has_value());
+  ASSERT_EQ(out->servers.size(), 1u);
+  const auto& server = out->servers[0];
+  EXPECT_EQ(server.udp_flags, 0x00000620u);
+  EXPECT_EQ(server.udp_key, 0x11223344u);
+  EXPECT_EQ(server.udp_key_ip, 0x0A141E28u);
+  EXPECT_EQ(server.tcp_obf_port, 4665u);
+  EXPECT_EQ(server.udp_obf_port, 4675u);
+  EXPECT_TRUE(server.extra.empty());
+}
+
+TEST(ServerMet, WritesObfuscationTagsAsAmuleWidths){
+  ServerList in;
+  ServerEntry server;
+  server.ip = *IPv4::from_dotted("10.20.30.40");
+  server.port = 4661;
+  server.udp_flags = 0x00000620u;
+  server.udp_key = 0x11223344u;
+  server.udp_key_ip = 0x0A141E28u;
+  server.tcp_obf_port = 4665;
+  server.udp_obf_port = 4675;
+  in.servers = {server};
+
+  auto bytes = write_server_met(in);
+  auto out = parse_server_met(bytes);
+  ASSERT_TRUE(out.has_value());
+  ASSERT_EQ(out->servers.size(), 1u);
+  EXPECT_EQ(out->servers[0], server);
+
+  const std::vector<std::byte> tcp_port_tag{
+      std::byte{codec::tagtype::Uint16 | codec::tagtype::NameFlag},
+      std::byte{stag::TcpPortObfuscation},
+      std::byte{0x39}, std::byte{0x12},
+  };
+  const std::vector<std::byte> udp_port_tag{
+      std::byte{codec::tagtype::Uint16 | codec::tagtype::NameFlag},
+      std::byte{stag::UdpPortObfuscation},
+      std::byte{0x43}, std::byte{0x12},
+  };
+  EXPECT_NE(std::search(bytes.begin(), bytes.end(), tcp_port_tag.begin(), tcp_port_tag.end()), bytes.end());
+  EXPECT_NE(std::search(bytes.begin(), bytes.end(), udp_port_tag.begin(), udp_port_tag.end()), bytes.end());
 }
 
 // Graceful degradation: an unsupported tag TYPE must produce a clean error,

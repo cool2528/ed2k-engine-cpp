@@ -22,6 +22,9 @@ struct HelloInfo {
   std::uint32_t version = 0x3C;
   std::optional<IPv4> server_ip;
   std::optional<std::uint16_t> server_port;
+  bool supports_obfuscation = false;
+  bool requests_obfuscation = false;
+  bool requires_obfuscation = false;
 };
 
 // C→C 编码：返回 payload（opcode 由调用方设入 net::Packet）
