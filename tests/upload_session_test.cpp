@@ -731,6 +731,49 @@ TEST(UploadSession, AnswersMultipacketRequestSources2WithKnownSources){
   });
 }
 
+TEST(UploadSession, AnswersPreviewRequestWithFirstFrame){
+  net::IoRuntime rt;
+  auto path = temp_file("ed2k_upload_preview.bin");
+  auto data = sample_data(300 * 1024);
+  write_file(path, data);
+
+  KnownFileDB db;
+  KnownFile f = known_file_for(path, data);
+  db.add(f);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+
+    co_await send_pkt(s, op::REQUESTPREVIEW, encode_preview_request(f.hash), ed2k::net::proto::eMule);
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.protocol, ed2k::net::proto::eMule);
+    EXPECT_EQ(ans.opcode, op::PREVIEWANSWER);
+    auto preview = decode_preview_answer(ans.payload);
+    EXPECT_TRUE(preview.has_value()) << (preview ? "" : preview.error().message());
+    if(!preview) co_return;
+    EXPECT_EQ(preview->hash, f.hash);
+    EXPECT_EQ(preview->frames.size(), 1u);
+    if(preview->frames.size() != 1u) co_return;
+    EXPECT_EQ(preview->frames[0].size(), 256u * 1024u);
+    EXPECT_EQ(preview->frames[0][0], data[0]);
+    boost::system::error_code ignored; s.close(ignored);
+    co_return;
+  });
+  std::filesystem::remove(path);
+}
+
 TEST(UploadSession, StoresFileDescForCurrentRequestedFile){
   ed2k::net::IoRuntime rt;
   KnownFileDB db;

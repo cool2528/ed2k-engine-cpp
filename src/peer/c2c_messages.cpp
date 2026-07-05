@@ -385,6 +385,51 @@ tl::expected<FileDesc, std::error_code> decode_file_desc(std::span<const std::by
   return out;
 }
 
+std::vector<std::byte> encode_preview_request(const FileHash& h){
+  ByteWriter w;
+  w.hash16(h);
+  return w.take();
+}
+
+std::vector<std::byte> encode_preview_answer(const FileHash& h, std::span<const std::span<const std::byte>> frames){
+  ByteWriter w;
+  w.hash16(h);
+  w.u8(static_cast<std::uint8_t>(frames.size()));
+  for(auto frame : frames) {
+    w.u32(static_cast<std::uint32_t>(frame.size()));
+    w.blob(frame);
+  }
+  return w.take();
+}
+
+tl::expected<PreviewAnswer, std::error_code> decode_preview_answer(std::span<const std::byte> data){
+  ByteReader r(data);
+  PreviewAnswer out;
+  out.hash = r.hash16();
+  const auto count = r.u8();
+  out.frames.reserve(count);
+  for(std::uint8_t i = 0; i < count && r.ok(); ++i) {
+    const auto size = r.u32();
+    auto frame = r.blob(size);
+    out.frames.emplace_back(frame.begin(), frame.end());
+  }
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return out;
+}
+
+std::vector<std::byte> encode_chat_message(std::string_view text){
+  ByteWriter w;
+  w.string16(text);
+  return w.take();
+}
+
+tl::expected<std::string, std::error_code> decode_chat_message(std::span<const std::byte> data){
+  ByteReader r(data);
+  auto text = r.string16();
+  if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  return text;
+}
+
 std::vector<std::byte> encode_aich_file_hash_req(const FileHash& h){
   ByteWriter w;
   w.hash16(h);

@@ -69,6 +69,7 @@ struct PeerSource {
 };
 struct SourceExchangeAnswer { std::uint8_t version=0; FileHash hash; std::vector<PeerSource> sources; };
 struct FileDesc { std::uint8_t rating=0; std::string comment; };
+struct PreviewAnswer { FileHash hash; std::vector<std::vector<std::byte>> frames; };
 
 tl::expected<HelloInfo,std::error_code>          decode_hello(std::span<const std::byte>);        // OP_HELLO(校验并跳过 0x10 前导)
 tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>); // OP_HELLOANSWER(无前导)
@@ -88,6 +89,11 @@ std::vector<std::byte> encode_answer_sources2(const FileHash&, std::span<const P
 tl::expected<SourceExchangeAnswer, std::error_code> decode_answer_sources2(std::span<const std::byte>);
 std::vector<std::byte> encode_file_desc(std::uint8_t rating, std::string_view comment);
 tl::expected<FileDesc, std::error_code> decode_file_desc(std::span<const std::byte>);
+std::vector<std::byte> encode_preview_request(const FileHash&);
+std::vector<std::byte> encode_preview_answer(const FileHash&, std::span<const std::span<const std::byte>> frames);
+tl::expected<PreviewAnswer, std::error_code> decode_preview_answer(std::span<const std::byte>);
+std::vector<std::byte> encode_chat_message(std::string_view text);
+tl::expected<std::string, std::error_code> decode_chat_message(std::span<const std::byte>);
 
 // AICH (aMule SHAHashSet) — 两级 Merkle 树恢复数据。详见 aich_checker.hpp / 设计 spec §5。
 // 四个 opcode 均在 OP_EMULEPROT(0xC5) 下，非 eDonkey(0xE3)。

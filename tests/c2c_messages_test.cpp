@@ -258,6 +258,28 @@ TEST(C2CMessages, EncodeAndDecodeFileDesc){
   EXPECT_EQ(decoded->rating, 5u);
   EXPECT_EQ(decoded->comment, "verified");
 }
+TEST(C2CMessages, PreviewRequestAndAnswerRoundTrip){
+  const auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto req=encode_preview_request(h);
+  auto decoded_req=decode_file_hash_request(req);
+  ASSERT_TRUE(decoded_req.has_value());
+  EXPECT_EQ(*decoded_req, h);
+
+  auto frame=bytes({1,2,3});
+  auto answer=encode_preview_answer(h, std::array<std::span<const std::byte>, 1>{std::span<const std::byte>(frame)});
+  auto decoded=decode_preview_answer(answer);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->hash, h);
+  ASSERT_EQ(decoded->frames.size(), 1u);
+  EXPECT_EQ(decoded->frames[0], frame);
+}
+TEST(C2CMessages, ChatMessageUsesAmuleString16Payload){
+  auto payload=encode_chat_message("hello");
+  EXPECT_EQ(payload, bytes({5,0,'h','e','l','l','o'}));
+  auto decoded=decode_chat_message(payload);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(*decoded, "hello");
+}
 TEST(C2CMessages, EncodeRequestParts){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   auto out=encode_request_parts(h, {100,200,300}, {150,250,350});

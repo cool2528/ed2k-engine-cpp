@@ -11,6 +11,7 @@
 #include <tl/expected.hpp>
 #include "ed2k/core/hash.hpp"     // IPv4
 #include "ed2k/infra/ip_filter.hpp"
+#include "ed2k/infra/proxy.hpp"
 #include "ed2k/net/packet.hpp"
 namespace ed2k::net {
 class Connection {
@@ -27,6 +28,11 @@ class Connection {
 
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<void,std::error_code>>
+    connect_via_proxy(const infra::ProxyConfig& proxy,
+                      IPv4 target_ip,
+                      std::uint16_t target_port,
+                      std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     send(const Packet& p);
   boost::asio::awaitable<tl::expected<Packet,std::error_code>>

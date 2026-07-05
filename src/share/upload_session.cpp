@@ -14,6 +14,7 @@ namespace ed2k::share {
 namespace asio = boost::asio;
 namespace {
 constexpr std::uint64_t sending_part_chunk_size = 10240;
+constexpr std::uint64_t preview_frame_size = 256ull * 1024ull;
 using Digest = std::array<std::byte, 20>;
 
 Digest sha1_cat(const Digest& l, const Digest& r) {
@@ -260,6 +261,21 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     if(!decoded) co_return tl::unexpected(decoded.error());
     if(current_file_) files_.set_file_desc(*current_file_, decoded->rating, std::move(decoded->comment));
     co_return tl::expected<void, std::error_code>{};
+  }
+
+  if(pkt.opcode == ed2k::peer::op::REQUESTPREVIEW) {
+    auto decoded = ed2k::peer::decode_file_hash_request(pkt.payload);
+    if(!decoded) co_return tl::unexpected(decoded.error());
+    const KnownFile* file = files_.find(*decoded);
+    if(!file) co_return co_await send_not_found(*decoded);
+    auto data = co_await read_range(*file, 0, std::min<std::uint64_t>(file->size, preview_frame_size));
+    if(!data) co_return tl::unexpected(data.error());
+    const std::array<std::span<const std::byte>, 1> frames{std::span<const std::byte>(*data)};
+    ed2k::net::Packet ans;
+    ans.protocol = ed2k::net::proto::eMule;
+    ans.opcode = ed2k::peer::op::PREVIEWANSWER;
+    ans.payload = ed2k::peer::encode_preview_answer(*decoded, frames);
+    co_return co_await conn_.send(ans);
   }
 
   if(pkt.opcode == ed2k::peer::op::STARTUPLOADREQ) {
