@@ -216,6 +216,15 @@ TEST(PartFile, ResumeFromPartMetTrustedOverCorruptData){
     EXPECT_TRUE(pf.is_block_done(0,0));
     EXPECT_FALSE(pf.complete());
   }
+  {
+    auto met = path; met += ".part.met";
+    std::ifstream m(met, std::ios::binary);
+    ASSERT_TRUE(m.is_open());
+    char first = 0;
+    m.read(&first, 1);
+    ASSERT_EQ(m.gcount(), 1);
+    EXPECT_EQ(static_cast<unsigned char>(first), 0xE0u) << "PartFile should save aMule .part.met format";
+  }
   { std::fstream z(path, std::ios::binary | std::ios::in | std::ios::out);  // 破坏 part0 数据 (大小不变 → 防截断不触发)
     std::vector<char> zero(static_cast<std::size_t>(PART), 0); z.seekp(0); z.write(zero.data(), static_cast<std::streamsize>(PART)); }
   { PartFile pf(path, PART*2, fh, {h0,h1});                      // 重开: met 标 part0 done → 受信 (rehash 读零→md4≠h0→取消)

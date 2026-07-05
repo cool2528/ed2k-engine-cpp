@@ -38,6 +38,7 @@ bool PartFile::try_load_met(){
   auto r = ed2k::parse_part_met(buf);
   if(!r) return false;
   if(!(r->hash == file_hash_) || r->part_hashes != part_hashes_) return false;   // 陈旧 met (异文件)
+  if(r->size != 0 && r->size != size_) return false;
   std::uint64_t data_sz = std::filesystem::exists(path_) ? std::filesystem::file_size(path_) : 0;
   for(std::size_t i=0;i<part_done_.size();++i){   // 仅数据 part (空尾 part 不在 part_done_)
     std::uint64_t pstart = static_cast<std::uint64_t>(i)*PART_SIZE;
@@ -81,6 +82,7 @@ void PartFile::save_met() const {
   ed2k::PartFileState st;
   st.hash = file_hash_;
   st.part_hashes = part_hashes_;
+  st.size = size_;
   st.gaps = gaps();
   auto bytes = ed2k::write_part_met(st);
   std::ofstream m(met_path_, std::ios::binary | std::ios::trunc);

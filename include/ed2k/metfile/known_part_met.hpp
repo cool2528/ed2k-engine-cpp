@@ -17,6 +17,7 @@ tl::expected<std::vector<KnownFileEntry>,std::error_code> parse_known_met(std::s
 std::vector<std::byte> write_known_met(std::span<const KnownFileEntry>);
 struct PartFileState {
   FileHash hash; std::vector<PartHash> part_hashes;
+  std::uint64_t size=0;
   std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps;
   std::vector<codec::Tag> tags;
   auto operator<=>(const PartFileState&) const = default;
