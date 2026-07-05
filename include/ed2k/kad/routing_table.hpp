@@ -50,6 +50,7 @@ class RoutingZone {
 
   bool add_or_update(Contact contact);
   bool remove(const KadID& id);
+  const Contact* find(const KadID& id) const noexcept;
   std::size_t size() const noexcept;
   std::size_t leaf_count() const noexcept;
   std::vector<Contact> all_contacts() const;
@@ -66,6 +67,7 @@ class RoutingTable {
 
   bool add_or_update(Contact contact);
   bool remove(const KadID& id);
+  const Contact* find(const KadID& id) const noexcept;
   std::size_t size() const noexcept;
   std::size_t leaf_count() const noexcept;
   std::vector<Contact> all_contacts() const;

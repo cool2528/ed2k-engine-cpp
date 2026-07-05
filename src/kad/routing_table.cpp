@@ -151,6 +151,13 @@ bool remove_from_node(RoutingZone::Node& node, const KadID& id) {
   }
   return removed;
 }
+
+const Contact* find_in_node(const RoutingZone::Node& node, const KadID& id) noexcept {
+  if (node.leaf()) {
+    return node.bucket.find(id);
+  }
+  return find_in_node(*node.children[id.bit(node.depth)], id);
+}
 } // namespace
 
 RoutingZone::RoutingZone(KadID self_id)
@@ -169,6 +176,10 @@ bool RoutingZone::add_or_update(Contact contact) {
 
 bool RoutingZone::remove(const KadID& id) {
   return remove_from_node(*root_, id);
+}
+
+const Contact* RoutingZone::find(const KadID& id) const noexcept {
+  return find_in_node(*root_, id);
 }
 
 std::size_t RoutingZone::size() const noexcept {
@@ -194,6 +205,10 @@ bool RoutingTable::add_or_update(Contact contact) {
 
 bool RoutingTable::remove(const KadID& id) {
   return zone_.remove(id);
+}
+
+const Contact* RoutingTable::find(const KadID& id) const noexcept {
+  return zone_.find(id);
 }
 
 std::size_t RoutingTable::size() const noexcept {
