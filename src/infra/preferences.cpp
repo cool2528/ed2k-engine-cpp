@@ -47,6 +47,13 @@ codec::Tag string_tag(std::string name, std::string value) {
   return tag;
 }
 
+codec::Tag blob_tag(std::string name, std::vector<std::byte> value) {
+  codec::Tag tag;
+  tag.name_str = std::move(name);
+  tag.value = std::move(value);
+  return tag;
+}
+
 std::string path_string(const std::filesystem::path& path) {
   return path.generic_string();
 }
@@ -96,6 +103,10 @@ bool as_bool(const codec::Tag& tag, bool fallback) {
   return as_u64(tag, fallback ? 1u : 0u) != 0;
 }
 
+const std::vector<std::byte>* as_blob(const codec::Tag& tag) {
+  return std::get_if<std::vector<std::byte>>(&tag.value);
+}
+
 void apply_tag(Preferences& prefs, const codec::Tag& tag) {
   const auto& name = tag.name_str;
   if (name == "nickname") prefs.nickname = as_string(tag, prefs.nickname);
@@ -134,6 +145,13 @@ void apply_tag(Preferences& prefs, const codec::Tag& tag) {
   else if (name == "clients_met_path") prefs.clients_met_path = as_string(tag, path_string(prefs.clients_met_path));
   else if (name == "stat_dat_path") prefs.stat_dat_path = as_string(tag, path_string(prefs.stat_dat_path));
   else if (name == "shared_dirs") prefs.shared_dirs = split_paths(as_string(tag, {}));
+  else if (name == "categories") {
+    if (const auto* bytes = as_blob(tag)) {
+      if (auto categories = parse_categories(*bytes)) {
+        prefs.categories = std::move(*categories);
+      }
+    }
+  }
 }
 
 std::vector<codec::Tag> tags_for(const Preferences& prefs) {
@@ -174,6 +192,7 @@ std::vector<codec::Tag> tags_for(const Preferences& prefs) {
       string_tag("clients_met_path", path_string(prefs.clients_met_path)),
       string_tag("stat_dat_path", path_string(prefs.stat_dat_path)),
       string_tag("shared_dirs", join_paths(prefs.shared_dirs)),
+      blob_tag("categories", write_categories(prefs.categories)),
   };
 }
 } // namespace

@@ -44,6 +44,7 @@ class KnownFileDB {
  public:
   tl::expected<void, std::error_code> scan_dir(const std::filesystem::path& dir);
   void add(KnownFile file);
+  bool add_source(const FileHash& hash, ed2k::peer::PeerSource source);
   bool set_file_desc(const FileHash& hash, std::uint8_t rating, std::string comment);
   const KnownFile* find(const FileHash& hash) const;
   const std::vector<KnownFile>& files() const noexcept { return files_; }

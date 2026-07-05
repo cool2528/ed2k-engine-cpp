@@ -7,6 +7,8 @@
 
 #include <tl/expected.hpp>
 
+#include "ed2k/infra/category.hpp"
+
 namespace ed2k::infra {
 
 struct Preferences {
@@ -46,6 +48,7 @@ struct Preferences {
   std::filesystem::path clients_met_path = "clients.met";
   std::filesystem::path stat_dat_path = "statistics.dat";
   std::vector<std::filesystem::path> shared_dirs;
+  std::vector<Category> categories;
 
   static Preferences defaults();
   static tl::expected<Preferences, std::error_code> load(const std::filesystem::path& path);

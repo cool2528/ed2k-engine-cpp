@@ -3,8 +3,8 @@
 
 namespace ed2k::share {
 
-UploadQueue::UploadQueue(std::size_t max_slots, const ClientCredits* credits)
-  : max_slots_(max_slots), credits_(credits) {}
+UploadQueue::UploadQueue(std::size_t max_slots, const ClientCredits* credits, const infra::FriendList* friends)
+  : max_slots_(max_slots), credits_(credits), friends_(friends) {}
 
 UploadQueueDecision UploadQueue::enqueue(const UserHash& user_hash, const FileHash& file_hash) {
   if(has_slot(user_hash)) return {UploadQueueState::accepted, 0};
@@ -29,12 +29,13 @@ UploadQueueDecision UploadQueue::enqueue(const UserHash& user_hash, const FileHa
   }
 
   auto insert_at = queued_.end();
-  if(credits_) {
-    const auto new_score = credits_->score(user_hash);
-    insert_at = std::find_if(queued_.begin(), queued_.end(), [&](const Entry& existing) {
-      return new_score > credits_->score(existing.user_hash);
-    });
-  }
+  const bool new_friend = friends_ && friends_->is_friend_slot(user_hash);
+  const auto new_score = credits_ ? credits_->score(user_hash) : 0;
+  insert_at = std::find_if(queued_.begin(), queued_.end(), [&](const Entry& existing) {
+    const bool existing_friend = friends_ && friends_->is_friend_slot(existing.user_hash);
+    if(new_friend != existing_friend) return new_friend;
+    return credits_ && new_score > credits_->score(existing.user_hash);
+  });
   auto inserted_it = queued_.insert(insert_at, entry);
   return {UploadQueueState::queued,
           static_cast<std::uint16_t>(std::distance(queued_.begin(), inserted_it) + 1)};

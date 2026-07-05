@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "ed2k/infra/friend_list.hpp"
 #include "ed2k/share/upload_queue.hpp"
 
 using namespace ed2k;
@@ -73,4 +74,27 @@ TEST(UploadQueue, ReaskingFrontQueuedPeerGetsReleasedSlotWithoutBypass){
   EXPECT_EQ(front.rank, 0u);
   EXPECT_TRUE(q.has_slot(p2));
   EXPECT_EQ(q.rank(p3), 1u);
+}
+
+TEST(UploadQueue, FriendSlotTakesPriorityOverQueuedNonFriends){
+  infra::FriendList friends;
+  const auto file = file_hash("00112233445566778899aabbccddeeff");
+  const auto active = user_hash("11111111111111111111111111111111");
+  const auto regular = user_hash("22222222222222222222222222222222");
+  const auto friend_peer = user_hash("33333333333333333333333333333333");
+  friends.add({friend_peer, std::nullopt, "friend", true});
+
+  UploadQueue q(1, nullptr, &friends);
+  EXPECT_EQ(q.enqueue(active, file).state, UploadQueueState::accepted);
+  EXPECT_EQ(q.enqueue(regular, file).rank, 1u);
+
+  auto fd = q.enqueue(friend_peer, file);
+  EXPECT_EQ(fd.state, UploadQueueState::queued);
+  EXPECT_EQ(fd.rank, 1u);
+  EXPECT_EQ(q.rank(regular), 2u);
+
+  q.release(active);
+  auto grants = q.tick();
+  ASSERT_EQ(grants.size(), 1u);
+  EXPECT_EQ(grants[0].user_hash, friend_peer);
 }

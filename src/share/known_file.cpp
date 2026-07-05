@@ -153,6 +153,21 @@ void KnownFileDB::add(KnownFile file) {
   }
 }
 
+bool KnownFileDB::add_source(const FileHash& hash, ed2k::peer::PeerSource source) {
+  auto it = by_hash_.find(hash);
+  if(it == by_hash_.end()) return false;
+  auto& sources = files_[it->second].sources;
+  auto existing = std::find_if(sources.begin(), sources.end(), [&](const ed2k::peer::PeerSource& current) {
+    return current.user_hash == source.user_hash;
+  });
+  if(existing == sources.end()) {
+    sources.push_back(std::move(source));
+  } else {
+    *existing = std::move(source);
+  }
+  return true;
+}
+
 bool KnownFileDB::set_file_desc(const FileHash& hash, std::uint8_t rating, std::string comment) {
   auto it = by_hash_.find(hash);
   if(it == by_hash_.end()) return false;
