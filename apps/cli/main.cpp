@@ -17,6 +17,8 @@
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/app/server_session.hpp"
 #include "ed2k/infra/ip_filter.hpp"
+#include "ed2k/infra/preferences.hpp"
+#include "ed2k/infra/statistics.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
@@ -43,6 +45,8 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]\n"
   "       ed2k-tool comment <ed2k-link> --rating:n --comment:text [--peer:ip:port]\n"
   "       ed2k-tool ipfilter <ipfilter.dat> [--block-check:ip] [--level:n]\n"
+  "       ed2k-tool config <preferences.dat> [--set:key=value]\n"
+  "       ed2k-tool stats <statistics.dat>\n"
   "       ed2k-tool kad-bootstrap <nodes.dat>\n"
   "       ed2k-tool kad-search <nodes.dat> <keyword>\n"
   "       ed2k-tool kad-find-sources <nodes.dat> <ed2k-link>\n"
@@ -133,6 +137,38 @@ static ed2k::kad::KadSearchEntry kad_source_entry(const ed2k::share::KnownFile& 
     },
   };
 }
+static bool parse_bool_arg(std::string_view value){
+  return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+static bool apply_preference_set(ed2k::infra::Preferences& prefs, std::string_view assignment){
+  auto eq = assignment.find('=');
+  if(eq == std::string_view::npos) return false;
+  auto key = assignment.substr(0, eq);
+  auto value = assignment.substr(eq + 1);
+  auto number = [&] { return static_cast<std::uint32_t>(std::stoul(std::string(value))); };
+  if(key == "nickname") prefs.nickname = std::string(value);
+  else if(key == "tcp_port") prefs.tcp_port = static_cast<std::uint16_t>(number());
+  else if(key == "udp_port") prefs.udp_port = static_cast<std::uint16_t>(number());
+  else if(key == "server_udp_port") prefs.server_udp_port = static_cast<std::uint16_t>(number());
+  else if(key == "upload_limit_bps") prefs.upload_limit_bps = number();
+  else if(key == "download_limit_bps") prefs.download_limit_bps = number();
+  else if(key == "upload_slots") prefs.upload_slots = number();
+  else if(key == "max_connections") prefs.max_connections = number();
+  else if(key == "max_sources_per_file") prefs.max_sources_per_file = number();
+  else if(key == "ip_filter_level") prefs.ip_filter_level = static_cast<std::uint8_t>(number());
+  else if(key == "incoming_dir") prefs.incoming_dir = std::string(value);
+  else if(key == "temp_dir") prefs.temp_dir = std::string(value);
+  else if(key == "server_met_path") prefs.server_met_path = std::string(value);
+  else if(key == "nodes_dat_path") prefs.nodes_dat_path = std::string(value);
+  else if(key == "ipfilter_dat_path") prefs.ipfilter_dat_path = std::string(value);
+  else if(key == "enable_kad") prefs.enable_kad = parse_bool_arg(value);
+  else if(key == "enable_ip_filter") prefs.enable_ip_filter = parse_bool_arg(value);
+  else if(key == "enable_obfuscation") prefs.enable_obfuscation = parse_bool_arg(value);
+  else if(key == "request_obfuscation") prefs.request_obfuscation = parse_bool_arg(value);
+  else if(key == "require_obfuscation") prefs.require_obfuscation = parse_bool_arg(value);
+  else return false;
+  return true;
+}
 static tl::expected<std::vector<ed2k::kad::Contact>, std::error_code>
 load_kad_nodes(const char* path){
   return ed2k::kad::parse_nodes_dat(read_all(path));
@@ -210,6 +246,50 @@ int main(int argc,char** argv){
     } else {
       std::printf("ipfilter ranges: %zu\n", filter->ranges().size());
     }
+    return 0;
+  }
+  if(cmd=="config"){
+    if(argc<3) return usage();
+    const std::filesystem::path path = argv[2];
+    ed2k::infra::Preferences prefs = ed2k::infra::Preferences::defaults();
+    if(std::filesystem::exists(path)){
+      auto loaded = ed2k::infra::Preferences::load(path);
+      if(!loaded){ std::printf("error: %s\n", loaded.error().message().c_str()); return 1; }
+      prefs = std::move(*loaded);
+    }
+    bool changed = false;
+    for(int i=3;i<argc;++i){
+      std::string a=argv[i];
+      if(a.rfind("--set:",0)==0){
+        if(!apply_preference_set(prefs, a.substr(6))){
+          std::printf("error: invalid preference assignment\n");
+          return 1;
+        }
+        changed = true;
+      }
+    }
+    if(changed){
+      auto saved = prefs.save(path);
+      if(!saved){ std::printf("error: %s\n", saved.error().message().c_str()); return 1; }
+    }
+    std::printf("nickname=%s tcp=%u udp=%u kad=%d ipfilter_level=%u\n",
+                prefs.nickname.c_str(), prefs.tcp_port, prefs.udp_port,
+                prefs.enable_kad ? 1 : 0, prefs.ip_filter_level);
+    return 0;
+  }
+  if(cmd=="stats"){
+    if(argc<3) return usage();
+    auto stats = ed2k::infra::Statistics::load(argv[2]);
+    if(!stats){ std::printf("error: %s\n", stats.error().message().c_str()); return 1; }
+    const auto& s = stats->cumulative();
+    std::printf("uploaded=%llu downloaded=%llu server_connections=%llu failed_connections=%llu kad_packets=%llu sources=%llu files=%llu\n",
+                static_cast<unsigned long long>(s.uploaded_bytes),
+                static_cast<unsigned long long>(s.downloaded_bytes),
+                static_cast<unsigned long long>(s.server_connections),
+                static_cast<unsigned long long>(s.failed_connections),
+                static_cast<unsigned long long>(s.kad_packets_sent),
+                static_cast<unsigned long long>(s.sources_seen),
+                static_cast<unsigned long long>(s.files_completed));
     return 0;
   }
   if(cmd=="login"){

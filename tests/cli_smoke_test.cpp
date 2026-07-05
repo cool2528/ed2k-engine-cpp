@@ -8,6 +8,8 @@
 #  include <sys/wait.h>
 #endif
 #include "ed2k/kad/nodes_dat.hpp"
+#include "ed2k/infra/preferences.hpp"
+#include "ed2k/infra/statistics.hpp"
 #include "ed2k/util/log.hpp"
 
 namespace {
@@ -100,6 +102,53 @@ TEST(CliIPFilter, BlockCheckAcceptsIpfilterDat) {
 #endif
   const auto command = shell_path(*tool) + " ipfilter " + shell_path(path) +
                        " --block-check:1.2.3.4 --level:127" + redirect;
+  EXPECT_EQ(shell_exit_code(std::system(command.c_str())), 0);
+  std::filesystem::remove(path);
+}
+
+TEST(CliConfig, SetWritesPreferencesFile) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_cli_preferences.dat";
+  std::filesystem::remove(path);
+
+#ifdef _WIN32
+  const std::string redirect = " > NUL";
+#else
+  const std::string redirect = " > /dev/null";
+#endif
+  const auto command = shell_path(*tool) + " config " + shell_path(path) +
+                       " --set:tcp_port=5555 --set:nickname=cli" + redirect;
+  EXPECT_EQ(shell_exit_code(std::system(command.c_str())), 0);
+
+  auto loaded = ed2k::infra::Preferences::load(path);
+  ASSERT_TRUE(loaded.has_value()) << loaded.error().message();
+  EXPECT_EQ(loaded->tcp_port, 5555);
+  EXPECT_EQ(loaded->nickname, "cli");
+  std::filesystem::remove(path);
+}
+
+TEST(CliStats, PrintsStatisticsFile) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_cli_statistics.dat";
+  ed2k::infra::Statistics stats;
+  stats.add_uploaded_bytes(123);
+  auto saved = stats.save(path);
+  ASSERT_TRUE(saved.has_value()) << saved.error().message();
+
+#ifdef _WIN32
+  const std::string redirect = " > NUL";
+#else
+  const std::string redirect = " > /dev/null";
+#endif
+  const auto command = shell_path(*tool) + " stats " + shell_path(path) + redirect;
   EXPECT_EQ(shell_exit_code(std::system(command.c_str())), 0);
   std::filesystem::remove(path);
 }
