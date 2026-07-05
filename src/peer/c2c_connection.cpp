@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iterator>
 namespace ed2k::peer {
 namespace asio = boost::asio;
 using clock_type = std::chrono::steady_clock;
@@ -15,15 +16,24 @@ namespace {
 // 故不能假定「一区间一帧」——必须按字节偏移拼接。返回每个完成区间一个 Block(整区间数据)。
 // 终止: 全部活跃区间覆盖完成 / OP_OUTOFPARTREQS(对端无更多块, 提前结束) / 超时 / FILEREQANSNOFIL。
 // 子帧按 [b.start,b.end) ⊆ [starts[i],ends[i]) 归属区间 i; 仅接受连续推进(next[i] 起始 = start)。
-template <class DecodePart>
+template <class DecodeSendingPart, class DecodeCompressedSegment>
 asio::awaitable<tl::expected<std::vector<Block>, std::error_code>>
 accumulate_blocks(net::Connection& conn, const FileHash& h,
                   std::array<std::uint64_t, 3> starts, std::array<std::uint64_t, 3> ends,
                   std::uint8_t op_sending, std::uint8_t op_compressed,
-                  DecodePart decode_part, std::chrono::milliseconds timeout) {
+                  DecodeSendingPart decode_sending_part,
+                  DecodeCompressedSegment decode_compressed_segment,
+                  std::chrono::milliseconds timeout) {
   std::array<std::vector<std::byte>, 3> buf;
   std::array<std::uint64_t, 3> next{};
   std::array<bool, 3> active{}, done{};
+  struct PendingCompressed {
+    FileHash hash;
+    std::uint64_t start = 0;
+    std::uint32_t compressed_size = 0;
+    std::vector<std::byte> data;
+  };
+  std::vector<PendingCompressed> pending_compressed;
   std::size_t active_cnt = 0;
   for (std::size_t i = 0; i < 3; ++i) {
     if (starts[i] < ends[i]) {                       // 真实请求区间
@@ -38,6 +48,25 @@ accumulate_blocks(net::Connection& conn, const FileHash& h,
     for (std::size_t i = 0; i < 3; ++i) if (!done[i]) return false;
     return true;
   };
+  auto consume_block = [&](Block&& b) {
+    if (b.hash != h) return;                                      // 非本文件帧: 丢弃
+    if (b.end < b.start) return;                                  // 非法区间: 丢弃(防御)
+    for (std::size_t i = 0; i < 3; ++i) {
+      if (!active[i] || done[i]) continue;
+      if (b.start < starts[i] || b.end > ends[i]) continue;       // 不属此区间: 试下一个
+      std::uint64_t cs = std::max<std::uint64_t>(b.start, next[i]);  // 本帧中尚未覆盖的起点
+      if (cs > next[i]) break;                                    // 间隙(非连续): 弃帧(aMule 顺序发送不应发生)
+      if (b.end <= cs) break;                                     // 已完全覆盖(重叠帧): 忽略
+      std::size_t off = static_cast<std::size_t>(cs - starts[i]);        // buf[i] 内偏移
+      std::size_t sub_off = static_cast<std::size_t>(cs - b.start);      // 子帧内偏移
+      std::size_t n = static_cast<std::size_t>(b.end - cs);
+      if (off + n > buf[i].size() || sub_off + n > b.data.size()) break; // 越界/不足: 弃帧(防御)
+      std::copy_n(b.data.begin() + sub_off, n, buf[i].begin() + off);
+      next[i] = b.end;
+      if (next[i] >= ends[i]) done[i] = true;
+      break;                                                      // 已归属区间 i: 不再试其他
+    }
+  };
   auto deadline = clock_type::now() + timeout;
   while (!all_done()) {
     auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
@@ -48,24 +77,44 @@ accumulate_blocks(net::Connection& conn, const FileHash& h,
     if (pkt.opcode == op::OUTOFPARTREQS) break;                 // 对端不再供块: 提前结束
     if (pkt.opcode == op::FILEREQANSNOFIL) co_return tl::unexpected(make_error_code(errc::file_not_found));
     if (pkt.opcode != op_sending && pkt.opcode != op_compressed) continue;  // 其他帧(QUEUERANKING 等)忽略
-    auto b = decode_part(pkt.opcode, pkt.payload);
-    if (!b) co_return tl::unexpected(b.error());
-    if (b->hash != h) continue;                                 // 非本文件帧: 丢弃
-    if (b->end < b->start) continue;                            // 非法区间: 丢弃(防御)
-    for (std::size_t i = 0; i < 3; ++i) {
-      if (!active[i] || done[i]) continue;
-      if (b->start < starts[i] || b->end > ends[i]) continue;   // 不属此区间: 试下一个
-      std::uint64_t cs = std::max<std::uint64_t>(b->start, next[i]);  // 本帧中尚未覆盖的起点
-      if (cs > next[i]) break;                                  // 间隙(非连续): 弃帧(aMule 顺序发送不应发生)
-      if (b->end <= cs) break;                                  // 已完全覆盖(重叠帧): 忽略
-      std::size_t off = static_cast<std::size_t>(cs - starts[i]);        // buf[i] 内偏移
-      std::size_t sub_off = static_cast<std::size_t>(cs - b->start);     // 子帧内偏移
-      std::size_t n = static_cast<std::size_t>(b->end - cs);
-      if (off + n > buf[i].size() || sub_off + n > b->data.size()) break;  // 越界/不足: 弃帧(防御)
-      std::copy_n(b->data.begin() + sub_off, n, buf[i].begin() + off);
-      next[i] = b->end;
-      if (next[i] >= ends[i]) done[i] = true;
-      break;                                                    // 已归属区间 i: 不再试其他
+    if (pkt.opcode == op_sending) {
+      auto b = decode_sending_part(pkt.payload);
+      if (!b) co_return tl::unexpected(b.error());
+      consume_block(std::move(*b));
+      continue;
+    }
+
+    auto seg = decode_compressed_segment(pkt.payload);
+    if (!seg) co_return tl::unexpected(seg.error());
+    if (seg->hash != h) continue;
+    if (seg->data.size() > seg->compressed_size)
+      co_return tl::unexpected(make_error_code(errc::decompress_failed));
+    auto it = std::find_if(pending_compressed.begin(), pending_compressed.end(),
+      [&](const PendingCompressed& p) {
+        return p.hash == seg->hash && p.start == seg->start && p.compressed_size == seg->compressed_size;
+      });
+    if (it == pending_compressed.end()) {
+      PendingCompressed pending;
+      pending.hash = seg->hash;
+      pending.start = seg->start;
+      pending.compressed_size = seg->compressed_size;
+      pending.data.reserve(seg->compressed_size);
+      pending_compressed.push_back(std::move(pending));
+      it = std::prev(pending_compressed.end());
+    }
+    if (it->data.size() + seg->data.size() > it->compressed_size)
+      co_return tl::unexpected(make_error_code(errc::decompress_failed));
+    it->data.insert(it->data.end(), seg->data.begin(), seg->data.end());
+    if (it->data.size() == it->compressed_size) {
+      CompressedPartSegment full;
+      full.hash = it->hash;
+      full.start = it->start;
+      full.compressed_size = it->compressed_size;
+      full.data = std::move(it->data);
+      pending_compressed.erase(it);
+      auto b = inflate_compressed_part_segment(full);
+      if (!b) co_return tl::unexpected(b.error());
+      consume_block(std::move(*b));
     }
   }
   std::vector<Block> blocks;
@@ -214,21 +263,21 @@ C2CConnection::request_blocks(const FileHash& h, std::array<std::uint32_t,3> sta
     std::array<std::uint64_t,3>{starts[0], starts[1], starts[2]},
     std::array<std::uint64_t,3>{ends[0], ends[1], ends[2]},
     op::SENDINGPART, op::COMPRESSEDPART,
-    [](std::uint8_t oc, std::span<const std::byte> p) -> tl::expected<Block,std::error_code> {
-      return oc == op::SENDINGPART ? decode_sending_part(p) : decode_compressed_part(p);
-    }, timeout);
+    [](std::span<const std::byte> p) { return decode_sending_part(p); },
+    [](std::span<const std::byte> p) { return decode_compressed_part_segment(p); },
+    timeout);
 }
 
 asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
 C2CConnection::request_blocks_i64(const FileHash& h, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends, std::chrono::milliseconds timeout){
-  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::REQUESTPARTS_I64; req.payload=encode_request_parts_i64(h, starts, ends);
+  ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::REQUESTPARTS_I64; req.payload=encode_request_parts_i64(h, starts, ends);
   auto sr = co_await conn_.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
   co_return co_await accumulate_blocks(conn_, h, starts, ends,
     op::SENDINGPART_I64, op::COMPRESSEDPART_I64,
-    [](std::uint8_t oc, std::span<const std::byte> p) -> tl::expected<Block,std::error_code> {
-      return oc == op::SENDINGPART_I64 ? decode_sending_part_i64(p) : decode_compressed_part_i64(p);
-    }, timeout);
+    [](std::span<const std::byte> p) { return decode_sending_part_i64(p); },
+    [](std::span<const std::byte> p) { return decode_compressed_part_i64_segment(p); },
+    timeout);
 }
 
 asio::awaitable<tl::expected<AICHHash,std::error_code>>

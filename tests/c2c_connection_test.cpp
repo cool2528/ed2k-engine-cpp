@@ -286,6 +286,48 @@ TEST(C2CConnection, RequestBlocksRoundTrip){
     c.close(); co_return;
   });
 }
+TEST(C2CConnection, RequestBlocksReassemblesSplitCompressedPart){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  std::vector<std::byte> plain(25000, std::byte{0x2A});
+  auto packed = encode_compressed_part(h, 0, plain);
+  auto segment = decode_compressed_part_segment(packed);
+  ASSERT_TRUE(segment.has_value());
+  ASSERT_GT(segment->data.size(), 2u);
+  const auto split = segment->data.size() / 2;
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                       // REQUESTPARTS
+    {
+      codec::ByteWriter w;
+      w.hash16(h);
+      w.u32(0);
+      w.u32(segment->compressed_size);
+      w.blob(std::span<const std::byte>(segment->data).first(split));
+      co_await send_pkt(s, op::COMPRESSEDPART, w.take(), proto::eMule);
+    }
+    {
+      codec::ByteWriter w;
+      w.hash16(h);
+      w.u32(0);
+      w.u32(segment->compressed_size);
+      w.blob(std::span<const std::byte>(segment->data).subspan(split));
+      co_await send_pkt(s, op::COMPRESSEDPART, w.take(), proto::eMule);
+    }
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto r = co_await c.request_blocks(h, {0,0,0}, {static_cast<std::uint32_t>(plain.size()),0,0}, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->size(), 1u); if(r->size()!=1u) co_return;
+    EXPECT_EQ((*r)[0].start, 0u);
+    EXPECT_EQ((*r)[0].end, plain.size());
+    EXPECT_EQ((*r)[0].data, plain);
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, FileNotFound){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{

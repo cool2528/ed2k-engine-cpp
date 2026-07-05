@@ -406,10 +406,67 @@ UploadSession::read_range(const KnownFile& file, std::uint64_t start, std::uint6
 
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::send_requested_parts(const KnownFile& file, const ed2k::peer::RequestParts& req) {
+  auto send_uncompressed = [&](std::uint64_t start, std::span<const std::byte> data)
+      -> asio::awaitable<tl::expected<void, std::error_code>> {
+    std::uint64_t cur = start;
+    std::span<const std::byte> remaining = data;
+    while(!remaining.empty()) {
+      const auto n = std::min<std::uint64_t>(sending_part_chunk_size, remaining.size());
+      auto chunk = remaining.first(static_cast<std::size_t>(n));
+      ed2k::net::Packet ans;
+      ans.protocol = ed2k::net::proto::eDonkey;
+      ans.opcode = ed2k::peer::op::SENDINGPART;
+      ans.payload = ed2k::peer::encode_sending_part(req.hash, cur, chunk);
+      if(throttler_) co_await throttler_->acquire(chunk.size());
+      auto sr = co_await conn_.send(ans);
+      if(!sr) co_return tl::unexpected(sr.error());
+      if(credits_ && peer_) credits_->add_uploaded(peer_->user_hash, chunk.size());
+      cur += n;
+      remaining = remaining.subspan(static_cast<std::size_t>(n));
+    }
+    co_return tl::expected<void, std::error_code>{};
+  };
+
   for(std::size_t i = 0; i < req.starts.size(); ++i) {
     std::uint64_t cur = req.starts[i];
     const std::uint64_t end = req.ends[i];
     if(cur >= end) continue;
+
+    if(peer_ && peer_->supports_compression) {
+      auto data = co_await read_range(file, cur, end);
+      if(!data) co_return tl::unexpected(data.error());
+      auto payload = ed2k::peer::encode_compressed_part(req.hash, cur, *data);
+      auto segment = ed2k::peer::decode_compressed_part_segment(payload);
+      if(!segment) co_return tl::unexpected(segment.error());
+      const auto packed_size = segment->compressed_size;
+      if(packed_size > 0 && packed_size < data->size()) {
+        std::span<const std::byte> packed(segment->data.data(), segment->data.size());
+        std::size_t offset = 0;
+        while(offset < packed.size()) {
+          const auto n = std::min<std::size_t>(static_cast<std::size_t>(sending_part_chunk_size), packed.size() - offset);
+          ed2k::codec::ByteWriter w;
+          w.hash16(req.hash);
+          w.u32(static_cast<std::uint32_t>(cur));
+          w.u32(packed_size);
+          w.blob(packed.subspan(offset, n));
+          ed2k::net::Packet ans;
+          ans.protocol = ed2k::net::proto::eMule;
+          ans.opcode = ed2k::peer::op::COMPRESSEDPART;
+          ans.payload = w.take();
+          if(throttler_) co_await throttler_->acquire(n);
+          auto sr = co_await conn_.send(ans);
+          if(!sr) co_return tl::unexpected(sr.error());
+          offset += n;
+        }
+        if(credits_ && peer_) credits_->add_uploaded(peer_->user_hash, data->size());
+        continue;
+      }
+
+      auto sr = co_await send_uncompressed(cur, *data);
+      if(!sr) co_return tl::unexpected(sr.error());
+      continue;
+    }
+
     while(cur < end) {
       const std::uint64_t chunk_end = std::min<std::uint64_t>(cur + sending_part_chunk_size, end);
       auto data = co_await read_range(file, cur, chunk_end);

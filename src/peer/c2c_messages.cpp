@@ -3,6 +3,8 @@
 #include "ed2k/codec/tag.hpp"
 #include "ed2k/net/packet.hpp"   // net::MAX_PACKET_SIZE
 #include "net/inflate.hpp"       // P2 net::zlib_inflate（私有头，经 src PRIVATE include）
+#include <limits>
+#include <zlib.h>
 namespace ed2k::peer {
 namespace tag = ed2k::server::tag;   // CT_NAME/CT_VERSION 复用 server 的 tag-ID
 using codec::ByteWriter;
@@ -28,15 +30,27 @@ constexpr std::uint8_t ET_OS_INFO = 0x94;
 constexpr std::uint32_t SO_AMULE = 3;
 constexpr std::uint32_t SOURCEEXCHANGE2_VERSION = 4;
 
+std::vector<std::byte> zlib_deflate_level1(std::span<const std::byte> in) {
+  if(in.size() > std::numeric_limits<uLong>::max()) return {};
+  std::vector<std::byte> out(compressBound(static_cast<uLong>(in.size())));
+  uLongf out_len = static_cast<uLongf>(out.size());
+  const auto rc = compress2(reinterpret_cast<Bytef*>(out.data()), &out_len,
+                            reinterpret_cast<const Bytef*>(in.data()),
+                            static_cast<uLong>(in.size()), 1);
+  if(rc != Z_OK) return {};
+  out.resize(static_cast<std::size_t>(out_len));
+  return out;
+}
+
 constexpr std::uint32_t emule_version_2_3_3() {
   return (SO_AMULE << 24) | (2u << 17) | (3u << 10) | (3u << 7);
 }
 
-constexpr std::uint32_t misc_options1() {
+std::uint32_t misc_options1(const HelloInfo& h) {
   const std::uint32_t aich = 1;
   const std::uint32_t unicode = 1;
   const std::uint32_t udp = 0;
-  const std::uint32_t compression = 1;
+  const std::uint32_t compression = h.supports_compression ? 1u : 0u;
   const std::uint32_t secure_ident = 0;
   const std::uint32_t source_exchange = 3;
   const std::uint32_t extended_requests = 0;
@@ -86,7 +100,7 @@ std::vector<std::byte> encode_hello(const HelloInfo& h){
   tags.push_back(string_tag(tag::CT_NAME, h.nickname));
   tags.push_back(u32_tag(tag::CT_VERSION, h.version));
   tags.push_back(u32_tag(CT_EMULE_VERSION, emule_version_2_3_3()));
-  tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS1, misc_options1()));
+  tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS1, misc_options1(h)));
   tags.push_back(u32_tag(CT_EMULE_MISCOPTIONS2, misc_options2(h)));
   tags.push_back(u32_tag(CT_EMULECOMPAT_OPTIONS, 0));
   w.u32(static_cast<std::uint32_t>(tags.size()));
@@ -189,6 +203,15 @@ std::vector<std::byte> encode_sending_part(const FileHash& h, std::uint64_t star
   w.blob(data);
   return w.take();
 }
+std::vector<std::byte> encode_compressed_part(const FileHash& h, std::uint64_t start, std::span<const std::byte> data){
+  auto compressed = zlib_deflate_level1(data);
+  ByteWriter w;
+  w.hash16(h);
+  w.u32(static_cast<std::uint32_t>(start));
+  w.u32(static_cast<std::uint32_t>(compressed.size()));
+  w.blob(compressed);
+  return w.take();
+}
 std::vector<std::byte> encode_end_of_download(const FileHash& h){ ByteWriter w; w.hash16(h); return w.take(); }
 std::vector<std::byte> encode_cancel_transfer(){ return {}; }
 
@@ -201,6 +224,7 @@ tl::expected<HelloInfo,std::error_code> decode_hello(std::span<const std::byte> 
 tl::expected<HelloInfo,std::error_code> decode_hello_answer(std::span<const std::byte> data){
   ByteReader r(data);
   HelloInfo h;
+  h.supports_compression = false;
   h.user_hash = r.hash16();
   h.client_id = r.u32();
   h.port = r.u16();
@@ -348,16 +372,34 @@ tl::expected<Block,std::error_code> decode_sending_part(std::span<const std::byt
   b.data.assign(blob.begin(), blob.end());
   return b;
 }
-tl::expected<Block,std::error_code> decode_compressed_part(std::span<const std::byte> data){
+tl::expected<CompressedPartSegment,std::error_code> decode_compressed_part_segment(std::span<const std::byte> data){
   ByteReader r(data);
-  Block b; b.hash = r.hash16(); b.start = r.u32(); b.end = r.u32();
+  CompressedPartSegment b;
+  b.hash = r.hash16();
+  b.start = r.u32();
+  b.compressed_size = r.u32();
   std::size_t clen = data.size() - r.pos();
   auto comp = r.blob(clen);
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
+  b.data.assign(comp.begin(), comp.end());
+  return b;
+}
+tl::expected<Block,std::error_code> inflate_compressed_part_segment(const CompressedPartSegment& seg){
+  if(seg.data.size() != seg.compressed_size) return tl::unexpected(make_error_code(errc::decompress_failed));
+  auto comp = std::span<const std::byte>(seg.data.data(), seg.data.size());
   auto dec = ed2k::net::zlib_inflate(comp, ed2k::net::MAX_PACKET_SIZE);
   if(!dec) return tl::unexpected(dec.error());
+  Block b;
+  b.hash = seg.hash;
+  b.start = seg.start;
+  b.end = seg.start + dec->size();
   b.data = std::move(*dec);
   return b;
+}
+tl::expected<Block,std::error_code> decode_compressed_part(std::span<const std::byte> data){
+  auto seg = decode_compressed_part_segment(data);
+  if(!seg) return tl::unexpected(seg.error());
+  return inflate_compressed_part_segment(*seg);
 }
 tl::expected<FileHash,std::error_code> decode_file_req_ans_no_fil(std::span<const std::byte> data){
   ByteReader r(data);
@@ -603,6 +645,15 @@ std::vector<std::byte> encode_request_parts_i64(const FileHash& h, std::array<st
   for(auto e : ends) w.u64(e);
   return w.take();
 }
+std::vector<std::byte> encode_compressed_part_i64(const FileHash& h, std::uint64_t start, std::span<const std::byte> data){
+  auto compressed = zlib_deflate_level1(data);
+  ByteWriter w;
+  w.hash16(h);
+  w.u64(start);
+  w.u32(static_cast<std::uint32_t>(compressed.size()));
+  w.blob(compressed);
+  return w.take();
+}
 tl::expected<Block,std::error_code> decode_sending_part_i64(std::span<const std::byte> data){
   ByteReader r(data);
   Block b; b.hash = r.hash16(); b.start = r.u64(); b.end = r.u64();
@@ -612,15 +663,21 @@ tl::expected<Block,std::error_code> decode_sending_part_i64(std::span<const std:
   b.data.assign(blob.begin(), blob.end());
   return b;
 }
-tl::expected<Block,std::error_code> decode_compressed_part_i64(std::span<const std::byte> data){
+tl::expected<CompressedPartSegment,std::error_code> decode_compressed_part_i64_segment(std::span<const std::byte> data){
   ByteReader r(data);
-  Block b; b.hash = r.hash16(); b.start = r.u64(); b.end = r.u64();
+  CompressedPartSegment b;
+  b.hash = r.hash16();
+  b.start = r.u64();
+  b.compressed_size = r.u32();
   std::size_t clen = data.size() - r.pos();
   auto comp = r.blob(clen);
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
-  auto dec = ed2k::net::zlib_inflate(comp, ed2k::net::MAX_PACKET_SIZE);
-  if(!dec) return tl::unexpected(dec.error());
-  b.data = std::move(*dec);
+  b.data.assign(comp.begin(), comp.end());
   return b;
+}
+tl::expected<Block,std::error_code> decode_compressed_part_i64(std::span<const std::byte> data){
+  auto seg = decode_compressed_part_i64_segment(data);
+  if(!seg) return tl::unexpected(seg.error());
+  return inflate_compressed_part_segment(*seg);
 }
 }

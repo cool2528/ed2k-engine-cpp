@@ -26,7 +26,7 @@ struct HelloInfo {
   bool requests_obfuscation = false;
   bool requires_obfuscation = false;
   bool supports_aich = false;
-  bool supports_compression = false;
+  bool supports_compression = true;
   std::uint32_t source_exchange_version = 0;
   bool supports_comments = false;
   bool supports_multipacket = false;
@@ -85,6 +85,7 @@ std::vector<std::byte> encode_request_parts(const FileHash&, std::array<std::uin
 struct RequestParts { FileHash hash; std::array<std::uint64_t,3> starts{}, ends{}; };
 tl::expected<RequestParts,std::error_code> decode_request_parts(std::span<const std::byte>);
 std::vector<std::byte> encode_sending_part(const FileHash&, std::uint64_t start, std::span<const std::byte> data);
+std::vector<std::byte> encode_compressed_part(const FileHash&, std::uint64_t start, std::span<const std::byte> data);
 std::vector<std::byte> encode_end_of_download(const FileHash&);
 std::vector<std::byte> encode_cancel_transfer();
 
@@ -105,6 +106,12 @@ struct PeerSource {
 struct SourceExchangeAnswer { std::uint8_t version=0; FileHash hash; std::vector<PeerSource> sources; };
 struct FileDesc { std::uint8_t rating=0; std::string comment; };
 struct PreviewAnswer { FileHash hash; std::vector<std::vector<std::byte>> frames; };
+struct CompressedPartSegment {
+  FileHash hash;
+  std::uint64_t start = 0;
+  std::uint32_t compressed_size = 0;
+  std::vector<std::byte> data;
+};
 
 tl::expected<HelloInfo,std::error_code>          decode_hello(std::span<const std::byte>);        // OP_HELLO(校验并跳过 0x10 前导)
 tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>); // OP_HELLOANSWER(无前导)
@@ -114,6 +121,8 @@ tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(const 
 tl::expected<FileNameAnswer,std::error_code>     decode_req_filename_answer(std::span<const std::byte>);
 tl::expected<std::uint16_t,std::error_code>      decode_queue_ranking(std::span<const std::byte>);
 tl::expected<Block,std::error_code>              decode_sending_part(std::span<const std::byte>);
+tl::expected<CompressedPartSegment,std::error_code> decode_compressed_part_segment(std::span<const std::byte>);
+tl::expected<Block,std::error_code>              inflate_compressed_part_segment(const CompressedPartSegment&);
 tl::expected<Block,std::error_code>              decode_compressed_part(std::span<const std::byte>);
 tl::expected<FileHash,std::error_code>           decode_file_req_ans_no_fil(std::span<const std::byte>);
 std::vector<std::byte> encode_shared_files_answer(std::span<const SharedFileEntry> files);
@@ -156,6 +165,8 @@ tl::expected<AICHRecoveryData, std::error_code> decode_aich_answer(std::span<con
 
 // I64 (large file >4GiB) messages
 std::vector<std::byte> encode_request_parts_i64(const FileHash&, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends);
+std::vector<std::byte> encode_compressed_part_i64(const FileHash&, std::uint64_t start, std::span<const std::byte> data);
 tl::expected<Block,std::error_code>              decode_sending_part_i64(std::span<const std::byte>);
+tl::expected<CompressedPartSegment,std::error_code> decode_compressed_part_i64_segment(std::span<const std::byte>);
 tl::expected<Block,std::error_code>              decode_compressed_part_i64(std::span<const std::byte>);
 }

@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
@@ -53,6 +55,12 @@ static HelloInfo hello(std::string name){
   return h;
 }
 
+static HelloInfo hello_without_compression(std::string name){
+  auto h = hello(std::move(name));
+  h.supports_compression = false;
+  return h;
+}
+
 static HelloInfo hello_with_hash(std::string name, std::string_view hash){
   auto h = hello(std::move(name));
   h.user_hash = *UserHash::from_hex(hash);
@@ -66,6 +74,25 @@ static std::filesystem::path temp_file(std::string name){
 static std::vector<std::byte> sample_data(std::size_t n){
   std::vector<std::byte> data(n);
   for(std::size_t i=0;i<n;++i) data[i]=std::byte((i*37u + 11u) & 0xFFu);
+  return data;
+}
+
+static std::vector<std::byte> incompressible_data(std::size_t n){
+  std::vector<std::byte> data(n);
+  std::uint32_t x = 0x12345678u;
+  for(std::size_t i = 0; i < n; ++i) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    data[i] = std::byte(x & 0xFFu);
+  }
+  return data;
+}
+
+static std::vector<std::byte> partially_compressible_data(std::size_t n){
+  std::vector<std::byte> data(n, std::byte{0});
+  auto noise = incompressible_data(n / 2);
+  std::copy(noise.begin(), noise.end(), data.begin());
   return data;
 }
 
@@ -249,7 +276,7 @@ TEST(UploadSession, SplitsSendingPartFramesAtAMuleChunkSize){
     tcp::socket s(rt.context());
     auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
     EXPECT_FALSE(ec); if(ec) co_return;
-    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello_without_compression("client")));
     auto hello_ans = co_await read_packet(s);
     EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
     co_await send_pkt(s, op::REQUESTPARTS, encode_request_parts(f.hash, {0,0,0}, {25000,0,0}));
@@ -272,6 +299,146 @@ TEST(UploadSession, SplitsSendingPartFramesAtAMuleChunkSize){
     EXPECT_EQ(b2->end, 20480u);
     EXPECT_EQ(b3->start, 20480u);
     EXPECT_EQ(b3->end, 25000u);
+    s.close();
+    co_return;
+  });
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(UploadSession, SendsCompressedPartWhenCompressionSavesBytes){
+  ed2k::net::IoRuntime rt;
+  std::vector<std::byte> data(25000, std::byte{0});
+  auto path = temp_file("ed2k-upload-session-compressed.bin");
+  write_file(path, data);
+  KnownFileDB db;
+  auto f = known_file_for(path, data);
+  db.add(f);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::REQUESTPARTS, encode_request_parts(f.hash, {0,0,0}, {25000,0,0}));
+
+    auto p = co_await read_packet(s);
+    EXPECT_EQ(p.protocol, ed2k::net::proto::eMule);
+    EXPECT_EQ(p.opcode, op::COMPRESSEDPART);
+    auto block = decode_compressed_part(p.payload);
+    EXPECT_TRUE(block.has_value()); if(!block) co_return;
+    EXPECT_EQ(block->hash, f.hash);
+    EXPECT_EQ(block->start, 0u);
+    EXPECT_EQ(block->end, data.size());
+    EXPECT_EQ(block->data, data);
+    s.close();
+    co_return;
+  });
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(UploadSession, SplitsCompressedPartFramesAtAMuleChunkSize){
+  ed2k::net::IoRuntime rt;
+  auto data = partially_compressible_data(50000);
+  auto path = temp_file("ed2k-upload-session-compressed-split.bin");
+  write_file(path, data);
+  KnownFileDB db;
+  auto f = known_file_for(path, data);
+  db.add(f);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::REQUESTPARTS, encode_request_parts(f.hash, {0,0,0}, {static_cast<std::uint32_t>(data.size()),0,0}));
+
+    std::vector<std::byte> compressed;
+    std::optional<std::uint32_t> compressed_size;
+    std::size_t frame_count = 0;
+    while(true) {
+      auto p = co_await read_packet(s);
+      EXPECT_EQ(p.protocol, ed2k::net::proto::eMule);
+      EXPECT_EQ(p.opcode, op::COMPRESSEDPART);
+      auto seg = decode_compressed_part_segment(p.payload);
+      EXPECT_TRUE(seg.has_value()); if(!seg) co_return;
+      EXPECT_EQ(seg->hash, f.hash);
+      EXPECT_EQ(seg->start, 0u);
+      if(!compressed_size) compressed_size = seg->compressed_size;
+      EXPECT_EQ(seg->compressed_size, *compressed_size);
+      compressed.insert(compressed.end(), seg->data.begin(), seg->data.end());
+      ++frame_count;
+      if(compressed.size() >= *compressed_size) break;
+    }
+
+    EXPECT_GT(frame_count, 1u);
+    EXPECT_TRUE(compressed_size.has_value()); if(!compressed_size) co_return;
+    EXPECT_EQ(compressed.size(), *compressed_size);
+    ed2k::codec::ByteWriter w;
+    w.hash16(f.hash);
+    w.u32(0);
+    w.u32(*compressed_size);
+    w.blob(compressed);
+    auto block = decode_compressed_part(w.take());
+    EXPECT_TRUE(block.has_value()); if(!block) co_return;
+    EXPECT_EQ(block->data, data);
+    s.close();
+    co_return;
+  });
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(UploadSession, SendsUncompressedPartWhenCompressionDoesNotShrink){
+  ed2k::net::IoRuntime rt;
+  auto data = incompressible_data(4096);
+  auto path = temp_file("ed2k-upload-session-no-compression-benefit.bin");
+  write_file(path, data);
+  KnownFileDB db;
+  auto f = known_file_for(path, data);
+  db.add(f);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::REQUESTPARTS, encode_request_parts(f.hash, {0,0,0}, {4096,0,0}));
+
+    auto p = co_await read_packet(s);
+    EXPECT_EQ(p.protocol, ed2k::net::proto::eDonkey);
+    EXPECT_EQ(p.opcode, op::SENDINGPART);
+    auto block = decode_sending_part(p.payload);
+    EXPECT_TRUE(block.has_value()); if(!block) co_return;
+    EXPECT_EQ(block->data, data);
     s.close();
     co_return;
   });
@@ -499,7 +666,7 @@ TEST(UploadSession, ThrottlesSendingPartFrames){
     C2CConnection c(rt.executor());
     auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
     EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
-    auto hs = co_await c.handshake(hello("client"), 2s);
+    auto hs = co_await c.handshake(hello_without_compression("client"), 2s);
     EXPECT_TRUE(hs.has_value()); if(!hs) co_return;
 
     auto start = std::chrono::steady_clock::now();

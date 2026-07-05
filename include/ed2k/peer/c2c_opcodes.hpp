@@ -42,8 +42,8 @@ constexpr std::uint8_t MULTIPACKET_EXT   = 0xA4;  // eMule: <HASH16><SIZE64><sub
 constexpr std::uint8_t REQUESTSOURCES2   = 0x83;  // eMule SX2 standalone interop: <HASH16>; multipacket SX2 carries version/options
 constexpr std::uint8_t ANSWERSOURCES2    = 0x84;  // eMule SX2: version + hash + sources
 // large file (I64) extensions
-constexpr std::uint8_t REQUESTPARTS_I64 = 0x30;
-constexpr std::uint8_t SENDINGPART_I64  = 0x31;
-constexpr std::uint8_t COMPRESSEDPART_I64 = 0x32;
+constexpr std::uint8_t COMPRESSEDPART_I64 = 0xA1;
+constexpr std::uint8_t SENDINGPART_I64  = 0xA2;
+constexpr std::uint8_t REQUESTPARTS_I64 = 0xA3;
 }
 }

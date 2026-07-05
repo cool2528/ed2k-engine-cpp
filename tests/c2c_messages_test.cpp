@@ -422,6 +422,7 @@ TEST(C2CMessages, DecodeHelloAnswer){
   EXPECT_TRUE(out->server_ip.has_value());
   EXPECT_EQ(out->server_ip->host(), 0x7F000001u);
   EXPECT_EQ(out->server_port, 0x4662u);
+  EXPECT_FALSE(out->supports_compression);
 }
 TEST(C2CMessages, DecodeHelloAnswerReadsObfuscationBits){
   ByteWriter w;
@@ -463,6 +464,20 @@ TEST(C2CMessages, DecodeHelloAnswerReadsEmuleFeatureBits){
   EXPECT_TRUE(out->supports_source_exchange2);
   EXPECT_TRUE(out->supports_ext_multipacket);
   EXPECT_TRUE(out->supports_large_files);
+}
+TEST(C2CMessages, DecodeHelloAnswerReadsDisabledCompressionBit){
+  HelloInfo h;
+  h.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  h.client_id=0x01020304u;
+  h.port=0x1234u;
+  h.nickname="u";
+  h.version=0x3C;
+  h.supports_compression = false;
+
+  auto out = decode_hello_answer(encode_hello(h));
+
+  ASSERT_TRUE(out.has_value());
+  EXPECT_FALSE(out->supports_compression);
 }
 TEST(C2CMessages, DecodeHello){
   // OP_HELLO 帧 = [0x10] + body(hash+id+port+tagcount+tags+server_ip+server_port)。
@@ -573,16 +588,44 @@ TEST(C2CMessages, DecodeSendingPart){
   EXPECT_EQ(out->end, 200u);
   EXPECT_EQ(out->data, bytes({1,2,3}));
 }
+TEST(C2CMessages, LargeBlockOpcodesMatchAmuleTcp){
+  EXPECT_EQ(ed2k::peer::op::COMPRESSEDPART_I64, 0xA1u);
+  EXPECT_EQ(ed2k::peer::op::SENDINGPART_I64, 0xA2u);
+  EXPECT_EQ(ed2k::peer::op::REQUESTPARTS_I64, 0xA3u);
+}
+TEST(C2CMessages, EncodeCompressedPartUsesAmulePackedHeader){
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  std::vector<std::byte> plain(4096, std::byte{0x2A});
+
+  auto out = encode_compressed_part(h, 100, plain);
+
+  ed2k::codec::ByteReader r(out);
+  EXPECT_EQ(r.hash16(), h);
+  EXPECT_EQ(r.u32(), 100u);
+  const auto packed_size = r.u32();
+  EXPECT_TRUE(r.ok());
+  EXPECT_EQ(packed_size, out.size() - 24u);
+  EXPECT_LT(packed_size, plain.size());
+
+  auto decoded = decode_compressed_part(out);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->hash, h);
+  EXPECT_EQ(decoded->start, 100u);
+  EXPECT_EQ(decoded->end, 100u + plain.size());
+  EXPECT_EQ(decoded->data, plain);
+}
 TEST(C2CMessages, DecodeCompressedPart){
   auto plain = bytes({10,20,30,40,50});
   auto comp = zlib_compress(plain);
   ByteWriter w;
   w.hash16(*FileHash::from_hex("00112233445566778899aabbccddeeff"));
   w.u32(100);
-  w.u32(200);
+  w.u32(static_cast<std::uint32_t>(comp.size()));
   w.blob(comp);
   auto out=decode_compressed_part(w.take());
   ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->start, 100u);
+  EXPECT_EQ(out->end, 105u);
   EXPECT_EQ(out->data, plain);
 }
 TEST(C2CMessages, DecodeFileReqAnsNoFil){
@@ -699,12 +742,35 @@ TEST(C2CMessages, DecodeCompressedPartI64){
   ByteWriter w;
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   w.hash16(h);
-  w.u64(100);
-  w.u64(200);
+  w.u64(0x100000000ULL);
+  w.u32(static_cast<std::uint32_t>(comp.size()));
   w.blob(comp);
   auto out=decode_compressed_part_i64(w.take());
   ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->start, 0x100000000ULL);
+  EXPECT_EQ(out->end, 0x100000005ULL);
   EXPECT_EQ(out->data, plain);
+}
+TEST(C2CMessages, EncodeCompressedPartI64UsesAmulePackedHeader){
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  std::vector<std::byte> plain(4096, std::byte{0x7B});
+
+  auto out = encode_compressed_part_i64(h, 0x100000000ULL, plain);
+
+  ed2k::codec::ByteReader r(out);
+  EXPECT_EQ(r.hash16(), h);
+  EXPECT_EQ(r.u64(), 0x100000000ULL);
+  const auto packed_size = r.u32();
+  EXPECT_TRUE(r.ok());
+  EXPECT_EQ(packed_size, out.size() - 28u);
+  EXPECT_LT(packed_size, plain.size());
+
+  auto decoded = decode_compressed_part_i64(out);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->hash, h);
+  EXPECT_EQ(decoded->start, 0x100000000ULL);
+  EXPECT_EQ(decoded->end, 0x100001000ULL);
+  EXPECT_EQ(decoded->data, plain);
 }
 TEST(C2CMessages, DecodeSendingPartI64Truncated){
   EXPECT_FALSE(decode_sending_part_i64(bytes({1,2,3,4})).has_value());
