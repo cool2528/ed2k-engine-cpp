@@ -14,7 +14,7 @@ namespace ed2k::server {
 
 // C→S 编码：返回 payload（opcode 由调用方设入 net::Packet）
 std::vector<std::byte> encode_glob_search_req(const SearchExpr&);                       // = serialize_search
-std::vector<std::byte> encode_get_sources_req(const FileHash&, std::uint64_t size);      // hash16 + u32 size
+std::vector<std::byte> encode_get_sources_req(const FileHash&, std::uint64_t size);      // hash16 + u64 size
 std::vector<std::byte> encode_server_status_req(std::uint32_t challenge);               // u32
 std::vector<std::byte> encode_server_list_req(IPv4 ip, std::uint16_t port);             // u32 ip + u16 port
 std::vector<std::byte> encode_server_desc_req(std::uint32_t challenge);                 // u32
@@ -34,5 +34,6 @@ tl::expected<UdpSearchResult,std::error_code> decode_glob_search_res(std::span<c
 tl::expected<std::vector<FoundSources>,std::error_code> decode_glob_found_sources(std::span<const std::byte>);
 tl::expected<ServerStat,std::error_code> decode_server_stat(std::span<const std::byte>, std::uint32_t challenge);
 tl::expected<ServerDesc,std::error_code> decode_server_desc(std::span<const std::byte>, std::uint32_t challenge);
+tl::expected<ServerIdent,std::error_code> decode_udp_server_ident(std::span<const std::byte>);
 tl::expected<std::uint32_t,std::error_code> decode_invalid_low_id(std::span<const std::byte>);
 }

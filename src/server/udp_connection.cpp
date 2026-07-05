@@ -8,6 +8,13 @@ namespace asio = boost::asio;
 using udp = asio::ip::udp;
 using clock_type = std::chrono::steady_clock;
 
+namespace {
+bool matches_wanted_opcode(std::uint8_t got, std::uint8_t want){
+  if(got == want) return true;
+  return want == udpop::GLOBFOUNDSOURCES2 && got == udpop::GLOBFOUNDSOURCES;
+}
+}
+
 UdpServerConnection::UdpServerConnection(asio::any_io_executor ex, IPv4 ip, std::uint16_t port)
   : UdpServerConnection(ex, ip, port, UdpServerObfuscation{}) {}
 UdpServerConnection::UdpServerConnection(asio::any_io_executor ex, IPv4 ip, std::uint16_t port,
@@ -87,11 +94,18 @@ UdpServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds bud
     auto parsed = ed2k::net::parse_udp_datagram(datagram);
     if(!parsed) co_return tl::unexpected(parsed.error());
     auto pkt = std::move(*parsed);
-    if(pkt.opcode == want) co_return std::move(pkt);
+    if(matches_wanted_opcode(pkt.opcode, want)) co_return std::move(pkt);
     if(pkt.opcode == udpop::INVALID_LOWID){
       if(on_event_){
         auto id = decode_invalid_low_id(pkt.payload);
         if(id) on_event_(InvalidLowIdEvent{*id});
+      }
+      continue;
+    }
+    if(pkt.opcode == udpop::SERVER_IDENT){
+      if(on_event_){
+        auto id = decode_udp_server_ident(pkt.payload);
+        if(id) on_event_(UdpServerIdentEvent{id->hash, id->ip, id->port, id->name, id->description});
       }
       continue;
     }
@@ -110,7 +124,7 @@ asio::awaitable<tl::expected<FoundSources,std::error_code>>
 UdpServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=udpop::GLOBGETSOURCES2;
   req.payload = encode_get_sources_req(h, size);
-  auto rp = co_await request_response(req, udpop::GLOBFOUNDSOURCES, timeout);
+  auto rp = co_await request_response(req, udpop::GLOBFOUNDSOURCES2, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   auto v = decode_glob_found_sources(rp->payload);
   if(!v) co_return tl::unexpected(v.error());

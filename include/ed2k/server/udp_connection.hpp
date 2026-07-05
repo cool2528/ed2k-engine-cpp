@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -15,7 +16,8 @@
 #include "ed2k/server/search_query.hpp"
 namespace ed2k::server {
 struct InvalidLowIdEvent { std::uint32_t id=0; };
-using UdpEvent = std::variant<InvalidLowIdEvent>;
+struct UdpServerIdentEvent { MD4Hash hash; IPv4 ip; std::uint16_t port=0; std::string name, description; };
+using UdpEvent = std::variant<InvalidLowIdEvent, UdpServerIdentEvent>;
 
 struct UdpServerObfuscation {
   std::uint32_t udp_key = 0;

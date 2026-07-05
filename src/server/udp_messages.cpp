@@ -5,7 +5,7 @@ using codec::ByteWriter;
 using codec::ByteReader;
 std::vector<std::byte> encode_glob_search_req(const SearchExpr& e){ return serialize_search(e); }
 std::vector<std::byte> encode_get_sources_req(const FileHash& h, std::uint64_t size){
-  ByteWriter w; w.hash16(h); w.u32(static_cast<std::uint32_t>(size)); return w.take();
+  ByteWriter w; w.hash16(h); w.u64(size); return w.take();
 }
 std::vector<std::byte> encode_server_status_req(std::uint32_t challenge){ ByteWriter w; w.u32(challenge); return w.take(); }
 std::vector<std::byte> encode_server_list_req(IPv4 ip, std::uint16_t port){ ByteWriter w; w.u32_be(ip.host()); w.u16(port); return w.take(); }
@@ -53,7 +53,7 @@ tl::expected<std::vector<FoundSources>,std::error_code> decode_glob_found_source
     out.push_back(std::move(fs));
     if(r.remaining() >= 2){
       std::uint8_t proto = r.u8(), op = r.u8();
-      if(!(proto == 0xE3 && op == udpop::GLOBFOUNDSOURCES)) break;
+      if(!(proto == 0xE3 && (op == udpop::GLOBFOUNDSOURCES || op == udpop::GLOBFOUNDSOURCES2))) break;
     }
   }
   return out;
@@ -103,6 +103,9 @@ tl::expected<ServerDesc,std::error_code> decode_server_desc(std::span<const std:
   }
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return sd;
+}
+tl::expected<ServerIdent,std::error_code> decode_udp_server_ident(std::span<const std::byte> data){
+  return decode_server_ident(data);
 }
 tl::expected<std::uint32_t,std::error_code> decode_invalid_low_id(std::span<const std::byte> data){
   ByteReader r(data);

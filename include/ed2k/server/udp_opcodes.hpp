@@ -5,6 +5,7 @@ namespace udpop {
 constexpr std::uint8_t GLOBSEARCHREQ2    = 0x92;
 constexpr std::uint8_t GLOBSEARCHRES     = 0x99;
 constexpr std::uint8_t GLOBGETSOURCES2   = 0x94;
+constexpr std::uint8_t GLOBFOUNDSOURCES2 = 0x95;
 constexpr std::uint8_t GLOBFOUNDSOURCES  = 0x9B;
 constexpr std::uint8_t GLOBSERVSTATREQ   = 0x96;
 constexpr std::uint8_t GLOBSERVSTATRES   = 0x97;
@@ -12,6 +13,7 @@ constexpr std::uint8_t SERVER_LIST_REQ   = 0xA0;
 constexpr std::uint8_t SERVER_LIST_RES   = 0xA1;
 constexpr std::uint8_t SERVER_DESC_REQ   = 0xA2;
 constexpr std::uint8_t SERVER_DESC_RES   = 0xA3;
+constexpr std::uint8_t SERVER_IDENT      = 0x56;
 constexpr std::uint8_t INVALID_LOWID     = 0x9E;
 }
 namespace udpflag {

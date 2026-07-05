@@ -93,6 +93,30 @@ TEST(UdpConnection, GetSourcesRoundTrip){
     c.close(); co_return;
   });
 }
+TEST(UdpConnection, GetSourcesUsesV2SizeAndAcceptsV2Response){
+  IoRuntime rt;
+  ed2k::test::MockUdpServer srv(rt.context());
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  std::vector<std::byte> request_payload;
+  srv.serve([&](udp::socket& s, const Packet& request, const udp::endpoint& from) -> asio::awaitable<void>{
+    EXPECT_EQ(request.opcode, udpop::GLOBGETSOURCES2);
+    request_payload = request.payload;
+    codec::ByteWriter w;
+    w.hash16(h); w.u8(1);
+    w.u32(0x01000000u); w.u16(0x1234u);
+    co_await ed2k::test::send_packet_to(s, from, udpop::GLOBFOUNDSOURCES2, w.take());
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
+    auto r = co_await c.get_sources(h, 0x100000001ull, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->sources.size(), 1u);
+    EXPECT_EQ(request_payload, encode_get_sources_req(h, 0x100000001ull));
+    EXPECT_EQ(request_payload.size(), 24u);
+    c.close(); co_return;
+  });
+}
 TEST(UdpConnection, GetSourcesNoMatchReturnsEmpty){
   IoRuntime rt;
   ed2k::test::MockUdpServer srv(rt.context());
@@ -307,6 +331,33 @@ TEST(UdpConnection, ServerDescChallengeMismatch){
     auto r = co_await c.server_desc(0x9999F0FFu, 2s);       // 客户端发的 challenge(低2字节=0xF0FF,与 mock 不同)
     EXPECT_FALSE(r.has_value());
     if(!r) EXPECT_EQ(r.error(), make_error_code(errc::server_protocol_error));
+    c.close(); co_return;
+  });
+}
+TEST(UdpConnection, ServerIdentEventEmitted){
+  IoRuntime rt;
+  ed2k::test::MockUdpServer srv(rt.context());
+  srv.serve([](udp::socket& s, const Packet&, const udp::endpoint& from) -> asio::awaitable<void>{
+    codec::ByteWriter ident;
+    ident.hash16(*MD4Hash::from_hex("00112233445566778899aabbccddeeff"));
+    ident.u32_be(0x7F000001u);
+    ident.u16(0x1234u);
+    ident.u32(2);
+    ident.u8(0x82); ident.u8(tag::ST_SERVERNAME); ident.string16("name");
+    ident.u8(0x82); ident.u8(tag::ST_DESCRIPTION); ident.string16("desc");
+    co_await ed2k::test::send_packet_to(s, from, udpop::SERVER_IDENT, ident.take());
+    co_await ed2k::test::send_packet_to(s, from, udpop::GLOBSEARCHRES, search_item("after"));
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
+    std::string got_name;
+    c.on_event([&](const UdpEvent& e){
+      if(std::holds_alternative<UdpServerIdentEvent>(e)) got_name = std::get<UdpServerIdentEvent>(e).name;
+    });
+    auto r = co_await c.global_search(Keyword{"foo"}, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(got_name, "name");
     c.close(); co_return;
   });
 }

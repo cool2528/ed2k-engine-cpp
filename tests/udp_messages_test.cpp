@@ -14,8 +14,19 @@ static std::vector<std::byte> hex(std::string_view h){
 TEST(UdpMessages, EncodeGetSourcesReq){
   auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
   std::vector<std::byte> want = hex("00112233445566778899aabbccddeeff");
-  auto s = bytes({100,0,0,0}); want.insert(want.end(), s.begin(), s.end());
+  auto s = bytes({100,0,0,0, 0,0,0,0}); want.insert(want.end(), s.begin(), s.end());
   EXPECT_EQ(encode_get_sources_req(h, 100), want);
+}
+TEST(UdpMessages, P9OpcodesExposeV2FoundSourcesAndServerIdent){
+  EXPECT_EQ(udpop::GLOBFOUNDSOURCES2, 0x95u);
+  EXPECT_EQ(udpop::SERVER_IDENT, 0x56u);
+}
+TEST(UdpMessages, EncodeGetSourcesReq2UsesUint64Size){
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  std::vector<std::byte> want = hex("00112233445566778899aabbccddeeff");
+  auto s = bytes({1,0,0,0, 1,0,0,0});
+  want.insert(want.end(), s.begin(), s.end());
+  EXPECT_EQ(encode_get_sources_req(h, 0x100000001ull), want);
 }
 TEST(UdpMessages, EncodeServerStatusReq){
   EXPECT_EQ(encode_server_status_req(0x12345678u), bytes({0x78,0x56,0x34,0x12}));
@@ -65,6 +76,18 @@ TEST(UdpMessages, DecodeGlobFoundSourcesConcat){
   w.hash16(h); w.u8(1); w.u32(0x01000000u); w.u16(0x1234u);          // 组1: HighID 源
   w.u8(0xE3); w.u8(udpop::GLOBFOUNDSOURCES);
   w.hash16(h); w.u8(1); w.u32(5u); w.u16(0x5678u);                     // 组2: LowID 源
+  auto out = decode_glob_found_sources(w.take());
+  ASSERT_TRUE(out.has_value());
+  ASSERT_EQ(out->size(), 2u);
+  EXPECT_FALSE((*out)[0].sources[0].low_id());
+  EXPECT_TRUE((*out)[1].sources[0].low_id());
+}
+TEST(UdpMessages, DecodeGlobFoundSourcesConcatV2){
+  ByteWriter w;
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  w.hash16(h); w.u8(1); w.u32(0x01000000u); w.u16(0x1234u);
+  w.u8(0xE3); w.u8(udpop::GLOBFOUNDSOURCES2);
+  w.hash16(h); w.u8(1); w.u32(5u); w.u16(0x5678u);
   auto out = decode_glob_found_sources(w.take());
   ASSERT_TRUE(out.has_value());
   ASSERT_EQ(out->size(), 2u);
@@ -135,6 +158,22 @@ TEST(UdpMessages, DecodeServerDescChallengeMismatch){
   auto out = decode_server_desc(w.take(), 0x9999F0FFu);              // 低2字节同为 0xF0FF → 新格式
   EXPECT_FALSE(out.has_value());
   EXPECT_EQ(out.error(), make_error_code(errc::server_protocol_error));
+}
+TEST(UdpMessages, DecodeUdpServerIdentUsesServerIdentLayout){
+  std::vector<std::byte> d = hex("00112233445566778899aabbccddeeff");
+  auto app=[&](std::initializer_list<int> xs){ for(int x:xs) d.push_back(std::byte(x)); };
+  app({0x7F,0,0,1});
+  app({0x34,0x12});
+  app({2,0,0,0});
+  app({0x82,tag::ST_SERVERNAME,  0x04,0x00,'n','a','m','e'});
+  app({0x82,tag::ST_DESCRIPTION, 0x04,0x00,'d','e','s','c'});
+  auto out = decode_udp_server_ident(d);
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(out->hash, *MD4Hash::from_hex("00112233445566778899aabbccddeeff"));
+  EXPECT_EQ(out->ip.host(), 0x7F000001u);
+  EXPECT_EQ(out->port, 0x1234u);
+  EXPECT_EQ(out->name, "name");
+  EXPECT_EQ(out->description, "desc");
 }
 TEST(UdpMessages, DecodeInvalidLowId){
   ByteWriter w; w.u32(0x00001234u);
