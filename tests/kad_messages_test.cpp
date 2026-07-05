@@ -2,8 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "ed2k/codec/tag.hpp"
 #include "ed2k/kad/messages.hpp"
 #include "ed2k/net/udp_framing.hpp"
 
@@ -33,6 +36,20 @@ std::vector<unsigned> bytes_of(const std::vector<std::byte>& data) {
     out.push_back(std::to_integer<unsigned>(b));
   }
   return out;
+}
+
+codec::Tag string_tag(std::uint8_t name_id, std::string value) {
+  codec::Tag tag;
+  tag.name_str = std::string(1, static_cast<char>(name_id));
+  tag.value = std::move(value);
+  return tag;
+}
+
+codec::Tag int_tag(std::uint8_t name_id, std::uint64_t value) {
+  codec::Tag tag;
+  tag.name_str = std::string(1, static_cast<char>(name_id));
+  tag.value = value;
+  return tag;
 }
 } // namespace
 
@@ -111,4 +128,124 @@ TEST(KadMessages, RejectsMalformedPackets) {
   truncated_res.opcode = opcode::kad2_res;
   truncated_res.payload = {std::byte{0x01}};
   EXPECT_FALSE(decode_kad2_res(truncated_res).has_value());
+}
+
+TEST(KadMessages, SearchKeySourceAndResponseRoundTrip) {
+  const auto sender = kid("00112233445566778899aabbccddeeff");
+  const auto target = kid("0102030405060708090a0b0c0d0e0f10");
+  const auto answer = kid("101112131415161718191a1b1c1d1e1f");
+
+  auto key_req_packet = encode_kad2_search_key_req(target, 0);
+  EXPECT_EQ(key_req_packet.protocol, kad_protocol);
+  EXPECT_EQ(key_req_packet.opcode, opcode::kad2_search_key_req);
+  ASSERT_EQ(key_req_packet.payload.size(), 18u);
+
+  auto key_req = decode_kad2_search_key_req(key_req_packet);
+  ASSERT_TRUE(key_req.has_value());
+  EXPECT_EQ(key_req->target, target);
+  EXPECT_EQ(key_req->start_position, 0u);
+
+  auto source_req_packet = encode_kad2_search_source_req(target, 3, 123456789ull);
+  EXPECT_EQ(source_req_packet.opcode, opcode::kad2_search_source_req);
+  ASSERT_EQ(source_req_packet.payload.size(), 26u);
+
+  auto source_req = decode_kad2_search_source_req(source_req_packet);
+  ASSERT_TRUE(source_req.has_value());
+  EXPECT_EQ(source_req->target, target);
+  EXPECT_EQ(source_req->start_position, 3u);
+  EXPECT_EQ(source_req->file_size, 123456789ull);
+
+  const std::vector<KadSearchEntry> entries{KadSearchEntry{
+      .answer_id = answer,
+      .tags = {string_tag(tag::filename, "ubuntu.iso"), int_tag(tag::file_size, 123456789ull)},
+  }};
+  auto res_packet = encode_kad2_search_res(sender, target, entries);
+  EXPECT_EQ(res_packet.opcode, opcode::kad2_search_res);
+  ASSERT_GE(res_packet.payload.size(), 34u);
+  EXPECT_EQ(std::to_integer<unsigned>(res_packet.payload[32]), 1u);
+  EXPECT_EQ(std::to_integer<unsigned>(res_packet.payload[33]), 0u);
+
+  auto res = decode_kad2_search_res(res_packet);
+  ASSERT_TRUE(res.has_value());
+  EXPECT_EQ(res->sender_id, sender);
+  EXPECT_EQ(res->target, target);
+  ASSERT_EQ(res->entries.size(), 1u);
+  EXPECT_EQ(res->entries[0].answer_id, answer);
+  ASSERT_EQ(res->entries[0].tags.size(), 2u);
+}
+
+TEST(KadMessages, PublishKeySourceAndResponseRoundTrip) {
+  const auto key = kid("00112233445566778899aabbccddeeff");
+  const auto file = kid("0102030405060708090a0b0c0d0e0f10");
+  const auto source = kid("101112131415161718191a1b1c1d1e1f");
+
+  const std::vector<KadSearchEntry> files{KadSearchEntry{
+      .answer_id = file,
+      .tags = {string_tag(tag::filename, "ubuntu.iso"), int_tag(tag::file_size, 123456789ull)},
+  }};
+  auto key_packet = encode_kad2_publish_key_req(key, files);
+  EXPECT_EQ(key_packet.opcode, opcode::kad2_publish_key_req);
+  ASSERT_GE(key_packet.payload.size(), 34u);
+  EXPECT_EQ(std::to_integer<unsigned>(key_packet.payload[16]), 1u);
+  EXPECT_EQ(std::to_integer<unsigned>(key_packet.payload[17]), 0u);
+
+  auto key_req = decode_kad2_publish_key_req(key_packet);
+  ASSERT_TRUE(key_req.has_value());
+  EXPECT_EQ(key_req->key_id, key);
+  ASSERT_EQ(key_req->entries.size(), 1u);
+  EXPECT_EQ(key_req->entries[0].answer_id, file);
+
+  const KadSearchEntry source_entry{
+      .answer_id = source,
+      .tags = {int_tag(tag::source_type, 1), int_tag(tag::source_port, 4662),
+               int_tag(tag::source_udp_port, 4665), int_tag(tag::file_size, 123456789ull)},
+  };
+  auto source_packet = encode_kad2_publish_source_req(file, source_entry);
+  EXPECT_EQ(source_packet.opcode, opcode::kad2_publish_source_req);
+  ASSERT_GE(source_packet.payload.size(), 33u);
+
+  auto source_req = decode_kad2_publish_source_req(source_packet);
+  ASSERT_TRUE(source_req.has_value());
+  EXPECT_EQ(source_req->file_id, file);
+  EXPECT_EQ(source_req->source.answer_id, source);
+  ASSERT_EQ(source_req->source.tags.size(), 4u);
+
+  auto ack_packet = encode_kad2_publish_res(file, 7);
+  EXPECT_EQ(ack_packet.opcode, opcode::kad2_publish_res);
+  ASSERT_EQ(ack_packet.payload.size(), 17u);
+
+  auto ack = decode_kad2_publish_res(ack_packet);
+  ASSERT_TRUE(ack.has_value());
+  EXPECT_EQ(ack->target, file);
+  EXPECT_EQ(ack->load, 7u);
+}
+
+TEST(KadMessages, SearchAndPublishNotesRoundTrip) {
+  const auto file = kid("00112233445566778899aabbccddeeff");
+  const auto source = kid("0102030405060708090a0b0c0d0e0f10");
+
+  auto search_packet = encode_kad2_search_notes_req(file, 123456789ull);
+  EXPECT_EQ(search_packet.protocol, kad_protocol);
+  EXPECT_EQ(search_packet.opcode, opcode::kad2_search_notes_req);
+  ASSERT_EQ(search_packet.payload.size(), 24u);
+
+  auto search_req = decode_kad2_search_notes_req(search_packet);
+  ASSERT_TRUE(search_req.has_value());
+  EXPECT_EQ(search_req->target, file);
+  EXPECT_EQ(search_req->file_size, 123456789ull);
+
+  const KadSearchEntry note{
+      .answer_id = source,
+      .tags = {string_tag(tag::filename, "ubuntu.iso"), string_tag(tag::description, "works"),
+               int_tag(tag::file_rating, 4), int_tag(tag::file_size, 123456789ull)},
+  };
+  auto publish_packet = encode_kad2_publish_notes_req(file, note);
+  EXPECT_EQ(publish_packet.opcode, opcode::kad2_publish_notes_req);
+  ASSERT_GE(publish_packet.payload.size(), 33u);
+
+  auto publish_req = decode_kad2_publish_notes_req(publish_packet);
+  ASSERT_TRUE(publish_req.has_value());
+  EXPECT_EQ(publish_req->file_id, file);
+  EXPECT_EQ(publish_req->note.answer_id, source);
+  ASSERT_EQ(publish_req->note.tags.size(), 4u);
 }

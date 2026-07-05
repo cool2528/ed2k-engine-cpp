@@ -11,6 +11,7 @@
 #include <boost/asio/ip/udp.hpp>
 #include <tl/expected.hpp>
 
+#include "ed2k/kad/indexed.hpp"
 #include "ed2k/kad/messages.hpp"
 #include "ed2k/kad/routing_table.hpp"
 #include "ed2k/net/udp_socket.hpp"
@@ -44,6 +45,29 @@ class KadNetwork {
   boost::asio::awaitable<tl::expected<void, std::error_code>>
   bootstrap(std::span<const Contact> seeds, std::chrono::milliseconds timeout);
 
+  boost::asio::awaitable<tl::expected<KadPublishResponse, std::error_code>>
+  publish_keyword(const Contact& remote, KadID key_id, std::span<const KadSearchEntry> entries,
+                  std::chrono::milliseconds timeout);
+
+  boost::asio::awaitable<tl::expected<KadPublishResponse, std::error_code>>
+  publish_source(const Contact& remote, KadID file_id, const KadSearchEntry& source,
+                 std::chrono::milliseconds timeout);
+
+  boost::asio::awaitable<tl::expected<KadPublishResponse, std::error_code>>
+  publish_notes(const Contact& remote, KadID file_id, const KadSearchEntry& note,
+                std::chrono::milliseconds timeout);
+
+  boost::asio::awaitable<tl::expected<std::vector<KadSearchEntry>, std::error_code>>
+  search_keyword(std::span<const Contact> peers, KadID key_id, std::chrono::milliseconds timeout);
+
+  boost::asio::awaitable<tl::expected<std::vector<KadSearchEntry>, std::error_code>>
+  find_sources(std::span<const Contact> peers, KadID file_id, std::uint64_t file_size,
+               std::chrono::milliseconds timeout);
+
+  boost::asio::awaitable<tl::expected<std::vector<KadSearchEntry>, std::error_code>>
+  search_notes(std::span<const Contact> peers, KadID file_id, std::uint64_t file_size,
+               std::chrono::milliseconds timeout);
+
   boost::asio::awaitable<tl::expected<void, std::error_code>>
   serve_once(std::chrono::milliseconds timeout);
 
@@ -53,6 +77,7 @@ class KadNetwork {
   net::UdpSocket socket_;
   Contact self_;
   RoutingTable routing_;
+  KadIndexed indexed_;
 };
 
 } // namespace ed2k::kad

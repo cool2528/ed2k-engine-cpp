@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <limits>
+#include <string>
 #include <utility>
 #include <variant>
 
@@ -42,6 +43,22 @@ std::uint64_t integer_value(const codec::Tag& tag) noexcept {
   return 0;
 }
 
+std::string string_value(const codec::Tag& tag) {
+  if (const auto* value = std::get_if<std::string>(&tag.value)) {
+    return *value;
+  }
+  return {};
+}
+
+const codec::Tag* find_tag(const KadSearchEntry& entry, std::uint8_t name_id) noexcept {
+  for (const auto& tag_value : entry.tags) {
+    if (has_name_id(tag_value, name_id)) {
+      return &tag_value;
+    }
+  }
+  return nullptr;
+}
+
 tl::expected<void, std::error_code> require_packet(const net::Packet& packet, std::uint8_t opcode) {
   if (packet.protocol != kad_protocol || packet.opcode != opcode) {
     return tl::unexpected(make_error_code(errc::server_protocol_error));
@@ -74,6 +91,43 @@ void write_contact(codec::ByteWriter& writer, const Contact& contact) {
   writer.u16(contact.udp_port);
   writer.u16(contact.tcp_port);
   writer.u8(contact.version);
+}
+
+void write_tag_list(codec::ByteWriter& writer, std::span<const codec::Tag> tags) {
+  const auto count = std::min<std::size_t>(tags.size(), std::numeric_limits<std::uint8_t>::max());
+  writer.u8(static_cast<std::uint8_t>(count));
+  for (std::size_t i = 0; i < count; ++i) {
+    codec::write_tag(writer, tags[i]);
+  }
+}
+
+tl::expected<std::vector<codec::Tag>, std::error_code> read_tag_list(codec::ByteReader& reader) {
+  const auto count = reader.u8();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  return codec::read_taglist(reader, count);
+}
+
+void write_search_entry(codec::ByteWriter& writer, const KadSearchEntry& entry) {
+  writer.blob(entry.answer_id.bytes());
+  write_tag_list(writer, entry.tags);
+}
+
+tl::expected<KadSearchEntry, std::error_code> read_search_entry(codec::ByteReader& reader) {
+  auto answer = read_kad_id(reader);
+  if (!answer) {
+    return tl::unexpected(answer.error());
+  }
+  auto tags = read_tag_list(reader);
+  if (!tags) {
+    return tl::unexpected(tags.error());
+  }
+
+  KadSearchEntry entry;
+  entry.answer_id = *answer;
+  entry.tags = std::move(*tags);
+  return entry;
 }
 
 tl::expected<Contact, std::error_code> read_contact(codec::ByteReader& reader) {
@@ -253,6 +307,337 @@ tl::expected<Kad2Response, std::error_code> decode_kad2_res(const net::Packet& p
     response.contacts.push_back(*contact);
   }
   return response;
+}
+
+net::Packet encode_kad2_search_key_req(const KadID& target, std::uint16_t start_position) {
+  codec::ByteWriter writer;
+  writer.blob(target.bytes());
+  writer.u16(static_cast<std::uint16_t>(start_position & 0x7fffu));
+  return make_packet(opcode::kad2_search_key_req, writer.take());
+}
+
+tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_key_req(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_search_key_req);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto target = read_kad_id(reader);
+  if (!target) {
+    return tl::unexpected(target.error());
+  }
+  const auto start = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if ((start & 0x8000u) != 0 || reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::unsupported_version));
+  }
+
+  KadSearchRequest request;
+  request.target = *target;
+  request.start_position = static_cast<std::uint16_t>(start & 0x7fffu);
+  return request;
+}
+
+net::Packet encode_kad2_search_source_req(const KadID& target, std::uint16_t start_position,
+                                           std::uint64_t file_size) {
+  codec::ByteWriter writer;
+  writer.blob(target.bytes());
+  writer.u16(static_cast<std::uint16_t>(start_position & 0x7fffu));
+  writer.u64(file_size);
+  return make_packet(opcode::kad2_search_source_req, writer.take());
+}
+
+tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_source_req(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_search_source_req);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto target = read_kad_id(reader);
+  if (!target) {
+    return tl::unexpected(target.error());
+  }
+  KadSearchRequest request;
+  request.target = *target;
+  request.start_position = static_cast<std::uint16_t>(reader.u16() & 0x7fffu);
+  request.file_size = reader.u64();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  return request;
+}
+
+net::Packet encode_kad2_search_notes_req(const KadID& target, std::uint64_t file_size) {
+  codec::ByteWriter writer;
+  writer.blob(target.bytes());
+  writer.u64(file_size);
+  return make_packet(opcode::kad2_search_notes_req, writer.take());
+}
+
+tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_notes_req(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_search_notes_req);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto target = read_kad_id(reader);
+  if (!target) {
+    return tl::unexpected(target.error());
+  }
+  KadSearchRequest request;
+  request.target = *target;
+  request.file_size = reader.u64();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  return request;
+}
+
+net::Packet encode_kad2_search_res(const KadID& sender_id, const KadID& target,
+                                    std::span<const KadSearchEntry> entries) {
+  const auto count = std::min<std::size_t>(entries.size(), std::numeric_limits<std::uint16_t>::max());
+
+  codec::ByteWriter writer;
+  writer.blob(sender_id.bytes());
+  writer.blob(target.bytes());
+  writer.u16(static_cast<std::uint16_t>(count));
+  for (std::size_t i = 0; i < count; ++i) {
+    write_search_entry(writer, entries[i]);
+  }
+  return make_packet(opcode::kad2_search_res, writer.take());
+}
+
+tl::expected<KadSearchResponse, std::error_code> decode_kad2_search_res(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_search_res);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto sender = read_kad_id(reader);
+  if (!sender) {
+    return tl::unexpected(sender.error());
+  }
+  auto target = read_kad_id(reader);
+  if (!target) {
+    return tl::unexpected(target.error());
+  }
+  const auto count = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+
+  KadSearchResponse response;
+  response.sender_id = *sender;
+  response.target = *target;
+  response.entries.reserve(count);
+  for (std::uint16_t i = 0; i < count; ++i) {
+    auto entry = read_search_entry(reader);
+    if (!entry) {
+      return tl::unexpected(entry.error());
+    }
+    response.entries.push_back(std::move(*entry));
+  }
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  return response;
+}
+
+net::Packet encode_kad2_publish_key_req(const KadID& key_id, std::span<const KadSearchEntry> entries) {
+  const auto count = std::min<std::size_t>(entries.size(), std::numeric_limits<std::uint16_t>::max());
+
+  codec::ByteWriter writer;
+  writer.blob(key_id.bytes());
+  writer.u16(static_cast<std::uint16_t>(count));
+  for (std::size_t i = 0; i < count; ++i) {
+    write_search_entry(writer, entries[i]);
+  }
+  return make_packet(opcode::kad2_publish_key_req, writer.take());
+}
+
+tl::expected<KadPublishKeyRequest, std::error_code> decode_kad2_publish_key_req(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_publish_key_req);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto key = read_kad_id(reader);
+  if (!key) {
+    return tl::unexpected(key.error());
+  }
+  const auto count = reader.u16();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+
+  KadPublishKeyRequest request;
+  request.key_id = *key;
+  request.entries.reserve(count);
+  for (std::uint16_t i = 0; i < count; ++i) {
+    auto entry = read_search_entry(reader);
+    if (!entry) {
+      return tl::unexpected(entry.error());
+    }
+    request.entries.push_back(std::move(*entry));
+  }
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  return request;
+}
+
+net::Packet encode_kad2_publish_source_req(const KadID& file_id, const KadSearchEntry& source) {
+  codec::ByteWriter writer;
+  writer.blob(file_id.bytes());
+  write_search_entry(writer, source);
+  return make_packet(opcode::kad2_publish_source_req, writer.take());
+}
+
+tl::expected<KadPublishSourceRequest, std::error_code> decode_kad2_publish_source_req(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_publish_source_req);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto file = read_kad_id(reader);
+  if (!file) {
+    return tl::unexpected(file.error());
+  }
+  auto source = read_search_entry(reader);
+  if (!source) {
+    return tl::unexpected(source.error());
+  }
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+
+  KadPublishSourceRequest request;
+  request.file_id = *file;
+  request.source = std::move(*source);
+  return request;
+}
+
+net::Packet encode_kad2_publish_notes_req(const KadID& file_id, const KadSearchEntry& note) {
+  codec::ByteWriter writer;
+  writer.blob(file_id.bytes());
+  write_search_entry(writer, note);
+  return make_packet(opcode::kad2_publish_notes_req, writer.take());
+}
+
+tl::expected<KadPublishNotesRequest, std::error_code> decode_kad2_publish_notes_req(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_publish_notes_req);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto file = read_kad_id(reader);
+  if (!file) {
+    return tl::unexpected(file.error());
+  }
+  auto note = read_search_entry(reader);
+  if (!note) {
+    return tl::unexpected(note.error());
+  }
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+
+  KadPublishNotesRequest request;
+  request.file_id = *file;
+  request.note = std::move(*note);
+  return request;
+}
+
+net::Packet encode_kad2_publish_res(const KadID& target, std::uint8_t load) {
+  codec::ByteWriter writer;
+  writer.blob(target.bytes());
+  writer.u8(load);
+  return make_packet(opcode::kad2_publish_res, writer.take());
+}
+
+tl::expected<KadPublishResponse, std::error_code> decode_kad2_publish_res(const net::Packet& packet) {
+  auto ok = require_packet(packet, opcode::kad2_publish_res);
+  if (!ok) {
+    return tl::unexpected(ok.error());
+  }
+
+  codec::ByteReader reader(packet.payload);
+  auto target = read_kad_id(reader);
+  if (!target) {
+    return tl::unexpected(target.error());
+  }
+  KadPublishResponse response;
+  response.target = *target;
+  response.load = reader.u8();
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() > 0) {
+    const auto options = reader.u8();
+    response.requests_ack = (options & 0x01u) != 0;
+  }
+  if (!reader.ok()) {
+    return tl::unexpected(make_error_code(errc::buffer_underflow));
+  }
+  if (reader.remaining() != 0) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  return response;
+}
+
+std::string file_name(const KadSearchEntry& entry) {
+  if (const auto* tag_value = find_tag(entry, tag::filename)) {
+    return string_value(*tag_value);
+  }
+  return {};
+}
+
+std::uint64_t file_size(const KadSearchEntry& entry) noexcept {
+  if (const auto* tag_value = find_tag(entry, tag::file_size)) {
+    return integer_value(*tag_value);
+  }
+  return 0;
+}
+
+std::uint16_t source_tcp_port(const KadSearchEntry& entry) noexcept {
+  if (const auto* tag_value = find_tag(entry, tag::source_port)) {
+    return static_cast<std::uint16_t>(integer_value(*tag_value));
+  }
+  return 0;
+}
+
+std::uint16_t source_udp_port(const KadSearchEntry& entry) noexcept {
+  if (const auto* tag_value = find_tag(entry, tag::source_udp_port)) {
+    return static_cast<std::uint16_t>(integer_value(*tag_value));
+  }
+  return 0;
 }
 
 } // namespace ed2k::kad

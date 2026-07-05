@@ -2,11 +2,13 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <system_error>
 #include <vector>
 
 #include <tl/expected.hpp>
 
+#include "ed2k/codec/tag.hpp"
 #include "ed2k/kad/routing_table.hpp"
 #include "ed2k/net/packet.hpp"
 
@@ -16,6 +18,19 @@ inline constexpr std::uint8_t kad_protocol = 0xE4;
 inline constexpr std::uint8_t kad_packed_protocol = 0xE5;
 inline constexpr std::uint8_t kad2_version = 0x08;
 
+namespace tag {
+inline constexpr std::uint8_t filename = 0x01;
+inline constexpr std::uint8_t file_size = 0x02;
+inline constexpr std::uint8_t file_type = 0x03;
+inline constexpr std::uint8_t description = 0x0B;
+inline constexpr std::uint8_t sources = 0x15;
+inline constexpr std::uint8_t file_rating = 0xF7;
+inline constexpr std::uint8_t source_udp_port = 0xFC;
+inline constexpr std::uint8_t source_port = 0xFD;
+inline constexpr std::uint8_t source_ip = 0xFE;
+inline constexpr std::uint8_t source_type = 0xFF;
+} // namespace tag
+
 namespace opcode {
 inline constexpr std::uint8_t kad2_bootstrap_req = 0x01;
 inline constexpr std::uint8_t kad2_bootstrap_res = 0x09;
@@ -24,6 +39,15 @@ inline constexpr std::uint8_t kad2_hello_res = 0x19;
 inline constexpr std::uint8_t kad2_req = 0x21;
 inline constexpr std::uint8_t kad2_hello_res_ack = 0x22;
 inline constexpr std::uint8_t kad2_res = 0x29;
+inline constexpr std::uint8_t kad2_search_key_req = 0x33;
+inline constexpr std::uint8_t kad2_search_source_req = 0x34;
+inline constexpr std::uint8_t kad2_search_notes_req = 0x35;
+inline constexpr std::uint8_t kad2_search_res = 0x3B;
+inline constexpr std::uint8_t kad2_publish_key_req = 0x43;
+inline constexpr std::uint8_t kad2_publish_source_req = 0x44;
+inline constexpr std::uint8_t kad2_publish_notes_req = 0x45;
+inline constexpr std::uint8_t kad2_publish_res = 0x4B;
+inline constexpr std::uint8_t kad2_publish_res_ack = 0x4C;
 } // namespace opcode
 
 struct Kad2Request {
@@ -37,6 +61,44 @@ struct Kad2Response {
   std::vector<Contact> contacts;
 };
 
+struct KadSearchRequest {
+  KadID target;
+  std::uint16_t start_position = 0;
+  std::uint64_t file_size = 0;
+};
+
+struct KadSearchEntry {
+  KadID answer_id;
+  std::vector<codec::Tag> tags;
+};
+
+struct KadSearchResponse {
+  KadID sender_id;
+  KadID target;
+  std::vector<KadSearchEntry> entries;
+};
+
+struct KadPublishKeyRequest {
+  KadID key_id;
+  std::vector<KadSearchEntry> entries;
+};
+
+struct KadPublishSourceRequest {
+  KadID file_id;
+  KadSearchEntry source;
+};
+
+struct KadPublishNotesRequest {
+  KadID file_id;
+  KadSearchEntry note;
+};
+
+struct KadPublishResponse {
+  KadID target;
+  std::uint8_t load = 0;
+  bool requests_ack = false;
+};
+
 net::Packet encode_kad2_hello_req(const Contact& self);
 net::Packet encode_kad2_hello_res(const Contact& self);
 tl::expected<Contact, std::error_code> decode_kad2_hello(const net::Packet& packet,
@@ -48,5 +110,36 @@ tl::expected<Kad2Request, std::error_code> decode_kad2_req(const net::Packet& pa
 
 net::Packet encode_kad2_res(const KadID& target, std::span<const Contact> contacts);
 tl::expected<Kad2Response, std::error_code> decode_kad2_res(const net::Packet& packet);
+
+net::Packet encode_kad2_search_key_req(const KadID& target, std::uint16_t start_position);
+tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_key_req(const net::Packet& packet);
+
+net::Packet encode_kad2_search_source_req(const KadID& target, std::uint16_t start_position,
+                                           std::uint64_t file_size);
+tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_source_req(const net::Packet& packet);
+
+net::Packet encode_kad2_search_notes_req(const KadID& target, std::uint64_t file_size);
+tl::expected<KadSearchRequest, std::error_code> decode_kad2_search_notes_req(const net::Packet& packet);
+
+net::Packet encode_kad2_search_res(const KadID& sender_id, const KadID& target,
+                                    std::span<const KadSearchEntry> entries);
+tl::expected<KadSearchResponse, std::error_code> decode_kad2_search_res(const net::Packet& packet);
+
+net::Packet encode_kad2_publish_key_req(const KadID& key_id, std::span<const KadSearchEntry> entries);
+tl::expected<KadPublishKeyRequest, std::error_code> decode_kad2_publish_key_req(const net::Packet& packet);
+
+net::Packet encode_kad2_publish_source_req(const KadID& file_id, const KadSearchEntry& source);
+tl::expected<KadPublishSourceRequest, std::error_code> decode_kad2_publish_source_req(const net::Packet& packet);
+
+net::Packet encode_kad2_publish_notes_req(const KadID& file_id, const KadSearchEntry& note);
+tl::expected<KadPublishNotesRequest, std::error_code> decode_kad2_publish_notes_req(const net::Packet& packet);
+
+net::Packet encode_kad2_publish_res(const KadID& target, std::uint8_t load);
+tl::expected<KadPublishResponse, std::error_code> decode_kad2_publish_res(const net::Packet& packet);
+
+std::string file_name(const KadSearchEntry& entry);
+std::uint64_t file_size(const KadSearchEntry& entry) noexcept;
+std::uint16_t source_tcp_port(const KadSearchEntry& entry) noexcept;
+std::uint16_t source_udp_port(const KadSearchEntry& entry) noexcept;
 
 } // namespace ed2k::kad
