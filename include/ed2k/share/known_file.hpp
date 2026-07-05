@@ -8,6 +8,7 @@
 #include <tl/expected.hpp>
 #include "ed2k/core/hash.hpp"
 #include "ed2k/metfile/known_part_met.hpp"
+#include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/util/error.hpp"
 
 namespace ed2k::share {
@@ -22,6 +23,7 @@ struct KnownFile {
   std::uint32_t date = 0;
   std::uint8_t rating = 0;
   std::string comment;
+  std::vector<ed2k::peer::PeerSource> sources;
   auto operator<=>(const KnownFile&) const = default;
 };
 

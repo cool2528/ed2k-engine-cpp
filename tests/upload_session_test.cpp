@@ -584,6 +584,57 @@ TEST(UploadSession, AnswersRequestSources2WithEmptySourceList){
   });
 }
 
+TEST(UploadSession, AnswersRequestSources2WithKnownSources){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "shared.bin";
+  f.size = 1;
+  f.sources.push_back({
+    0x0100007Fu,
+    4662,
+    0x0200007Fu,
+    4661,
+    *UserHash::from_hex("11111111111111111111111111111111"),
+    0x03
+  });
+  db.add(f);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor());
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    EXPECT_EQ((co_await read_packet(s)).opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::REQUESTSOURCES2, encode_request_sources2(f.hash), ed2k::net::proto::eMule);
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.protocol, ed2k::net::proto::eMule);
+    EXPECT_EQ(ans.opcode, op::ANSWERSOURCES2);
+    auto decoded = decode_answer_sources2(ans.payload);
+    EXPECT_TRUE(decoded.has_value()); if(!decoded) co_return;
+    EXPECT_EQ(decoded->hash, f.hash);
+    EXPECT_EQ(decoded->sources.size(), 1u);
+    if(decoded->sources.size() != 1u) co_return;
+    EXPECT_EQ(decoded->sources[0].client_id, 0x0100007Fu);
+    EXPECT_EQ(decoded->sources[0].port, 4662u);
+    EXPECT_EQ(decoded->sources[0].server_ip, 0x0200007Fu);
+    EXPECT_EQ(decoded->sources[0].server_port, 4661u);
+    EXPECT_EQ(decoded->sources[0].user_hash, *UserHash::from_hex("11111111111111111111111111111111"));
+    EXPECT_EQ(decoded->sources[0].crypt_options, 0x03u);
+    s.close();
+    co_return;
+  });
+}
+
 TEST(UploadSession, StoresFileDescForCurrentRequestedFile){
   ed2k::net::IoRuntime rt;
   KnownFileDB db;

@@ -62,6 +62,7 @@ struct PeerSource {
   std::uint16_t server_port=0;
   UserHash user_hash;
   std::uint8_t crypt_options=0;
+  auto operator<=>(const PeerSource&) const = default;
 };
 struct SourceExchangeAnswer { std::uint8_t version=0; FileHash hash; std::vector<PeerSource> sources; };
 struct FileDesc { std::uint8_t rating=0; std::string comment; };

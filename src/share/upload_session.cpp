@@ -195,7 +195,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     ed2k::net::Packet ans;
     ans.protocol = ed2k::net::proto::eMule;
     ans.opcode = ed2k::peer::op::ANSWERSOURCES2;
-    ans.payload = ed2k::peer::encode_answer_sources2(file->hash, {});
+    ans.payload = ed2k::peer::encode_answer_sources2(file->hash, file->sources);
     co_return co_await conn_.send(ans);
   }
 
