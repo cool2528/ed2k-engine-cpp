@@ -48,6 +48,15 @@ struct IPv4 {
 }
 template<> struct std::hash<ed2k::MD4Hash> {
   std::size_t operator()(const ed2k::MD4Hash& h) const noexcept {
-    std::size_t s=0; for(auto b:h.bytes()) s=s*131+std::to_integer<unsigned>(b); return s;
+    std::uint64_t s = 14695981039346656037ull;
+    for(auto b : h.bytes()) {
+      s ^= std::to_integer<std::uint8_t>(b);
+      s *= 1099511628211ull;
+    }
+    if constexpr(sizeof(std::size_t) < sizeof(std::uint64_t)) {
+      return static_cast<std::size_t>(s ^ (s >> 32));
+    } else {
+      return static_cast<std::size_t>(s);
+    }
   }
 };

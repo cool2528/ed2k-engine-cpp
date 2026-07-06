@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <functional>
 #include <utility>
 #include "ed2k/core/hash.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
@@ -33,6 +34,15 @@ TEST(MD4Hash, HexRoundTrip){
 TEST(MD4Hash, RejectsBadHex){
   EXPECT_FALSE(MD4Hash::from_hex("xyz").has_value());
   EXPECT_FALSE(MD4Hash::from_hex("31d6").has_value()); // 长度不足
+}
+TEST(MD4Hash, HashSeparatesWeakPolynomialCollision){
+  std::array<std::byte,16> a{};
+  std::array<std::byte,16> b{};
+  a[1] = std::byte{131};
+  b[0] = std::byte{1};
+  ASSERT_NE(a, b);
+  EXPECT_NE(std::hash<MD4Hash>{}(MD4Hash::from_bytes(a)),
+            std::hash<MD4Hash>{}(MD4Hash::from_bytes(b)));
 }
 TEST(AICHHash, Base32RoundTrip){
   std::array<std::byte,20> raw{}; for(int i=0;i<20;++i) raw[i]=std::byte(i);

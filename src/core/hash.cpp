@@ -1,5 +1,7 @@
 #include "ed2k/core/hash.hpp"
 #include <cstdio>
+#include <format>
+#include <iterator>
 namespace ed2k {
 namespace {
 int hexval(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10;
@@ -14,8 +16,9 @@ tl::expected<MD4Hash,std::error_code> MD4Hash::from_hex(std::string_view s){
   return MD4Hash::from_bytes(out);
 }
 std::string MD4Hash::to_hex() const {
-  static const char* k="0123456789abcdef"; std::string s; s.reserve(32);
-  for(auto b:b_){auto v=std::to_integer<unsigned>(b); s+=k[v>>4]; s+=k[v&15];} return s;
+  std::string s; s.reserve(32);
+  for(auto b:b_) std::format_to(std::back_inserter(s), "{:02x}", std::to_integer<unsigned>(b));
+  return s;
 }
 namespace {
 const char* B32="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -45,7 +48,6 @@ tl::expected<IPv4,std::error_code> IPv4::from_dotted(std::string_view s){
   return IPv4::from_host((a<<24)|(b<<16)|(c<<8)|d);
 }
 std::string IPv4::to_dotted() const {
-  char buf[16]; std::snprintf(buf,sizeof buf,"%u.%u.%u.%u",
-    (value_>>24)&0xff,(value_>>16)&0xff,(value_>>8)&0xff,value_&0xff); return buf;
+  return std::format("{}.{}.{}.{}", (value_>>24)&0xff, (value_>>16)&0xff, (value_>>8)&0xff, value_&0xff);
 }
 }

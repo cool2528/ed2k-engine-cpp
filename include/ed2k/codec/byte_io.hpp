@@ -1,5 +1,7 @@
 #pragma once
+#include <concepts>
 #include <cstdint>
+#include <iterator>
 #include <span>
 #include <string>
 #include <string_view>
@@ -7,11 +9,19 @@
 #include <array>
 #include "ed2k/core/hash.hpp"
 namespace ed2k::codec {
+template<class T>
+concept ByteRange = requires(const T& t) {
+  { std::data(t) } -> std::convertible_to<const std::byte*>;
+  { std::size(t) } -> std::convertible_to<std::size_t>;
+};
+
 class ByteReader {
   std::span<const std::byte> buf_; std::size_t pos_=0; bool ok_=true;
   bool need(std::size_t n) noexcept { if(!ok_||pos_+n>buf_.size()){ ok_=false; return false;} return true; }
  public:
   explicit ByteReader(std::span<const std::byte> b) noexcept :buf_(b){}
+  template<ByteRange R>
+  explicit ByteReader(const R& b) noexcept : ByteReader(std::span<const std::byte>(std::data(b), std::size(b))) {}
   [[nodiscard]] bool ok() const noexcept { return ok_; }
   [[nodiscard]] std::size_t remaining() const noexcept { return ok_? buf_.size()-pos_ : 0; }
   [[nodiscard]] std::size_t pos() const noexcept { return pos_; }
@@ -46,6 +56,8 @@ class ByteWriter {
   void hash16(const MD4Hash& h){ for(auto b:h.bytes()) out_.push_back(b); }
   void hash20(std::span<const std::byte,20> h){ for(auto b:h) out_.push_back(b); }
   void blob(std::span<const std::byte> b){ for(auto x:b) out_.push_back(x); }
+  template<ByteRange R>
+  void blob(const R& b){ blob(std::span<const std::byte>(std::data(b), std::size(b))); }
   std::vector<std::byte> take(){ return std::move(out_); }
 };
 }

@@ -1,9 +1,15 @@
 #include <gtest/gtest.h>
+#include <span>
 #include <type_traits>
 #include <utility>
+#include <vector>
 #include "ed2k/codec/byte_io.hpp"
 using namespace ed2k; using namespace ed2k::codec;
 
+static_assert(ByteRange<std::vector<std::byte>>);
+static_assert(ByteRange<std::array<std::byte,4>>);
+static_assert(ByteRange<std::span<const std::byte>>);
+static_assert(!ByteRange<std::vector<std::uint8_t>>);
 static_assert(noexcept(std::declval<const ByteReader&>().ok()));
 static_assert(noexcept(std::declval<const ByteReader&>().remaining()));
 static_assert(noexcept(std::declval<const ByteReader&>().pos()));
@@ -33,4 +39,14 @@ TEST(ByteIO, UnderflowSetsNotOk){
   (void)r.u32();               // 越界
   EXPECT_FALSE(r.ok());
   EXPECT_EQ(r.u8(),0u);        // 出错后空转返回 0
+}
+TEST(ByteIO, ByteRangeOverloadsAcceptStdByteContainers){
+  std::vector<std::byte> payload{std::byte{0x34}, std::byte{0x12}, std::byte{0xAB}};
+  ByteReader r(payload);
+  EXPECT_EQ(r.u16(), 0x1234u);
+  EXPECT_EQ(r.u8(), 0xABu);
+
+  ByteWriter w;
+  w.blob(payload);
+  EXPECT_EQ(w.take(), payload);
 }
