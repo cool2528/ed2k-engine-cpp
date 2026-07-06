@@ -46,6 +46,108 @@ std::optional<server::SourceEndpoint> endpoint_from_kad_source(const kad::KadSea
   }
   return server::SourceEndpoint{ipv4_to_wire(*ip), tcp_port};
 }
+
+peer::HelloInfo default_hello() {
+  peer::HelloInfo mine;
+  mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  mine.nickname = "ed2k";
+  mine.version = 0x3C;
+  mine.port = 4662;
+  return mine;
+}
+
+std::size_t data_part_count(std::uint64_t size) noexcept {
+  return static_cast<std::size_t>((size + PART_SIZE - 1) / PART_SIZE);
+}
+
+std::vector<bool> normalize_file_status_parts(std::vector<bool> parts, std::uint64_t size) {
+  // aMule 对完整共享文件发 FILESTATUS count=0 (无 part 位图): ClientTCPSocket.cpp OP_SETREQFILEID
+  // 处理 `if(reqfile->IsPartFile()) WritePartStatus else WriteUInt16(0)`。语义 = 对端拥有整文件
+  // (所有 part 可用), 不是 "0 part"。非空位图 (PartFile 不完整源) 按实际 have-part 过滤。
+  if(parts.empty()) parts.assign(data_part_count(size), true);
+  return parts;
+}
+
+boost::asio::awaitable<tl::expected<void,std::error_code>>
+connect_and_handshake_phase(peer::C2CConnection& conn,
+                            const server::SourceEndpoint& source,
+                            std::chrono::milliseconds timeout) {
+  IPv4 ip = IPv4::from_wire(source.id);
+  auto cr = co_await conn.connect(ip, source.port, timeout);
+  if(!cr) co_return tl::unexpected(cr.error());
+  auto hr = co_await conn.handshake(default_hello(), timeout);
+  if(!hr) co_return tl::unexpected(hr.error());
+  co_return tl::expected<void,std::error_code>{};
+}
+
+struct FileSetup {
+  std::vector<PartHash> part_hashes;
+  std::vector<bool> peer_parts;
+};
+
+boost::asio::awaitable<tl::expected<FileSetup,std::error_code>>
+fetch_hashset_phase(peer::C2CConnection& conn,
+                    const FileHash& hash,
+                    std::uint64_t size,
+                    std::chrono::milliseconds timeout) {
+  auto fs = co_await conn.request_file(hash, timeout);
+  if(!fs) co_return tl::unexpected(fs.error());
+  // 单 part 文件跳过 hashset (aMule 不应答); 传空 part_hashes, PartFile 自合成 {file_hash}。
+  std::vector<PartHash> part_hashes;
+  if(size > PART_SIZE){
+    auto hs = co_await conn.request_hashset(hash, timeout);
+    if(!hs) co_return tl::unexpected(hs.error());
+    part_hashes = std::move(*hs);
+  }
+  co_return FileSetup{std::move(part_hashes), normalize_file_status_parts(std::move(fs->parts), size)};
+}
+
+boost::asio::awaitable<tl::expected<void,std::error_code>>
+start_upload_phase(peer::C2CConnection& conn,
+                   const FileHash& hash,
+                   std::chrono::milliseconds timeout) {
+  (void)co_await conn.request_filename(hash, timeout);   // 文件名可选,忽略失败
+  auto up = co_await conn.start_upload(hash, timeout);
+  if(!up) co_return tl::unexpected(up.error());
+  co_return tl::expected<void,std::error_code>{};
+}
+
+boost::asio::awaitable<tl::expected<void,std::error_code>>
+dispatch_blocks_phase(peer::C2CConnection& conn,
+                      PartFile& pf,
+                      const FileHash& hash,
+                      std::uint64_t size,
+                      std::vector<bool> peer_parts,
+                      std::chrono::milliseconds timeout) {
+  auto missing = pf.missing_parts_peer_has(peer_parts);
+  // 缺失 part 位图: 用于跳过对端没有 / 已完成的 part。
+  std::vector<bool> need_part(data_part_count(size), false);
+  for(std::uint32_t p : missing) need_part[p] = true;
+  // per-part 块迭代: 块绝不跨 part 边界, 与 aMule 两级树 per-part 叶序一致。
+  std::size_t np = data_part_count(size);
+  for(std::size_t p=0; p<np; ++p){
+    if(p >= need_part.size() || !need_part[p]) continue;
+    std::uint64_t pstart = static_cast<std::uint64_t>(p) * PART_SIZE;
+    std::uint64_t plen = std::min(PART_SIZE, size - pstart);
+    std::size_t nb = static_cast<std::size_t>((plen + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+    for(std::size_t b=0; b<nb; ++b){
+      if(pf.is_block_done(p, b)) continue;
+      std::uint64_t start = pstart + static_cast<std::uint64_t>(b) * AICH_BLOCK_SIZE;
+      std::uint64_t end = std::min(start + AICH_BLOCK_SIZE, pstart + plen);
+      auto blocks = co_await conn.request_blocks(hash,
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start),0,0},
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end),0,0},
+        timeout);
+      if(!blocks) co_return tl::unexpected(blocks.error());
+      if(blocks->empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
+      for(auto& b2 : *blocks){
+        auto w = pf.write_block(b2.start, b2.end, b2.data);
+        if(!w) co_return tl::unexpected(w.error());
+      }
+    }
+  }
+  co_return tl::expected<void,std::error_code>{};
+}
 } // namespace
 
 Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
@@ -61,62 +163,16 @@ void Download::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std:
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 Download::run(std::chrono::milliseconds timeout){
   conn_.set_ip_filter(ip_filter_, ip_filter_level_);
-  IPv4 ip = IPv4::from_wire(source_.id);
-  auto cr = co_await conn_.connect(ip, source_.port, timeout);
-  if(!cr) co_return tl::unexpected(cr.error());
-  ed2k::peer::HelloInfo mine;
-  mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
-  mine.nickname = "ed2k"; mine.version = 0x3C; mine.port = 4662;
-  auto hr = co_await conn_.handshake(mine, timeout);
-  if(!hr) co_return tl::unexpected(hr.error());
-  auto fs = co_await conn_.request_file(hash_, timeout);
-  if(!fs) co_return tl::unexpected(fs.error());
-  // 单 part 文件跳过 hashset (aMule 不应答); 传空 part_hashes, PartFile 自合成 {file_hash}。
-  std::vector<PartHash> part_hashes;
-  if(size_ > PART_SIZE){
-    auto hs = co_await conn_.request_hashset(hash_, timeout);
-    if(!hs) co_return tl::unexpected(hs.error());
-    part_hashes = std::move(*hs);
-  }
-  PartFile pf(out_, size_, hash_, std::move(part_hashes));
-  (void)co_await conn_.request_filename(hash_, timeout);   // 文件名可选,忽略失败
-  auto up = co_await conn_.start_upload(hash_, timeout);
-  if(!up) co_return tl::unexpected(up.error());
-  // aMule 对完整共享文件发 FILESTATUS count=0 (无 part 位图): ClientTCPSocket.cpp OP_SETREQFILEID
-  // 处理 `if(reqfile->IsPartFile()) WritePartStatus else WriteUInt16(0)`。语义 = 对端拥有整文件
-  // (所有 part 可用), 不是 "0 part"。故 fs->parts 空 (count=0) 时视为全部 part 可用;
-  // 非空 (PartFile 不完整源发真实位图) 按位图过滤。单 part 文件 num_parts=1, 同此规则覆盖。
-  std::vector<bool> peer_parts = fs->parts;
-  if(peer_parts.empty()){
-    peer_parts.assign(static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE), true);
-  }
-  auto missing = pf.missing_parts_peer_has(peer_parts);
-  // 缺失 part 位图: 用于跳过对端没有 / 已完成的 part。
-  std::vector<bool> need_part(static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE), false);
-  for(std::uint32_t p : missing) need_part[p] = true;
-  // per-part 块迭代: 块绝不跨 part 边界, 与 aMule 两级树 per-part 叶序一致。
-  std::size_t np = static_cast<std::size_t>((size_ + PART_SIZE - 1) / PART_SIZE);
-  for(std::size_t p=0; p<np; ++p){
-    if(p >= need_part.size() || !need_part[p]) continue;
-    std::uint64_t pstart = static_cast<std::uint64_t>(p) * PART_SIZE;
-    std::uint64_t plen = std::min(PART_SIZE, size_ - pstart);
-    std::size_t nb = static_cast<std::size_t>((plen + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
-    for(std::size_t b=0; b<nb; ++b){
-      if(pf.is_block_done(p, b)) continue;
-      std::uint64_t start = pstart + static_cast<std::uint64_t>(b) * AICH_BLOCK_SIZE;
-      std::uint64_t end = std::min(start + AICH_BLOCK_SIZE, pstart + plen);
-      auto blocks = co_await conn_.request_blocks(hash_,
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start),0,0},
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end),0,0},
-        timeout);
-      if(!blocks) co_return tl::unexpected(blocks.error());
-      if(blocks->empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
-      for(auto& b2 : *blocks){
-        auto w = pf.write_block(b2.start, b2.end, b2.data);
-        if(!w) co_return tl::unexpected(w.error());
-      }
-    }
-  }
+  auto connected = co_await connect_and_handshake_phase(conn_, source_, timeout);
+  if(!connected) co_return tl::unexpected(connected.error());
+  auto setup = co_await fetch_hashset_phase(conn_, hash_, size_, timeout);
+  if(!setup) co_return tl::unexpected(setup.error());
+  PartFile pf(out_, size_, hash_, std::move(setup->part_hashes));
+  auto upload = co_await start_upload_phase(conn_, hash_, timeout);
+  if(!upload) co_return tl::unexpected(upload.error());
+  auto dispatched = co_await dispatch_blocks_phase(conn_, pf, hash_, size_,
+                                                   std::move(setup->peer_parts), timeout);
+  if(!dispatched) co_return tl::unexpected(dispatched.error());
   if(!pf.complete()) co_return tl::unexpected(make_error_code(errc::io_error));
   co_return tl::expected<void,std::error_code>{};
 }
@@ -183,12 +239,9 @@ fetch_hashset(boost::asio::any_io_executor ex,
     conn_opt.emplace(std::move(c));
     accepted = false;
   }
-  ed2k::peer::HelloInfo mine;
-  mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
-  mine.nickname = "ed2k"; mine.version = 0x3C; mine.port = 4662;
   tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
-  if(accepted) hr = co_await conn_opt->handshake_acceptor(mine, timeout);
-  else         hr = co_await conn_opt->handshake(mine, timeout);
+  if(accepted) hr = co_await conn_opt->handshake_acceptor(default_hello(), timeout);
+  else         hr = co_await conn_opt->handshake(default_hello(), timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
@@ -247,6 +300,139 @@ struct SharedState {
 // 单网络线程无竞争)。对照 boost asio experimental::channel 文档示例。
 using ResultCh = boost::asio::experimental::channel<void(boost::system::error_code, int)>;
 
+struct PeerSetup {
+  ed2k::peer::C2CConnection conn;
+  std::vector<bool> fs_parts;
+};
+
+static boost::asio::awaitable<tl::expected<PeerSetup,std::error_code>>
+setup_source_phase(boost::asio::any_io_executor ex,
+                   const ed2k::server::SourceEndpoint& source,
+                   std::optional<ed2k::peer::C2CConnection> pre_conn,
+                   std::vector<bool> pre_parts,
+                   const FileHash& hash,
+                   std::uint64_t size,
+                   std::chrono::milliseconds timeout,
+                   std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
+                   std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
+                   std::shared_ptr<const infra::IPFilter> ip_filter,
+                   std::uint8_t ip_filter_level) {
+  if(pre_conn.has_value()){
+    // 复用 setup 连接 (已 HELLO+SETREQFILEID; 多 part 还含 HASHSETREQUEST); 直接进 REQUESTFILENAME。
+    co_return PeerSetup{std::move(*pre_conn), std::move(pre_parts)};
+  }
+
+  bool accepted = false;
+  std::optional<ed2k::peer::C2CConnection> conn_opt;
+  if(source.low_id()){
+    if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
+    auto cb = co_await server_conn->get().callback_request(source.id, timeout);
+    if(!cb) co_return tl::unexpected(cb.error());
+    auto acc = co_await listener->get().accept(timeout);
+    if(!acc) co_return tl::unexpected(acc.error());
+    conn_opt.emplace(std::move(*acc));
+    accepted = true;
+  } else {
+    ed2k::peer::C2CConnection c(ex);
+    c.set_ip_filter(ip_filter, ip_filter_level);
+    auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
+    if(!cr) co_return tl::unexpected(cr.error());
+    conn_opt.emplace(std::move(c));
+    accepted = false;
+  }
+
+  tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
+  if(accepted) hr = co_await conn_opt->handshake_acceptor(default_hello(), timeout);
+  else         hr = co_await conn_opt->handshake(default_hello(), timeout);
+  if(!hr) co_return tl::unexpected(hr.error());
+  auto fs = co_await conn_opt->request_file(hash, timeout);
+  if(!fs) co_return tl::unexpected(fs.error());
+  // 单 part 文件跳过 hashset (aMule 不应答); 多 part 文件仍请求 (mock 序列要求, 结果丢弃)。
+  if(size > PART_SIZE){
+    auto hs = co_await conn_opt->request_hashset(hash, timeout);
+    if(!hs) co_return tl::unexpected(hs.error());
+  }
+  co_return PeerSetup{std::move(*conn_opt), std::move(fs->parts)};
+}
+
+static boost::asio::awaitable<bool>
+negotiate_aich_phase(ed2k::peer::C2CConnection& conn,
+                     SharedState& st,
+                     std::chrono::milliseconds timeout) {
+  // M4c: AICH master-hash 协商 + 降级 (per-worker)。匹配才启用两级 verify_block;
+  // 不匹配/不支持 AICH → 降级无 AICH 下载 (part-hash MD4 仍兜底)。
+  if(!st.aich.has_value()) co_return false;
+  auto mh = co_await conn.request_aich_master_hash(st.hash, timeout);
+  co_return mh && *mh == *st.aich;
+}
+
+static boost::asio::awaitable<tl::expected<void,std::error_code>>
+pull_blocks_phase(ed2k::peer::C2CConnection& conn,
+                  SharedState& st,
+                  std::vector<bool> fs_parts,
+                  bool aich_active,
+                  std::chrono::milliseconds timeout,
+                  std::size_t max_retries) {
+  // servable = 对端可服务 part 集合 (初始 = FILESTATUS), 空响应时收缩 (防部分 part 死循环)。
+  std::vector<bool> servable = normalize_file_status_parts(std::move(fs_parts), st.size);
+  bool large_file = st.size > (std::uint64_t(1) << 32);
+  std::size_t retry = 0;
+  while(!st.alloc.complete()){
+    if(st.complete) break;
+    auto nb = st.alloc.next_block_for_parts(servable);
+    if(!nb){
+      // 无对端可服务块 = 源耗尽。若已完成 → 成功退出; 仅剩我一人且未完成 → io_error;
+      // 否则正常退出, 余块由兄弟 worker 处理。
+      if(st.complete) co_return tl::expected<void,std::error_code>{};
+      if(st.active_workers <= 1) co_return tl::unexpected(make_error_code(errc::io_error));
+      co_return tl::expected<void,std::error_code>{};
+    }
+    auto [part_index, block_in_part, start_byte, end_byte] = *nb;
+
+    std::vector<ed2k::peer::Block> blocks;
+    if(large_file){
+      auto r = co_await conn.request_blocks_i64(st.hash,
+        std::array<std::uint64_t,3>{start_byte,0,0}, std::array<std::uint64_t,3>{end_byte,0,0}, timeout);
+      if(!r){ st.alloc.requeue_block(part_index, block_in_part); co_return tl::unexpected(r.error()); }
+      blocks = std::move(*r);
+    } else {
+      auto r = co_await conn.request_blocks(st.hash,
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start_byte),0,0},
+        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end_byte),0,0}, timeout);
+      if(!r){ st.alloc.requeue_block(part_index, block_in_part); co_return tl::unexpected(r.error()); }
+      blocks = std::move(*r);
+    }
+    if(blocks.empty()){
+      // 对端声称有该 part 但未供块 (部分 part) → 标该 part 不可服务 + requeue, 试别块。
+      servable[part_index] = false;
+      st.alloc.requeue_block(part_index, block_in_part);
+      continue;
+    }
+
+    for(auto& b : blocks){
+      // C2 先验证后写入: AICH 启用时先拉 proof + verify_block, 通过才写盘;
+      // 校验失败 requeue 同源重试, 超 max_retries 返回 block_corrupt 让该源退出 (块回队列, 他源可取)。
+      if(aich_active){
+        auto rd = co_await conn.request_aich_proof(st.hash, *st.aich,
+                                                   static_cast<std::uint16_t>(part_index), timeout);
+        bool ok = false;
+        if(rd) ok = st.checker->verify_block(part_index, block_in_part, b.data,
+                                             std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
+        if(!ok){
+          st.alloc.requeue_block(part_index, block_in_part);
+          if(++retry > max_retries) co_return tl::unexpected(make_error_code(errc::block_corrupt));
+          break;   // 同源重下该块 (next_block_for_parts 会再取到 requeue 的块或下一可服务块)
+        }
+      }
+      auto w = co_await st.pf.write_block_async(b.start, b.end, b.data, st.disk_ex);
+      if(!w){ st.alloc.requeue_block(part_index, block_in_part); co_return tl::unexpected(w.error()); }
+      if(st.alloc.mark_block_done(part_index, block_in_part)){ st.mark_complete(); break; }
+      retry = 0;   // 成功一块, 重置同源重试计数
+    }
+  }
+  co_return tl::expected<void,std::error_code>{};
+}
+
 // raccoon worker: 连接 source → (复用 setup 连接或全新连接) → start_upload → AICH master
 // 协商 (per-worker) → 按 next_block_for_parts(has_part) 取块 (仅请求对端有该 part 的块) →
 // request_blocks → AICH verify (若启用) → write_block → mark_done。源耗尽 (无对端可服务块)
@@ -269,125 +455,16 @@ peer_worker(boost::asio::any_io_executor ex,
     done_ch.try_send(boost::system::error_code{}, 0);   // capacity=N, 永不阻塞; 纯完成信号
   };
 
-  std::optional<ed2k::peer::C2CConnection> conn_opt;
-  std::vector<bool> fs_parts;
-  if(pre_conn.has_value()){
-    // 复用 setup 连接 (已 HELLO+SETREQFILEID; 多 part 还含 HASHSETREQUEST); 直接进 REQUESTFILENAME。
-    conn_opt = std::move(pre_conn);
-    fs_parts = std::move(pre_parts);
-  } else {
-    // 全新连接: connect + handshake + request_file (+ request_hashset 仅多 part; 共享 st 已有 hashset, 丢弃)
-    bool accepted = false;
-    if(source.low_id()){
-      if(!server_conn || !listener){ finish(make_error_code(errc::connect_failed)); co_return; }
-      auto cb = co_await server_conn->get().callback_request(source.id, timeout);
-      if(!cb){ finish(cb.error()); co_return; }
-      auto acc = co_await listener->get().accept(timeout);
-      if(!acc){ finish(acc.error()); co_return; }
-      conn_opt.emplace(std::move(*acc));
-      accepted = true;
-    } else {
-      ed2k::peer::C2CConnection c(ex);
-      c.set_ip_filter(ip_filter, ip_filter_level);
-      auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
-      if(!cr){ finish(cr.error()); co_return; }
-      conn_opt.emplace(std::move(c));
-      accepted = false;
-    }
-    ed2k::peer::HelloInfo mine;
-    mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
-    mine.nickname = "ed2k"; mine.version = 0x3C; mine.port = 4662;
-    tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
-    if(accepted) hr = co_await conn_opt->handshake_acceptor(mine, timeout);
-    else         hr = co_await conn_opt->handshake(mine, timeout);
-    if(!hr){ finish(hr.error()); co_return; }
-    auto fs = co_await conn_opt->request_file(st.hash, timeout);
-    if(!fs){ finish(fs.error()); co_return; }
-    fs_parts = std::move(fs->parts);
-    // 单 part 文件跳过 hashset (aMule 不应答); 多 part 文件仍请求 (mock 序列要求, 结果丢弃)。
-    if(st.size > PART_SIZE){
-      auto hs = co_await conn_opt->request_hashset(st.hash, timeout);
-      if(!hs){ finish(hs.error()); co_return; }
-    }
-  }
-  auto& conn = *conn_opt;
-
-  (void)co_await conn.request_filename(st.hash, timeout);   // 文件名可选, 忽略失败
-  auto up = co_await conn.start_upload(st.hash, timeout);
-  if(!up){ finish(up.error()); co_return; }
-
-  // M4c: AICH master-hash 协商 + 降级 (per-worker)。匹配才启用两级 verify_block;
-  // 不匹配/不支持 AICH → 降级无 AICH 下载 (part-hash MD4 仍兜底)。
-  bool aich_active = false;
-  if(st.aich.has_value()){
-    auto mh = co_await conn.request_aich_master_hash(st.hash, timeout);
-    if(mh && *mh == *st.aich) aich_active = true;
-  }
-
-  // servable = 对端可服务 part 集合 (初始 = FILESTATUS), 空响应时收缩 (防部分 part 死循环)。
-  std::vector<bool> servable = fs_parts;
-  // aMule 完整共享文件 FILESTATUS count=0 (无位图, 见 ClientTCPSocket.cpp OP_SETREQFILEID:
-  // !IsPartFile() → WriteUInt16(0)) = 拥有整文件 → 空位图视为全部 part 可服务。
-  // 非空位图 (PartFile 不完整源) 按实际 have-part 过滤。
-  if(servable.empty()){
-    servable.assign(static_cast<std::size_t>((st.size + PART_SIZE - 1) / PART_SIZE), true);
-  }
-  bool large_file = st.size > (std::uint64_t(1) << 32);
-  std::size_t retry = 0;
-  while(!st.alloc.complete()){
-    if(st.complete) break;
-    auto nb = st.alloc.next_block_for_parts(servable);
-    if(!nb){
-      // 无对端可服务块 = 源耗尽。若已完成 → 成功退出; 仅剩我一人且未完成 → io_error;
-      // 否则正常退出, 余块由兄弟 worker 处理。
-      if(st.complete){ finish({}); co_return; }
-      if(st.active_workers <= 1){ finish(make_error_code(errc::io_error)); co_return; }
-      finish({}); co_return;
-    }
-    auto [part_index, block_in_part, start_byte, end_byte] = *nb;
-
-    std::vector<ed2k::peer::Block> blocks;
-    if(large_file){
-      auto r = co_await conn.request_blocks_i64(st.hash,
-        std::array<std::uint64_t,3>{start_byte,0,0}, std::array<std::uint64_t,3>{end_byte,0,0}, timeout);
-      if(!r){ st.alloc.requeue_block(part_index, block_in_part); finish(r.error()); co_return; }
-      blocks = std::move(*r);
-    } else {
-      auto r = co_await conn.request_blocks(st.hash,
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start_byte),0,0},
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end_byte),0,0}, timeout);
-      if(!r){ st.alloc.requeue_block(part_index, block_in_part); finish(r.error()); co_return; }
-      blocks = std::move(*r);
-    }
-    if(blocks.empty()){
-      // 对端声称有该 part 但未供块 (部分 part) → 标该 part 不可服务 + requeue, 试别块。
-      servable[part_index] = false;
-      st.alloc.requeue_block(part_index, block_in_part);
-      continue;
-    }
-
-    for(auto& b : blocks){
-      // C2 先验证后写入: AICH 启用时先拉 proof + verify_block, 通过才写盘;
-      // 校验失败 requeue 同源重试, 超 max_retries 返回 block_corrupt 让该源退出 (块回队列, 他源可取)。
-      if(aich_active){
-        auto rd = co_await conn.request_aich_proof(st.hash, *st.aich,
-                                                   static_cast<std::uint16_t>(part_index), timeout);
-        bool ok = false;
-        if(rd) ok = st.checker->verify_block(part_index, block_in_part, b.data,
-                                             std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
-        if(!ok){
-          st.alloc.requeue_block(part_index, block_in_part);
-          if(++retry > max_retries){ finish(make_error_code(errc::block_corrupt)); co_return; }
-          break;   // 同源重下该块 (next_block_for_parts 会再取到 requeue 的块或下一可服务块)
-        }
-      }
-      auto w = co_await st.pf.write_block_async(b.start, b.end, b.data, st.disk_ex);
-      if(!w){ st.alloc.requeue_block(part_index, block_in_part); finish(w.error()); co_return; }
-      if(st.alloc.mark_block_done(part_index, block_in_part)){ st.mark_complete(); break; }
-      retry = 0;   // 成功一块, 重置同源重试计数
-    }
-  }
-  finish({});
+  auto setup = co_await setup_source_phase(ex, source, std::move(pre_conn), std::move(pre_parts),
+                                           st.hash, st.size, timeout, server_conn, listener,
+                                           std::move(ip_filter), ip_filter_level);
+  if(!setup){ finish(setup.error()); co_return; }
+  auto upload = co_await start_upload_phase(setup->conn, st.hash, timeout);
+  if(!upload){ finish(upload.error()); co_return; }
+  const bool aich_active = co_await negotiate_aich_phase(setup->conn, st, timeout);
+  auto pulled = co_await pull_blocks_phase(setup->conn, st, std::move(setup->fs_parts),
+                                           aich_active, timeout, max_retries);
+  finish(pulled ? std::error_code{} : pulled.error());
 }
 
 boost::asio::awaitable<tl::expected<void,std::error_code>>
