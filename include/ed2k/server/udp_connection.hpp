@@ -1,7 +1,9 @@
 #pragma once
+#include <cstddef>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <variant>
@@ -30,11 +32,30 @@ struct UdpServerObfuscation {
 };
 
 class UdpServerConnection {
+  struct SubscriptionState;
  public:
+  class Subscription {
+   public:
+    Subscription() noexcept = default;
+    ~Subscription();
+    Subscription(const Subscription&) = delete;
+    Subscription& operator=(const Subscription&) = delete;
+    Subscription(Subscription&& other) noexcept;
+    Subscription& operator=(Subscription&& other) noexcept;
+
+   private:
+    friend class UdpServerConnection;
+    Subscription(std::weak_ptr<SubscriptionState> state, std::size_t id) noexcept;
+    void reset() noexcept;
+
+    std::weak_ptr<SubscriptionState> state_;
+    std::size_t id_ = 0;
+  };
+
   UdpServerConnection(boost::asio::any_io_executor ex, IPv4 server_ip, std::uint16_t server_udp_port);
   UdpServerConnection(boost::asio::any_io_executor ex, IPv4 server_ip, std::uint16_t server_udp_port,
                       UdpServerObfuscation obfuscation);
-  void on_event(std::function<void(const UdpEvent&)> sink);
+  [[nodiscard]] Subscription on_event(std::function<void(const UdpEvent&)> sink);
 
   boost::asio::awaitable<tl::expected<UdpSearchResult,std::error_code>>
     global_search(const SearchExpr&, std::chrono::milliseconds timeout);
@@ -59,6 +80,6 @@ class UdpServerConnection {
   ed2k::net::UdpSocket sock_;
   boost::asio::ip::udp::endpoint plain_server_;
   UdpServerObfuscation obfuscation_;
-  std::function<void(const UdpEvent&)> on_event_;
+  std::shared_ptr<SubscriptionState> observers_;
 };
 }

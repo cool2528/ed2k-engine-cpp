@@ -103,7 +103,7 @@ TEST(ServerConnection, LoginHighId){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     ServerConnection c(rt.executor());
     std::vector<ServerEvent> evs;
-    c.on_event([&](const ServerEvent& e){ evs.push_back(e); });
+    auto sub = c.on_event([&](const ServerEvent& e){ evs.push_back(e); });
     LoginParams p; p.nickname="u"; p.client_port=4662;
     p.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
     auto r = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
@@ -144,7 +144,7 @@ TEST(ServerConnection, LoginEmitsMessageAndStatus){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     ServerConnection c(rt.executor());
     std::vector<ServerEvent> evs;
-    c.on_event([&](const ServerEvent& e){ evs.push_back(e); });
+    auto sub = c.on_event([&](const ServerEvent& e){ evs.push_back(e); });
     LoginParams p; p.nickname="u";
     auto r = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
@@ -155,6 +155,29 @@ TEST(ServerConnection, LoginEmitsMessageAndStatus){
     }
     EXPECT_TRUE(got_msg);
     EXPECT_TRUE(got_status);
+    c.close(); co_return;
+  });
+}
+TEST(ServerConnection, DestroyedSubscriptionStopsEvents){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);
+    co_await ed2k::test::send_packet(s, op::SERVERMESSAGE, msg_payload("after-unsubscribe"));
+    co_await ed2k::test::send_packet(s, op::IDCHANGE, idchange_payload(0x01000000u, 0u));
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    ServerConnection c(rt.executor());
+    int calls = 0;
+    {
+      auto sub = c.on_event([&](const ServerEvent&){ ++calls; });
+      (void)sub;
+    }
+    LoginParams p; p.nickname="u";
+    auto r = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(calls, 0);
     c.close(); co_return;
   });
 }
@@ -305,7 +328,7 @@ TEST(ServerConnection, CallbackRequestedEmitted){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     ServerConnection c(rt.executor());
     std::vector<ServerEvent> evs;
-    c.on_event([&](const ServerEvent& e){ evs.push_back(e); });
+    auto sub = c.on_event([&](const ServerEvent& e){ evs.push_back(e); });
     LoginParams p; p.nickname="u";
     auto lr = co_await c.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 2s);
     EXPECT_TRUE(lr.has_value()); if(!lr) co_return;

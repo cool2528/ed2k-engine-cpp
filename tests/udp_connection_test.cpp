@@ -352,12 +352,40 @@ TEST(UdpConnection, ServerIdentEventEmitted){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
     std::string got_name;
-    c.on_event([&](const UdpEvent& e){
+    auto sub = c.on_event([&](const UdpEvent& e){
       if(std::holds_alternative<UdpServerIdentEvent>(e)) got_name = std::get<UdpServerIdentEvent>(e).name;
     });
     auto r = co_await c.global_search(Keyword{"foo"}, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     EXPECT_EQ(got_name, "name");
+    c.close(); co_return;
+  });
+}
+TEST(UdpConnection, DestroyedSubscriptionStopsEvents){
+  IoRuntime rt;
+  ed2k::test::MockUdpServer srv(rt.context());
+  srv.serve([](udp::socket& s, const Packet&, const udp::endpoint& from) -> asio::awaitable<void>{
+    codec::ByteWriter ident;
+    ident.hash16(*MD4Hash::from_hex("00112233445566778899aabbccddeeff"));
+    ident.u32_be(0x7F000001u);
+    ident.u16(0x1234u);
+    ident.u32(2);
+    ident.u8(0x82); ident.u8(tag::ST_SERVERNAME); ident.string16("name");
+    ident.u8(0x82); ident.u8(tag::ST_DESCRIPTION); ident.string16("desc");
+    co_await ed2k::test::send_packet_to(s, from, udpop::SERVER_IDENT, ident.take());
+    co_await ed2k::test::send_packet_to(s, from, udpop::GLOBSEARCHRES, search_item("after"));
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
+    int calls = 0;
+    {
+      auto sub = c.on_event([&](const UdpEvent&){ ++calls; });
+      (void)sub;
+    }
+    auto r = co_await c.global_search(Keyword{"foo"}, 2s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(calls, 0);
     c.close(); co_return;
   });
 }
@@ -373,7 +401,7 @@ TEST(UdpConnection, InvalidLowIdEmitted){
   run_coro(rt, [&]() -> asio::awaitable<void>{
     UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), srv.port());
     std::uint32_t got_id = 0;
-    c.on_event([&](const UdpEvent& e){ if(std::holds_alternative<InvalidLowIdEvent>(e)) got_id = std::get<InvalidLowIdEvent>(e).id; });
+    auto sub = c.on_event([&](const UdpEvent& e){ if(std::holds_alternative<InvalidLowIdEvent>(e)) got_id = std::get<InvalidLowIdEvent>(e).id; });
     auto r = co_await c.global_search(Keyword{"foo"}, 2s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     EXPECT_EQ(got_id, 0x00001234u);

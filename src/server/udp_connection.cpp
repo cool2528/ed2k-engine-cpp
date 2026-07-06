@@ -3,6 +3,9 @@
 #include "ed2k/net/udp_obfuscation.hpp"
 #include "ed2k/util/error.hpp"
 #include <chrono>
+#include <map>
+#include <utility>
+#include <vector>
 namespace ed2k::server {
 namespace asio = boost::asio;
 using udp = asio::ip::udp;
@@ -15,14 +18,43 @@ bool matches_wanted_opcode(std::uint8_t got, std::uint8_t want){
 }
 }
 
+struct UdpServerConnection::SubscriptionState {
+  std::map<std::size_t, std::function<void(const UdpEvent&)>> sinks;
+  std::size_t next_id = 1;
+};
+
+UdpServerConnection::Subscription::Subscription(std::weak_ptr<SubscriptionState> state, std::size_t id) noexcept
+  : state_(std::move(state)), id_(id) {}
+UdpServerConnection::Subscription::~Subscription() { reset(); }
+UdpServerConnection::Subscription::Subscription(Subscription&& other) noexcept
+  : state_(std::move(other.state_)), id_(std::exchange(other.id_, 0)) {}
+UdpServerConnection::Subscription& UdpServerConnection::Subscription::operator=(Subscription&& other) noexcept {
+  if(this != &other){
+    reset();
+    state_ = std::move(other.state_);
+    id_ = std::exchange(other.id_, 0);
+  }
+  return *this;
+}
+void UdpServerConnection::Subscription::reset() noexcept {
+  if(id_ == 0) return;
+  if(auto state = state_.lock()) state->sinks.erase(id_);
+  id_ = 0;
+}
+
 UdpServerConnection::UdpServerConnection(asio::any_io_executor ex, IPv4 ip, std::uint16_t port)
   : UdpServerConnection(ex, ip, port, UdpServerObfuscation{}) {}
 UdpServerConnection::UdpServerConnection(asio::any_io_executor ex, IPv4 ip, std::uint16_t port,
                                          UdpServerObfuscation obfuscation)
   : sock_(ex),
     plain_server_(udp::endpoint(asio::ip::address_v4(ip.host()), port)),
-    obfuscation_(obfuscation) {}
-void UdpServerConnection::on_event(std::function<void(const UdpEvent&)> sink){ on_event_ = std::move(sink); }
+    obfuscation_(obfuscation),
+    observers_(std::make_shared<SubscriptionState>()) {}
+UdpServerConnection::Subscription UdpServerConnection::on_event(std::function<void(const UdpEvent&)> sink){
+  const auto id = observers_->next_id++;
+  observers_->sinks.emplace(id, std::move(sink));
+  return Subscription{observers_, id};
+}
 void UdpServerConnection::close() noexcept { sock_.close(); }
 
 udp::endpoint UdpServerConnection::obfuscated_endpoint() const {
@@ -95,17 +127,23 @@ UdpServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds bud
     if(!parsed) co_return tl::unexpected(parsed.error());
     auto pkt = std::move(*parsed);
     if(matches_wanted_opcode(pkt.opcode, want)) co_return std::move(pkt);
+    auto dispatch = [&](UdpEvent event) {
+      std::vector<std::function<void(const UdpEvent&)>> sinks;
+      sinks.reserve(observers_->sinks.size());
+      for(auto& [id, sink] : observers_->sinks) sinks.push_back(sink);
+      for(auto& sink : sinks) sink(event);
+    };
     if(pkt.opcode == udpop::INVALID_LOWID){
-      if(on_event_){
+      if(!observers_->sinks.empty()){
         auto id = decode_invalid_low_id(pkt.payload);
-        if(id) on_event_(InvalidLowIdEvent{*id});
+        if(id) dispatch(InvalidLowIdEvent{*id});
       }
       continue;
     }
     if(pkt.opcode == udpop::SERVER_IDENT){
-      if(on_event_){
+      if(!observers_->sinks.empty()){
         auto id = decode_udp_server_ident(pkt.payload);
-        if(id) on_event_(UdpServerIdentEvent{id->hash, id->ip, id->port, id->name, id->description});
+        if(id) dispatch(UdpServerIdentEvent{id->hash, id->ip, id->port, id->name, id->description});
       }
       continue;
     }

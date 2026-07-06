@@ -3,28 +3,59 @@
 #include "ed2k/net/framing.hpp"
 #include "ed2k/util/error.hpp"
 #include <chrono>
+#include <map>
 #include <span>
+#include <utility>
+#include <vector>
 namespace ed2k::server {
 namespace asio = boost::asio;
 using clock_type = std::chrono::steady_clock;
 
+struct ServerConnection::SubscriptionState {
+  std::map<std::size_t, std::function<void(const ServerEvent&)>> sinks;
+  std::size_t next_id = 1;
+};
+
 struct ServerConnection::Impl {
-  explicit Impl(asio::any_io_executor ex) : conn(ex) {}
+  explicit Impl(asio::any_io_executor ex) : conn(ex), observers(std::make_shared<SubscriptionState>()) {}
 
   void dispatch_push(const net::Packet& pkt);
   asio::awaitable<tl::expected<net::Packet,std::error_code>>
     pump_until(std::uint8_t want, std::chrono::milliseconds budget);
 
   net::Connection conn;
-  std::function<void(const ServerEvent&)> on_event;
+  std::shared_ptr<SubscriptionState> observers;
 };
+
+ServerConnection::Subscription::Subscription(std::weak_ptr<SubscriptionState> state, std::size_t id) noexcept
+  : state_(std::move(state)), id_(id) {}
+ServerConnection::Subscription::~Subscription() { reset(); }
+ServerConnection::Subscription::Subscription(Subscription&& other) noexcept
+  : state_(std::move(other.state_)), id_(std::exchange(other.id_, 0)) {}
+ServerConnection::Subscription& ServerConnection::Subscription::operator=(Subscription&& other) noexcept {
+  if(this != &other){
+    reset();
+    state_ = std::move(other.state_);
+    id_ = std::exchange(other.id_, 0);
+  }
+  return *this;
+}
+void ServerConnection::Subscription::reset() noexcept {
+  if(id_ == 0) return;
+  if(auto state = state_.lock()) state->sinks.erase(id_);
+  id_ = 0;
+}
 
 ServerConnection::ServerConnection(asio::any_io_executor ex) : impl_(std::make_unique<Impl>(ex)) {}
 ServerConnection::~ServerConnection() = default;
 ServerConnection::ServerConnection(ServerConnection&&) noexcept = default;
 ServerConnection& ServerConnection::operator=(ServerConnection&&) noexcept = default;
 
-void ServerConnection::on_event(std::function<void(const ServerEvent&)> sink){ impl_->on_event = std::move(sink); }
+ServerConnection::Subscription ServerConnection::on_event(std::function<void(const ServerEvent&)> sink){
+  const auto id = impl_->observers->next_id++;
+  impl_->observers->sinks.emplace(id, std::move(sink));
+  return Subscription{impl_->observers, id};
+}
 void ServerConnection::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
   impl_->conn.set_ip_filter(std::move(filter), level);
 }
@@ -32,14 +63,20 @@ void ServerConnection::close() noexcept { impl_->conn.close(); }
 bool ServerConnection::is_open() const noexcept { return impl_->conn.is_open(); }
 
 void ServerConnection::Impl::dispatch_push(const net::Packet& pkt){
-  if(!on_event) return;
+  if(observers->sinks.empty()) return;
+  auto dispatch = [&](ServerEvent event) {
+    std::vector<std::function<void(const ServerEvent&)>> sinks;
+    sinks.reserve(observers->sinks.size());
+    for(auto& [id, sink] : observers->sinks) sinks.push_back(sink);
+    for(auto& sink : sinks) sink(event);
+  };
   std::span<const std::byte> p{pkt.payload};
   switch(pkt.opcode){
-    case op::SERVERMESSAGE: { auto d=decode_server_message(p); if(d) on_event(ServerMessageEvent{std::move(*d)}); break; }
-    case op::SERVERSTATUS:  { auto d=decode_server_status(p);  if(d) on_event(ServerStatusEvent{d->users,d->files}); break; }
-    case op::SERVERIDENT:   { auto d=decode_server_ident(p);   if(d) on_event(ServerIdentEvent{d->hash,d->ip,d->port,d->name,d->description}); break; }
-    case op::SERVERLIST:    { auto d=decode_server_list(p);    if(d) on_event(ServerListEvent{std::move(*d)}); break; }
-    case op::CALLBACKREQUESTED: { auto d=decode_callback_requested(p); if(d) on_event(CallbackRequestedEvent{d->ip,d->port}); break; }
+    case op::SERVERMESSAGE: { auto d=decode_server_message(p); if(d) dispatch(ServerMessageEvent{std::move(*d)}); break; }
+    case op::SERVERSTATUS:  { auto d=decode_server_status(p);  if(d) dispatch(ServerStatusEvent{d->users,d->files}); break; }
+    case op::SERVERIDENT:   { auto d=decode_server_ident(p);   if(d) dispatch(ServerIdentEvent{d->hash,d->ip,d->port,d->name,d->description}); break; }
+    case op::SERVERLIST:    { auto d=decode_server_list(p);    if(d) dispatch(ServerListEvent{std::move(*d)}); break; }
+    case op::CALLBACKREQUESTED: { auto d=decode_callback_requested(p); if(d) dispatch(CallbackRequestedEvent{d->ip,d->port}); break; }
     default: break;
   }
 }

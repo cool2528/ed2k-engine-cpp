@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,7 +29,26 @@ using ServerEvent = std::variant<ServerStatusEvent, ServerMessageEvent, ServerId
                                  ServerListEvent, CallbackRequestedEvent>;
 
 class ServerConnection {
+  struct SubscriptionState;
  public:
+  class Subscription {
+   public:
+    Subscription() noexcept = default;
+    ~Subscription();
+    Subscription(const Subscription&) = delete;
+    Subscription& operator=(const Subscription&) = delete;
+    Subscription(Subscription&& other) noexcept;
+    Subscription& operator=(Subscription&& other) noexcept;
+
+   private:
+    friend class ServerConnection;
+    Subscription(std::weak_ptr<SubscriptionState> state, std::size_t id) noexcept;
+    void reset() noexcept;
+
+    std::weak_ptr<SubscriptionState> state_;
+    std::size_t id_ = 0;
+  };
+
   explicit ServerConnection(boost::asio::any_io_executor ex);
   ~ServerConnection();
   ServerConnection(const ServerConnection&) = delete;
@@ -36,7 +56,7 @@ class ServerConnection {
   ServerConnection(ServerConnection&&) noexcept;
   ServerConnection& operator=(ServerConnection&&) noexcept;
 
-  void on_event(std::function<void(const ServerEvent&)> sink);
+  [[nodiscard]] Subscription on_event(std::function<void(const ServerEvent&)> sink);
   void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
 
   boost::asio::awaitable<tl::expected<LoginResult,std::error_code>>
