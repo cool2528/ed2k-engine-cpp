@@ -1,6 +1,17 @@
 #include <gtest/gtest.h>
+#include <type_traits>
+#include <utility>
 #include "ed2k/codec/byte_io.hpp"
 using namespace ed2k; using namespace ed2k::codec;
+
+static_assert(noexcept(std::declval<const ByteReader&>().ok()));
+static_assert(noexcept(std::declval<const ByteReader&>().remaining()));
+static_assert(noexcept(std::declval<const ByteReader&>().pos()));
+static_assert(std::is_same_v<decltype(std::declval<ByteReader&>().u8()), std::uint8_t>);
+static_assert(std::is_same_v<decltype(std::declval<ByteReader&>().u16()), std::uint16_t>);
+static_assert(std::is_same_v<decltype(std::declval<ByteReader&>().u32()), std::uint32_t>);
+static_assert(std::is_same_v<decltype(std::declval<ByteReader&>().u64()), std::uint64_t>);
+
 TEST(ByteIO, RoundTripPrimitives){
   ByteWriter w; w.u8(0x12); w.u16(0x3456); w.u32(0x89abcdef); w.u64(0x1122334455667788ull);
   w.string16("hello");

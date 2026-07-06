@@ -343,8 +343,8 @@ C2CConnection::request_aich_proof(const FileHash& h, const AICHHash& master, std
   // 帧 = file_hash(16) + part_index(2) + master_hash(20) + V2 data,master_hash 在偏移 18..38。
   {
     codec::ByteReader r(rp->payload);
-    r.hash16();                          // file_hash(16)
-    r.u16();                             // part_index(2)
+    (void)r.hash16();                    // file_hash(16)
+    (void)r.u16();                       // part_index(2)
     auto echoed = AICHHash::from_bytes(r.hash20());
     if(!r.ok() || echoed != master) co_return tl::unexpected(make_error_code(errc::hash_mismatch));
   }

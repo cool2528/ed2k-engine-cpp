@@ -1,6 +1,30 @@
 #include <gtest/gtest.h>
+#include <utility>
 #include "ed2k/core/hash.hpp"
+#include "ed2k/hash/aich_hasher.hpp"
+#include "ed2k/net/packet.hpp"
 using namespace ed2k;
+
+namespace {
+constexpr std::array<std::byte,16> zero_md4{};
+constexpr std::array<std::byte,20> zero_aich{};
+constexpr auto constexpr_md4 = MD4Hash::from_bytes(zero_md4);
+constexpr auto constexpr_aich = AICHHash::from_bytes(zero_aich);
+constexpr auto localhost = IPv4::from_wire(0x0100007Fu);
+
+static_assert(noexcept(MD4Hash::from_bytes(zero_md4)));
+static_assert(noexcept(AICHHash::from_bytes(zero_aich)));
+static_assert(noexcept(std::declval<const MD4Hash&>().bytes()));
+static_assert(noexcept(std::declval<const AICHHash&>().bytes()));
+static_assert(noexcept(IPv4::from_wire(0x0100007Fu)));
+static_assert(constexpr_md4.bytes()[0] == std::byte{0});
+static_assert(constexpr_aich.bytes()[0] == std::byte{0});
+static_assert(localhost.host() == 0x7F000001u);
+static_assert(AICH_BLOCK_SIZE == 184320u);
+static_assert(PART_SIZE == 9728000u);
+static_assert(net::MAX_PACKET_SIZE == 8u * 1024u * 1024u);
+}
+
 TEST(MD4Hash, HexRoundTrip){
   auto h = MD4Hash::from_hex("31d6cfe0d16ae931b73c59d7e0c089c0");
   ASSERT_TRUE(h.has_value());

@@ -577,7 +577,7 @@ std::vector<std::byte> encode_aich_file_hash_ans(const FileHash& h, const AICHHa
 }
 tl::expected<AICHHash,std::error_code> decode_aich_file_hash_ans(std::span<const std::byte> data){
   ByteReader r(data);
-  r.hash16();                            // file_hash(16) — 调用方已知请求的文件,此处丢弃
+  (void)r.hash16();                      // file_hash(16) — 调用方已知请求的文件,此处丢弃
   auto master = r.hash20();              // aich_master_hash(20)
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return AICHHash::from_bytes(master);
@@ -618,9 +618,9 @@ std::vector<std::byte> encode_aich_request(const FileHash& h, const AICHHash& ma
 }
 tl::expected<AICHRecoveryData,std::error_code> decode_aich_answer(std::span<const std::byte> data){
   ByteReader r(data);
-  r.hash16();                            // file_hash(16)
-  r.u16();                               // part_index(u16) — 回显请求的 part,校验由 C2CConnection 负责
-  r.hash20();                            // master_hash(20) — 校验由 C2CConnection 负责
+  (void)r.hash16();                      // file_hash(16)
+  (void)r.u16();                         // part_index(u16) — 回显请求的 part,校验由 C2CConnection 负责
+  (void)r.hash20();                      // master_hash(20) — 校验由 C2CConnection 负责
   // V2 recovery data (aMule ReadRecoveryData)
   std::uint16_t count16 = r.u16();       // 16-bit 标识符 hash 数
   AICHRecoveryData out;
