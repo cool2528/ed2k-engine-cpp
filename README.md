@@ -1,7 +1,8 @@
 # ed2k-engine-cpp
 
 A from-scratch C++20 implementation of the **eDonkey2000 / eMule (eD2k) protocol** engine —
-link parsing, server session, multi-source download with AICH corruption recovery, and resume.
+link parsing, server and Kad sessions, upload/share, multi-source download with AICH corruption
+recovery, and cross-client resume.
 Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 
 > **Protocol fidelity canon.** All wire formats are verified against the aMule source by
@@ -21,9 +22,15 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | Async disk I/O (offload to disk thread, network never blocks) | ✅ |
 | `>4GiB` boundary (u64 blocks / offsets) | ✅ |
 | Live real-peer validation | ✅ vs local aMule 2.3.3 + real eMule server (see [Live tests](#live-tests)) |
-| Linux / CI | ⏳ planned (R0-2/R0-3) |
+| Upload/share/credits + SourceExchange v2 | ✅ |
+| Kad bootstrap/search/source lookup/publish | ✅ |
+| TCP/UDP/server obfuscation | ✅ |
+| Client infrastructure (IPFilter, preferences, stats, proxy, collection, scheduler, chat) | ✅ |
+| Server UDP completeness / MuleInfo / compressed upload / aMule `.part.met` | ✅ |
+| Linux / CI | ✅ |
 
-Mock loopback tests: **229 pass, 5 skip** (live-gated only); live **4/4 green**. Version: `1.0.0`.
+Mock loopback tests: **444 pass, 9 skip** (live-gated only); live paths include server, Kad,
+download, upload, and cross-client resume validation. Version: `2.2.0`.
 
 ## Build
 
@@ -44,23 +51,35 @@ ctest --preset default            # run tests (cwd build/default)
 cmake --preset linux              # configure (vcpkg manifest, Ninja, Debug)
 cmake --build --preset linux      # build
 ctest --preset linux              # run tests (live skip without ED2K_LIVE)
-# Artifacts: build/default/ed2k-tool, ed2k_tests
+# Artifacts: build/linux/ed2k-tool, ed2k_tests
 ```
 
 ## CLI — `ed2k-tool`
 
 ```
-ed2k-tool hash <file> [--aich] [--red]                 # compute ed2k link (P1)
+ed2k-tool [--config <preferences.dat>] [--ipfilter <ipfilter.dat>] [--proxy <uri>] [--obfuscation] <command> ...
+ed2k-tool hash <file> [--aich] [--red]                 # compute ed2k link
 ed2k-tool serverlist <server.met>                       # parse server.met
+ed2k-tool get-serverlist <server.met>                   # fetch and merge server.met
 ed2k-tool parse <ed2k-link>                             # parse an ed2k:// link
-ed2k-tool login <server.met> [--ip:x.x.x.x] [--port:n]  # login to a server (P4c-1)
+ed2k-tool login <server.met> [--ip:x.x.x.x] [--port:n]  # login to a server
 ed2k-tool search <server.met> <keyword>                 # keyword search
 ed2k-tool sources <server.met> <ed2k-link>              # get sources for a file
+ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]
+ed2k-tool comment <ed2k-link> --rating:n --comment:text [--peer:ip:port]
+ed2k-tool ipfilter <ipfilter.dat> [--block-check:ip] [--level:n]
+ed2k-tool config <preferences.dat> [--set:key=value]
+ed2k-tool stats <statistics.dat>
+ed2k-tool collection create <collection> <ed2k-link>...
+ed2k-tool collection list <collection>
+ed2k-tool schedule add <rules.txt> <rule>
+ed2k-tool schedule list <rules.txt>
+ed2k-tool update-serverlist <url> <dest>
 ed2k-tool kad-bootstrap <nodes.dat>                     # bootstrap Kad routing
 ed2k-tool kad-search <nodes.dat> <keyword>              # Kad keyword search
 ed2k-tool kad-find-sources <nodes.dat> <ed2k-link>      # Kad source lookup
 ed2k-tool kad-publish <nodes.dat> <dir> [--port:n]      # publish share to Kad
-ed2k-tool download <ed2k-link> [--out:PATH] [--server:server.met]  # download
+ed2k-tool download <ed2k-link> [--out:PATH] [--server:server.met]
 ```
 
 ### Examples
@@ -130,7 +149,7 @@ resumption on `ex`. `DiskExecutorRunsOnSeparateThread` test locks this in.
 
 ## Live tests
 
-Five tests are gated behind `ED2K_LIVE` and skip by default (mock loopback runs without them):
+Live tests are gated behind `ED2K_LIVE` and skip by default (mock loopback runs without them):
 
 ```bash
 # Server session (Login / Search / GetSources) — real eMule server
@@ -143,11 +162,10 @@ ED2K_LIVE=1 ED2K_LINK="ed2k://|file|...|/" ED2K_SOURCE=ip:port \
     --gtest_filter=LiveDownload.LocalPeerCompletes
 ```
 
-**R0-1 live validation ✅**: 3 `LiveServer.*` green vs a real eMule Security server; `LocalPeerCompletes`
-green vs a self-hosted local aMule 2.3.3 peer — single-part 5.57 MB + multi-part 29 MB (Red variant,
-empty trailing part) both MD4-verified end-to-end. Live testing surfaced and fixed 7 aMule byte-level
-fidelity bugs (see CHANGELOG). Public HighID peers IP-filter cloud IPs, so a local aMule instance is the
-reliable peer source.
+**Live validation ✅**: server login/search/source lookup, Kad bootstrap/search, SX2 upload,
+local-peer download, and bidirectional aMule `.part.met` handoff have been validated against
+real infrastructure or a local aMule 2.3.3 peer. Public HighID peers often filter cloud IPs, so
+a local aMule instance remains the reliable peer source for repeatable live tests.
 
 ## Project layout
 

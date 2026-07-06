@@ -3,6 +3,34 @@
 All notable changes to ed2kengine. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
+## [2.2.0] — 2026-07-06
+
+### Added — aMule protocol-level feature parity
+- Upload/share pipeline: known-file index, server publish, upload session/queue, rate limiting,
+  client credits, SourceExchange v2, comments, and ratings.
+- Kad support: routing table, bootstrap, Kad2 UDP, keyword/source/notes search and publish,
+  firewalled/buddy/callback flows, and CLI Kad commands.
+- Protocol obfuscation: built-in MD5/RC4, TCP encrypted stream handshake, UDP/server obfuscation,
+  negotiation bits, and fallback paths.
+- Client infrastructure: IPFilter, preferences, statistics, categories, friend/client lists,
+  proxy support, HTTP server-list updates, collections, preview, scheduler, and chat relay.
+- eD2k completeness: server UDP v2 source query/ident, server-list exchange, MuleInfo handshake,
+  AICH sharing, compressed upload blocks, aMule-faithful `.part.met`, and large-file boundaries.
+
+### Changed — code quality modernization
+- Public async/network/download handles moved behind PIMPL-style implementations while preserving
+  coroutine APIs.
+- Server and UDP observer registration now returns RAII subscriptions.
+- Core hash/codec/IP APIs gained targeted `[[nodiscard]]`, `constexpr`, and safe `noexcept`
+  contracts; byte-range APIs use a `std::byte` contiguous range concept.
+- `std::hash<MD4Hash>` was strengthened and selected formatting paths moved to C++20 `std::format`.
+- C++23 migration remains deferred; the release stays on C++20.
+
+### Tests
+- Windows and WSL full suites: 453 total, 444 pass + 9 live-gated skip, 0 fail.
+- Live validation includes real server paths, Kad bootstrap/search, SX2 upload, local aMule peer
+  download, and bidirectional aMule `.part.met` handoff.
+
 ## [1.0.0] — 2026-07-04
 
 ### Fixed — live protocol fidelity vs aMule 2.3.3 (R0-1)
