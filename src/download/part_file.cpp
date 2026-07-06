@@ -7,9 +7,16 @@
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/this_coro.hpp>
 namespace ed2k::download {
+namespace {
+std::filesystem::path part_met_path_for(const std::filesystem::path& path) {
+  auto met = path;
+  met += (path.extension() == ".part") ? ".met" : ".part.met";
+  return met;
+}
+}
+
 PartFile::PartFile(const std::filesystem::path& path, std::uint64_t size, const FileHash& file_hash, std::vector<PartHash> part_hashes)
-  : path_(path), met_path_(path), size_(size), file_hash_(file_hash), part_hashes_(std::move(part_hashes)) {
-  met_path_ += ".part.met";
+  : path_(path), met_path_(part_met_path_for(path)), size_(size), file_hash_(file_hash), part_hashes_(std::move(part_hashes)) {
   if(part_hashes_.empty()) part_hashes_.push_back(file_hash_);
   // 状态向量按数据 part 数 (num_parts) 分配, 非 hash 计数 (Red 变体空尾 part 不占数据 part 槽)。
   const std::size_t np = num_parts();

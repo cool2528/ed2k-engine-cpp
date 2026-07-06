@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <boost/asio/co_spawn.hpp>
 #include "ed2k/app/server_session.hpp"
+#include "ed2k/download/part_file.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
@@ -71,8 +73,11 @@ TEST(LiveDownload, LocalPeerCompletes){
 
   auto pl = parse_link(ls); ASSERT_TRUE(pl.has_value());
   auto* f = std::get_if<Ed2kFileLink>(&*pl); ASSERT_NE(f, nullptr);
-  auto out = std::filesystem::temp_directory_path() / "ed2k_live_local_dl";
-  std::filesystem::remove(out);
+  const char* out_s = std::getenv("ED2K_OUT");
+  const bool preserve_out = out_s && *out_s;
+  auto out = preserve_out ? std::filesystem::path(out_s)
+                          : (std::filesystem::temp_directory_path() / "ed2k_live_local_dl");
+  if(!preserve_out) std::filesystem::remove(out);
   ed2k::net::IoRuntime rt;
   run_coro(rt, [&]() -> asio::awaitable<void>{
     auto dl = ed2k::download::MultiSourceDownload::Builder(rt.executor())
@@ -94,5 +99,48 @@ TEST(LiveDownload, LocalPeerCompletes){
     ASSERT_TRUE(h.has_value());
     EXPECT_EQ(h->file_hash.to_hex(), exp);
   }
+  if(!preserve_out) std::filesystem::remove(out);
+}
+
+TEST(LivePartMet, WritesEnginePartialFixture){
+  const char* source_s = std::getenv("ED2K_PARTIAL_SOURCE");
+  const char* out_s = std::getenv("ED2K_PARTIAL_OUT");
+  if(!source_s || !*source_s || !out_s || !*out_s) {
+    GTEST_SKIP() << "set ED2K_PARTIAL_SOURCE and ED2K_PARTIAL_OUT";
+  }
+
+  const std::filesystem::path source = source_s;
+  const std::filesystem::path out = out_s;
+  ASSERT_TRUE(std::filesystem::exists(source));
+  std::filesystem::create_directories(out.parent_path());
   std::filesystem::remove(out);
+  auto met = out;
+  met += (out.extension() == ".part") ? ".met" : ".part.met";
+  std::filesystem::remove(met);
+
+  auto h = hash_file(source.string(), HashVariant::Red);
+  ASSERT_TRUE(h.has_value()) << h.error().message();
+  const auto size = std::filesystem::file_size(source);
+  ASSERT_GT(size, PART_SIZE) << "fixture must span at least two eD2k parts";
+
+  download::PartFile pf(out, size, h->file_hash, h->part_hashes);
+  std::ifstream in(source, std::ios::binary);
+  ASSERT_TRUE(in.is_open());
+  std::vector<std::byte> buf(static_cast<std::size_t>(AICH_BLOCK_SIZE));
+  std::uint64_t written = 0;
+  while(written < PART_SIZE) {
+    const auto n = static_cast<std::size_t>(
+      std::min<std::uint64_t>(AICH_BLOCK_SIZE, PART_SIZE - written));
+    in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n));
+    ASSERT_EQ(in.gcount(), static_cast<std::streamsize>(n));
+    auto w = pf.write_block(written, written + n, std::span<const std::byte>(buf.data(), n));
+    ASSERT_TRUE(w.has_value()) << (w ? "" : w.error().message());
+    written += n;
+  }
+
+  EXPECT_FALSE(pf.complete());
+  EXPECT_TRUE(pf.is_block_done(0, 0));
+  EXPECT_FALSE(pf.is_block_done(1, 0));
+  EXPECT_TRUE(std::filesystem::exists(out));
+  EXPECT_TRUE(std::filesystem::exists(met));
 }

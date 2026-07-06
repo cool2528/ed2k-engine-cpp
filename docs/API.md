@@ -60,7 +60,7 @@ std::string to_string(const Ed2kFileLink&);
 ```cpp
 // server.met
 tl::expected<ServerMet, std::error_code> parse_server_met(std::span<const std::byte>);
-// .part.met (internal round-trip format; PartFileState drives resume)
+// .part.met (aMule 0xE0/0xE2 format; legacy internal gap blobs still parse)
 struct PartFileState { FileHash hash; std::vector<PartHash> part_hashes; std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps; };
 tl::expected<PartFileState, std::error_code> parse_part_met(std::span<const std::byte>);
 std::vector<std::byte> write_part_met(const PartFileState&);

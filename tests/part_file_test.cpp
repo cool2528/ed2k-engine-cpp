@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <fstream>
 #include "ed2k/download/part_file.hpp"
+#include "ed2k/metfile/known_part_met.hpp"
 #include "crypto/md4.hpp"
 using namespace ed2k; using namespace ed2k::download;
 static constexpr std::uint64_t PART = 9728000;
@@ -282,6 +283,44 @@ TEST(PartFile, StalePartMetHashMismatchIgnored){
     EXPECT_FALSE(pf.is_block_done(0,0)) << "陈旧 met 应忽略, rehash 读 d0≠h0_wrong → part0 not done";
     EXPECT_FALSE(pf.is_block_done(1,0));
     EXPECT_EQ(pf.pending_blocks().size(), 106u);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+TEST(PartFile, AmulePartPathLoadsSiblingPartMet){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_amule_sibling_met"; std::filesystem::create_directories(dir);
+  auto path = dir/"001.part";
+  auto met = path; met += ".met";
+  auto d0 = make_part_data(0x11, PART);
+  auto h0 = md4_of(d0), h1 = md4_of(make_part_data(0x22, PART));
+  auto fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+
+  {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    std::vector<char> zero(static_cast<std::size_t>(PART), 0);
+    f.write(zero.data(), static_cast<std::streamsize>(zero.size()));
+    f.seekp(static_cast<std::streamoff>(PART * 2 - 1));
+    char last = 0;
+    f.write(&last, 1);
+  }
+  {
+    PartFileState st;
+    st.hash = fh;
+    st.part_hashes = {h0, h1};
+    st.size = PART * 2;
+    st.gaps = {{PART, PART * 2}};
+    auto bytes = write_part_met(st);
+    std::ofstream m(met, std::ios::binary | std::ios::trunc);
+    m.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  {
+    PartFile pf(path, PART * 2, fh, {h0, h1});
+    EXPECT_TRUE(pf.is_block_done(0, 0)) << "aMule 001.part should load sibling 001.part.met";
+    EXPECT_FALSE(pf.is_block_done(1, 0));
+    auto pending = pf.pending_blocks();
+    EXPECT_EQ(pending.size(), 53u);
+    for(auto [p,b] : pending) EXPECT_EQ(p, 1u);
   }
   std::filesystem::remove_all(dir);
 }

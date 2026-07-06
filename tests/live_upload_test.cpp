@@ -14,6 +14,7 @@
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/share/upload_session.hpp"
+#include "ed2k/share/upload_throttler.hpp"
 #include "ed2k/util/error.hpp"
 #include "live_env.hpp"
 
@@ -133,6 +134,7 @@ TEST(LiveUpload, AcceptsLocalPeerUploadSession){
   if(!path_s || !*path_s) GTEST_SKIP() << "set ED2K_UPLOAD_FILE to a file aMule will request";
   const char* port_s = std::getenv("ED2K_UPLOAD_PORT");
   const auto listen_port = port_s && *port_s ? static_cast<std::uint16_t>(std::stoi(port_s)) : 0;
+  const char* limit_s = std::getenv("ED2K_UPLOAD_LIMIT_BPS");
 
   const std::filesystem::path path = path_s;
   if(!std::filesystem::exists(path)) GTEST_SKIP() << "ED2K_UPLOAD_FILE does not exist";
@@ -152,13 +154,18 @@ TEST(LiveUpload, AcceptsLocalPeerUploadSession){
   db.add(std::move(f));
   ed2k::net::IoRuntime rt;
   peer::InboundListener listener(rt.executor(), listen_port);
+  std::optional<share::UploadBandwidthThrottler> throttler;
+  if(limit_s && *limit_s) {
+    throttler.emplace(rt.executor(), static_cast<std::uint64_t>(std::stoull(limit_s)));
+  }
   std::printf("  ED2K_UPLOAD_LISTEN=%u\n", listener.local_port());
 
   run_coro(rt, [&]() -> asio::awaitable<void>{
     auto accepted = co_await listener.accept(120s);
     EXPECT_TRUE(accepted.has_value()) << (accepted ? "" : accepted.error().message());
     if(!accepted) co_return;
-    share::UploadSession session(std::move(*accepted), db, live_hello(), rt.disk_executor());
+    share::UploadSession session(std::move(*accepted), db, live_hello(), rt.disk_executor(), nullptr,
+                                 throttler ? &*throttler : nullptr);
     auto r = co_await session.run(120s);
     EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
     co_return;

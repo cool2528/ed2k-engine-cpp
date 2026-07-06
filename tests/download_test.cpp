@@ -393,6 +393,53 @@ TEST(Download, BlockLevelSingleSource){
   std::filesystem::remove_all(dir);
 }
 
+TEST(Download, ResumesFromAmulePartMetSibling){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_amule_resume"; std::filesystem::create_directories(dir);
+  auto path = dir/"001.part";
+  auto met = path; met += ".met";
+  auto wrong_met = path; wrong_met += ".part.met";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+
+  {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(mf.d0.data()), static_cast<std::streamsize>(mf.d0.size()));
+  }
+  {
+    PartFileState st;
+    st.hash = mf.fhash;
+    st.part_hashes = {mf.h0, mf.h1};
+    st.size = PART * 2;
+    st.gaps = {{PART, PART * 2}};
+    auto bytes = write_part_met(st);
+    std::ofstream m(met, std::ios::binary | std::ios::trunc);
+    m.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1});
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(mf.fhash).size(PART*2).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peer.port()}})
+                .build();
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  EXPECT_TRUE(std::filesystem::exists(met));
+  EXPECT_FALSE(std::filesystem::exists(wrong_met)) << "aMule .part output must not create 001.part.part.met";
+  EXPECT_EQ(std::filesystem::file_size(path), PART * 2);
+  std::filesystem::remove_all(dir);
+}
+
 // M4c 两级 per-part AICH 损坏恢复。client 可信根 = aich_hash_bytes(full); peer A 回匹配
 // master(取自 clean full)但 SENDINGPART 对 part0 块5 供 0xFF → verify_block 叶校验失败 →
 // 同源重试耗尽 → block_corrupt; peer B(clean) 续传完成。C2 先验证后写入: 块5 坏数据从未落盘。

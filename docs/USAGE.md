@@ -126,9 +126,11 @@ all of them concurrently (raccoon), with per-part MD4 verification and AICH corr
 - `--out:PATH` — output file path (default: the link's filename, or `download.bin`).
 - `--server:server.met` — server list to login through. Omit to use the internal fallback list.
 
-Download writes a sparse `PartFile` and a sidecar `<file>.part.met`. If the download is
-interrupted, re-running the same command resumes: already-MD4-verified parts are trusted from
-`.part.met` and skipped (no re-hash); partial parts are re-downloaded whole.
+Download writes a sparse `PartFile` and an aMule-compatible sidecar. Normal output paths use
+`<file>.part.met`; output paths that already end in `.part` use the sibling `<file>.part.met`
+name (`001.part` -> `001.part.met`) so aMule temp files can be handed in or out. If the
+download is interrupted, re-running the same command resumes: already-MD4-verified parts are
+trusted from `.part.met` and skipped (no re-hash); partial parts are re-downloaded whole.
 
 ```bash
 ed2k-tool download "ed2k://|file|ubuntu.iso|...|/" --out:ubuntu.iso --server:server.met

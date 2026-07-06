@@ -33,7 +33,7 @@ class PartFile {
   tl::expected<ed2k::share::KnownFile,std::error_code> to_known_file() const;
  private:
   std::filesystem::path path_;
-  std::filesystem::path met_path_;   // path_ + ".part.met" (P4c-3 M2 续传持久化)
+  std::filesystem::path met_path_;   // .part outputs use sibling .met; other outputs use .part.met
   std::uint64_t size_;
   FileHash file_hash_;
   std::vector<PartHash> part_hashes_;
