@@ -1,4 +1,5 @@
 #include "ed2k/server/connection.hpp"
+#include "ed2k/net/connection.hpp"
 #include "ed2k/net/framing.hpp"
 #include "ed2k/util/error.hpp"
 #include <chrono>
@@ -7,34 +8,49 @@ namespace ed2k::server {
 namespace asio = boost::asio;
 using clock_type = std::chrono::steady_clock;
 
-ServerConnection::ServerConnection(asio::any_io_executor ex) : conn_(ex) {}
-void ServerConnection::on_event(std::function<void(const ServerEvent&)> sink){ on_event_ = std::move(sink); }
-void ServerConnection::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
-  conn_.set_ip_filter(std::move(filter), level);
-}
-void ServerConnection::close() noexcept { conn_.close(); }
-bool ServerConnection::is_open() const noexcept { return conn_.is_open(); }
+struct ServerConnection::Impl {
+  explicit Impl(asio::any_io_executor ex) : conn(ex) {}
 
-void ServerConnection::dispatch_push(const net::Packet& pkt){
-  if(!on_event_) return;
+  void dispatch_push(const net::Packet& pkt);
+  asio::awaitable<tl::expected<net::Packet,std::error_code>>
+    pump_until(std::uint8_t want, std::chrono::milliseconds budget);
+
+  net::Connection conn;
+  std::function<void(const ServerEvent&)> on_event;
+};
+
+ServerConnection::ServerConnection(asio::any_io_executor ex) : impl_(std::make_unique<Impl>(ex)) {}
+ServerConnection::~ServerConnection() = default;
+ServerConnection::ServerConnection(ServerConnection&&) noexcept = default;
+ServerConnection& ServerConnection::operator=(ServerConnection&&) noexcept = default;
+
+void ServerConnection::on_event(std::function<void(const ServerEvent&)> sink){ impl_->on_event = std::move(sink); }
+void ServerConnection::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
+  impl_->conn.set_ip_filter(std::move(filter), level);
+}
+void ServerConnection::close() noexcept { impl_->conn.close(); }
+bool ServerConnection::is_open() const noexcept { return impl_->conn.is_open(); }
+
+void ServerConnection::Impl::dispatch_push(const net::Packet& pkt){
+  if(!on_event) return;
   std::span<const std::byte> p{pkt.payload};
   switch(pkt.opcode){
-    case op::SERVERMESSAGE: { auto d=decode_server_message(p); if(d) on_event_(ServerMessageEvent{std::move(*d)}); break; }
-    case op::SERVERSTATUS:  { auto d=decode_server_status(p);  if(d) on_event_(ServerStatusEvent{d->users,d->files}); break; }
-    case op::SERVERIDENT:   { auto d=decode_server_ident(p);   if(d) on_event_(ServerIdentEvent{d->hash,d->ip,d->port,d->name,d->description}); break; }
-    case op::SERVERLIST:    { auto d=decode_server_list(p);    if(d) on_event_(ServerListEvent{std::move(*d)}); break; }
-    case op::CALLBACKREQUESTED: { auto d=decode_callback_requested(p); if(d) on_event_(CallbackRequestedEvent{d->ip,d->port}); break; }
+    case op::SERVERMESSAGE: { auto d=decode_server_message(p); if(d) on_event(ServerMessageEvent{std::move(*d)}); break; }
+    case op::SERVERSTATUS:  { auto d=decode_server_status(p);  if(d) on_event(ServerStatusEvent{d->users,d->files}); break; }
+    case op::SERVERIDENT:   { auto d=decode_server_ident(p);   if(d) on_event(ServerIdentEvent{d->hash,d->ip,d->port,d->name,d->description}); break; }
+    case op::SERVERLIST:    { auto d=decode_server_list(p);    if(d) on_event(ServerListEvent{std::move(*d)}); break; }
+    case op::CALLBACKREQUESTED: { auto d=decode_callback_requested(p); if(d) on_event(CallbackRequestedEvent{d->ip,d->port}); break; }
     default: break;
   }
 }
 
 asio::awaitable<tl::expected<net::Packet,std::error_code>>
-ServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds budget){
+ServerConnection::Impl::pump_until(std::uint8_t want, std::chrono::milliseconds budget){
   auto deadline = clock_type::now() + budget;
   while(true){
     auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
     if(rem.count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
-    auto rp = co_await conn_.recv(rem);
+    auto rp = co_await conn.recv(rem);
     if(!rp) co_return tl::unexpected(rp.error());
     auto& pkt = *rp;
     if(pkt.opcode == want) co_return pkt;
@@ -53,12 +69,12 @@ ServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds budget
 
 asio::awaitable<tl::expected<LoginResult,std::error_code>>
 ServerConnection::connect_and_login(IPv4 ip, std::uint16_t port, const LoginParams& p, std::chrono::milliseconds timeout){
-  auto cr = co_await conn_.connect(ip, port, timeout);
+  auto cr = co_await impl_->conn.connect(ip, port, timeout);
   if(!cr) co_return tl::unexpected(cr.error());
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::LOGINREQUEST; req.payload = encode_login(p);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::IDCHANGE, timeout);
+  auto rp = co_await impl_->pump_until(op::IDCHANGE, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   auto ic = decode_id_change(rp->payload);
   if(!ic) co_return tl::unexpected(ic.error());
@@ -72,12 +88,12 @@ ServerConnection::connect_and_login_via_proxy(const infra::ProxyConfig& proxy,
                                               std::uint16_t port,
                                               const LoginParams& p,
                                               std::chrono::milliseconds timeout){
-  auto cr = co_await conn_.connect_via_proxy(proxy, ip, port, timeout);
+  auto cr = co_await impl_->conn.connect_via_proxy(proxy, ip, port, timeout);
   if(!cr) co_return tl::unexpected(cr.error());
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::LOGINREQUEST; req.payload = encode_login(p);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::IDCHANGE, timeout);
+  auto rp = co_await impl_->pump_until(op::IDCHANGE, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   auto ic = decode_id_change(rp->payload);
   if(!ic) co_return tl::unexpected(ic.error());
@@ -88,9 +104,9 @@ ServerConnection::connect_and_login_via_proxy(const infra::ProxyConfig& proxy,
 asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
 ServerConnection::search(const SearchExpr& expr, std::chrono::milliseconds timeout){
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::SEARCHREQUEST; req.payload = encode_search(expr);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::SEARCHRESULT, timeout);
+  auto rp = co_await impl_->pump_until(op::SEARCHRESULT, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_search_result(rp->payload);
 }
@@ -98,18 +114,18 @@ ServerConnection::search(const SearchExpr& expr, std::chrono::milliseconds timeo
 asio::awaitable<tl::expected<FoundSources,std::error_code>>
 ServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono::milliseconds timeout){
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::GETSOURCES; req.payload = encode_get_sources(h, size);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::FOUNDSOURCES, timeout);
+  auto rp = co_await impl_->pump_until(op::FOUNDSOURCES, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_found_sources(rp->payload);
 }
 asio::awaitable<tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::error_code>>
 ServerConnection::get_server_list(std::chrono::milliseconds timeout){
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::GETSERVERLIST; req.payload = encode_get_server_list();
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::SERVERLIST, timeout);
+  auto rp = co_await impl_->pump_until(op::SERVERLIST, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_server_list(rp->payload);
 }
@@ -118,19 +134,19 @@ ServerConnection::callback_request(std::uint32_t client_id, std::chrono::millise
   (void)timeout;
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::CALLBACKREQUEST;
   req.payload = encode_callback_request(client_id);
-  co_return co_await conn_.send(req);
+  co_return co_await impl_->conn.send(req);
 }
 
 asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::publish_files(std::span<const ed2k::share::KnownFile> files){
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::OFFERFILES;
   req.payload = encode_offer_files(files);
-  co_return co_await conn_.send(req);
+  co_return co_await impl_->conn.send(req);
 }
 
 asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::receive_events(std::chrono::milliseconds timeout){
-  auto rp = co_await pump_until(op::NONE, timeout);
+  auto rp = co_await impl_->pump_until(op::NONE, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return tl::expected<void,std::error_code>{};
 }

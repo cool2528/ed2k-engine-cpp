@@ -13,7 +13,6 @@
 #include <boost/asio/ip/tcp.hpp>
 #include "ed2k/core/hash.hpp"
 #include "ed2k/infra/ip_filter.hpp"
-#include "ed2k/net/connection.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 namespace ed2k::peer {
 struct C2CHandshakeResult {
@@ -24,7 +23,13 @@ struct C2CHandshakeResult {
 class C2CConnection {
  public:
   explicit C2CConnection(boost::asio::any_io_executor ex);
-  explicit C2CConnection(boost::asio::ip::tcp::socket&& s) : conn_(std::move(s)) {}
+  explicit C2CConnection(boost::asio::ip::tcp::socket&& s);
+  ~C2CConnection();
+  C2CConnection(const C2CConnection&) = delete;
+  C2CConnection& operator=(const C2CConnection&) = delete;
+  C2CConnection(C2CConnection&&) noexcept;
+  C2CConnection& operator=(C2CConnection&&) noexcept;
+
   void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout);
@@ -67,8 +72,7 @@ class C2CConnection {
     request_aich_proof(const FileHash&, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout);
   void close() noexcept;
  private:
-  boost::asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
-    pump_until(std::uint8_t want, std::chrono::milliseconds budget, std::optional<std::uint8_t> protocol = std::nullopt);
-  ed2k::net::Connection conn_;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 }

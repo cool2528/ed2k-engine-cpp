@@ -177,6 +177,37 @@ Download::run(std::chrono::milliseconds timeout){
   co_return tl::expected<void,std::error_code>{};
 }
 
+struct MultiSourceDownload::Impl {
+  Impl(boost::asio::any_io_executor net_ex,
+       boost::asio::any_io_executor disk_ex_arg,
+       std::filesystem::path out_arg, FileHash hash_arg, std::uint64_t size_arg,
+       std::optional<AICHHash> aich_arg,
+       std::vector<server::SourceEndpoint> sources_arg,
+       std::optional<std::reference_wrapper<server::ServerConnection>> server_conn_arg,
+       std::optional<std::reference_wrapper<peer::InboundListener>> listener_arg,
+       std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_arg,
+       std::shared_ptr<const infra::IPFilter> ip_filter_arg,
+       std::uint8_t ip_filter_level_arg)
+    : ex(net_ex), disk_ex(std::move(disk_ex_arg)), out(std::move(out_arg)), hash(hash_arg), size(size_arg),
+      aich(std::move(aich_arg)), sources(std::move(sources_arg)),
+      server_conn(std::move(server_conn_arg)), listener(std::move(listener_arg)),
+      kad_network(std::move(kad_network_arg)), ip_filter(std::move(ip_filter_arg)),
+      ip_filter_level(ip_filter_level_arg) {}
+
+  boost::asio::any_io_executor ex;
+  boost::asio::any_io_executor disk_ex;   // 默认 = ex (同步等效), Builder.disk_executor 注入 disk 池
+  std::filesystem::path out;
+  FileHash hash;
+  std::uint64_t size;
+  std::optional<AICHHash> aich;
+  std::vector<server::SourceEndpoint> sources;
+  std::optional<std::reference_wrapper<server::ServerConnection>> server_conn;
+  std::optional<std::reference_wrapper<peer::InboundListener>> listener;
+  std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network;
+  std::shared_ptr<const infra::IPFilter> ip_filter;
+  std::uint8_t ip_filter_level = 127;
+};
+
 MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
                                           const std::filesystem::path& out,
                                           const FileHash& hash, std::uint64_t size,
@@ -184,13 +215,34 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
                                           std::vector<server::SourceEndpoint> sources,
                                           server::ServerConnection* server_conn,
                                           peer::InboundListener* listener)
-  : ex_(ex), disk_ex_(ex), out_(out), hash_(hash), size_(size), aich_(aich),
-    sources_(std::move(sources)),
-    server_conn_(server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt),
-    listener_(listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt),
-    kad_network_(std::nullopt),
-    ip_filter_(nullptr),
-    ip_filter_level_(127) {}
+  : impl_(std::make_unique<Impl>(
+      ex, ex, out, hash, size, aich, std::move(sources),
+      server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt,
+      listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt,
+      std::nullopt, nullptr, 127)) {}
+
+MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor net_ex,
+                                         boost::asio::any_io_executor disk_ex,
+                                         std::filesystem::path out, FileHash hash, std::uint64_t size,
+                                         std::optional<AICHHash> aich,
+                                         std::vector<server::SourceEndpoint> sources,
+                                         std::optional<std::reference_wrapper<server::ServerConnection>> server_conn,
+                                         std::optional<std::reference_wrapper<peer::InboundListener>> listener,
+                                         std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network,
+                                         std::shared_ptr<const infra::IPFilter> ip_filter,
+                                         std::uint8_t ip_filter_level)
+  : impl_(std::make_unique<Impl>(net_ex, std::move(disk_ex), std::move(out), hash, size,
+                                 std::move(aich), std::move(sources), std::move(server_conn),
+                                 std::move(listener), std::move(kad_network), std::move(ip_filter),
+                                 ip_filter_level)) {}
+
+MultiSourceDownload::~MultiSourceDownload() = default;
+MultiSourceDownload::MultiSourceDownload(MultiSourceDownload&&) noexcept = default;
+MultiSourceDownload& MultiSourceDownload::operator=(MultiSourceDownload&&) noexcept = default;
+
+void MultiSourceDownload::set_disk_executor(boost::asio::any_io_executor ex) {
+  impl_->disk_ex = std::move(ex);
+}
 
 MultiSourceDownload MultiSourceDownload::Builder::build() {
   return MultiSourceDownload(net_ex_, disk_ex_, std::move(out_), hash_, size_,
@@ -470,22 +522,23 @@ peer_worker(boost::asio::any_io_executor ex,
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
                          std::size_t max_retries){
-  if(kad_network_){
-    auto& kad_network = kad_network_->get();
-    const auto file_id = kad_id_from_hash(hash_);
+  auto& self = *impl_;
+  if(self.kad_network){
+    auto& kad_network = self.kad_network->get();
+    const auto file_id = kad_id_from_hash(self.hash);
     auto peers = kad_network.routing_table().closest_to(file_id, kad::KBucket::capacity);
     if(!peers.empty()){
-      auto kad_sources = co_await kad_network.find_sources(peers, file_id, size_, total_timeout);
+      auto kad_sources = co_await kad_network.find_sources(peers, file_id, self.size, total_timeout);
       if(kad_sources){
         for(const auto& entry : *kad_sources){
           auto endpoint = endpoint_from_kad_source(entry);
           if(!endpoint) continue;
-          if(ip_filter_ && ip_filter_->blocked(IPv4::from_wire(endpoint->id), ip_filter_level_)) continue;
-          const auto duplicate = std::any_of(sources_.begin(), sources_.end(),
+          if(self.ip_filter && self.ip_filter->blocked(IPv4::from_wire(endpoint->id), self.ip_filter_level)) continue;
+          const auto duplicate = std::any_of(self.sources.begin(), self.sources.end(),
                                              [&](const server::SourceEndpoint& current){
                                                return same_source(current, *endpoint);
                                              });
-          if(!duplicate) sources_.push_back(*endpoint);
+          if(!duplicate) self.sources.push_back(*endpoint);
         }
       }
     }
@@ -495,32 +548,32 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   FetchResult fr;
   std::size_t setup_idx = 0;
   std::error_code setup_err = make_error_code(errc::connect_failed);
-  for(; setup_idx < sources_.size(); ++setup_idx){
-    auto r = co_await fetch_hashset(ex_, sources_[setup_idx], hash_, size_, total_timeout,
-                                    server_conn_, listener_, ip_filter_, ip_filter_level_);
+  for(; setup_idx < self.sources.size(); ++setup_idx){
+    auto r = co_await fetch_hashset(self.ex, self.sources[setup_idx], self.hash, self.size, total_timeout,
+                                    self.server_conn, self.listener, self.ip_filter, self.ip_filter_level);
     if(r){ fr = std::move(*r); break; }
     setup_err = r.error();
   }
-  if(setup_idx == sources_.size()) co_return tl::unexpected(setup_err);
+  if(setup_idx == self.sources.size()) co_return tl::unexpected(setup_err);
 
   // 共享状态 (仅网络线程访问 → 无锁)。pf 为空 (M1 不接 .part.met); alloc 从 pf 恢复 (全 pending)。
-  PartFile pf(out_, size_, hash_, fr.part_hashes);
-  BlockAllocator alloc(size_, fr.part_hashes, aich_, pf);
-  std::size_t n_workers = sources_.size() - setup_idx;
-  SharedState st{std::move(pf), std::move(alloc), std::nullopt, aich_, hash_, size_,
-                 disk_ex_, false, n_workers, std::nullopt};
-  if(aich_) st.checker.emplace(*aich_, size_);
+  PartFile pf(self.out, self.size, self.hash, fr.part_hashes);
+  BlockAllocator alloc(self.size, fr.part_hashes, self.aich, pf);
+  std::size_t n_workers = self.sources.size() - setup_idx;
+  SharedState st{std::move(pf), std::move(alloc), std::nullopt, self.aich, self.hash, self.size,
+                 self.disk_ex, false, n_workers, std::nullopt};
+  if(self.aich) st.checker.emplace(*self.aich, self.size);
 
   // 阶段二: raccoon — N worker 并发。worker[setup_idx] 复用 setup 连接, 其余全新连接。
-  ResultCh done_ch(ex_, n_workers);      // capacity = N
-  for(std::size_t i = setup_idx; i < sources_.size(); ++i){
+  ResultCh done_ch(self.ex, n_workers);      // capacity = N
+  for(std::size_t i = setup_idx; i < self.sources.size(); ++i){
     std::optional<ed2k::peer::C2CConnection> pre_conn;
     std::vector<bool> pre_parts;
     if(i == setup_idx){ pre_conn = std::move(fr.conn); pre_parts = std::move(fr.fs_parts); }
-    boost::asio::co_spawn(ex_,
-      peer_worker(ex_, sources_[i], std::move(pre_conn), std::move(pre_parts), st,
-                  total_timeout, max_retries, server_conn_, listener_,
-                  ip_filter_, ip_filter_level_, done_ch),
+    boost::asio::co_spawn(self.ex,
+      peer_worker(self.ex, self.sources[i], std::move(pre_conn), std::move(pre_parts), st,
+                  total_timeout, max_retries, self.server_conn, self.listener,
+                  self.ip_filter, self.ip_filter_level, done_ch),
       boost::asio::detached);
   }
   // 收集 N 个完成信号 (worker 退出即 try_send; run 挂起在 async_receive, 网络线程跑 worker)。

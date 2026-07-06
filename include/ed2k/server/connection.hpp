@@ -12,7 +12,6 @@
 #include "ed2k/core/hash.hpp"          // MD4Hash/IPv4/FileHash
 #include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/infra/proxy.hpp"
-#include "ed2k/net/connection.hpp"     // net::Connection
 #include "ed2k/server/messages.hpp"    // LoginParams/SearchResultItem/FoundSources/decode_*
 #include "ed2k/server/search_query.hpp"// SearchExpr
 #include "ed2k/share/known_file.hpp"
@@ -31,6 +30,12 @@ using ServerEvent = std::variant<ServerStatusEvent, ServerMessageEvent, ServerId
 class ServerConnection {
  public:
   explicit ServerConnection(boost::asio::any_io_executor ex);
+  ~ServerConnection();
+  ServerConnection(const ServerConnection&) = delete;
+  ServerConnection& operator=(const ServerConnection&) = delete;
+  ServerConnection(ServerConnection&&) noexcept;
+  ServerConnection& operator=(ServerConnection&&) noexcept;
+
   void on_event(std::function<void(const ServerEvent&)> sink);
   void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
 
@@ -57,10 +62,7 @@ class ServerConnection {
   void close() noexcept;
   bool is_open() const noexcept;
  private:
-  boost::asio::awaitable<tl::expected<net::Packet,std::error_code>>
-    pump_until(std::uint8_t want_opcode, std::chrono::milliseconds total_budget);
-  void dispatch_push(const net::Packet& pkt);
-  net::Connection conn_;
-  std::function<void(const ServerEvent&)> on_event_;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 }

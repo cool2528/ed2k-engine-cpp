@@ -85,15 +85,16 @@ class MultiSourceDownload {
                       peer::InboundListener* listener = nullptr);
 
   [[deprecated("Use Builder.disk_executor()")]]
-  void set_disk_executor(boost::asio::any_io_executor ex) { disk_ex_ = std::move(ex); }
+  void set_disk_executor(boost::asio::any_io_executor ex);
 
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(
     std::chrono::milliseconds total_timeout, std::size_t max_retries = 3);
 
   MultiSourceDownload(const MultiSourceDownload&) = delete;
   MultiSourceDownload& operator=(const MultiSourceDownload&) = delete;
-  MultiSourceDownload(MultiSourceDownload&&) noexcept = default;
-  MultiSourceDownload& operator=(MultiSourceDownload&&) noexcept = default;
+  ~MultiSourceDownload();
+  MultiSourceDownload(MultiSourceDownload&&) noexcept;
+  MultiSourceDownload& operator=(MultiSourceDownload&&) noexcept;
  private:
   MultiSourceDownload(boost::asio::any_io_executor net_ex,
                       boost::asio::any_io_executor disk_ex,
@@ -104,24 +105,9 @@ class MultiSourceDownload {
                       std::optional<std::reference_wrapper<peer::InboundListener>> listener,
                       std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network,
                       std::shared_ptr<const infra::IPFilter> ip_filter,
-                      std::uint8_t ip_filter_level)
-    : ex_(net_ex), disk_ex_(disk_ex), out_(std::move(out)), hash_(hash), size_(size),
-      aich_(std::move(aich)), sources_(std::move(sources)),
-      server_conn_(std::move(server_conn)), listener_(std::move(listener)),
-      kad_network_(std::move(kad_network)), ip_filter_(std::move(ip_filter)),
-      ip_filter_level_(ip_filter_level) {}
-  boost::asio::any_io_executor ex_;
-  boost::asio::any_io_executor disk_ex_;   // 默认 = ex_ (同步等效), Builder.disk_executor 注入 disk 池
-  std::filesystem::path out_;
-  FileHash hash_;
-  std::uint64_t size_;
-  std::optional<AICHHash> aich_;
-  std::vector<server::SourceEndpoint> sources_;
-  std::optional<std::reference_wrapper<server::ServerConnection>> server_conn_;
-  std::optional<std::reference_wrapper<peer::InboundListener>> listener_;
-  std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
-  std::shared_ptr<const infra::IPFilter> ip_filter_;
-  std::uint8_t ip_filter_level_ = 127;
+                      std::uint8_t ip_filter_level);
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
   friend class Builder;
 };
 

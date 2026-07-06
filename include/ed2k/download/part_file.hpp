@@ -2,9 +2,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
+#include <memory>
 #include <span>
-#include <utility>
 #include <vector>
 #include <tl/expected.hpp>
 #include <boost/asio/any_io_executor.hpp>
@@ -17,6 +16,12 @@ namespace ed2k::download {
 class PartFile {
  public:
   PartFile(const std::filesystem::path& path, std::uint64_t size, const FileHash& file_hash, std::vector<PartHash> part_hashes);
+  ~PartFile();
+  PartFile(const PartFile&) = delete;
+  PartFile& operator=(const PartFile&) = delete;
+  PartFile(PartFile&&) noexcept;
+  PartFile& operator=(PartFile&&) noexcept;
+
   bool open_for_write() const noexcept;
   std::vector<std::uint32_t> missing_parts_peer_has(const std::vector<bool>& peer_parts) const;
   tl::expected<void,std::error_code> write_block(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data);
@@ -32,32 +37,7 @@ class PartFile {
   std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps() const;
   tl::expected<ed2k::share::KnownFile,std::error_code> to_known_file() const;
  private:
-  std::filesystem::path path_;
-  std::filesystem::path met_path_;   // .part outputs use sibling .met; other outputs use .part.met
-  std::uint64_t size_;
-  FileHash file_hash_;
-  std::vector<PartHash> part_hashes_;
-  std::vector<bool> part_done_;
-  std::vector<std::uint64_t> part_filled_;  // 每 part 已写入字节数，用于增量组装后触发 MD4 校验
-  std::vector<std::vector<bool>> block_done_;  // block_done_[part][block_in_part]; 块不跨 part 边界
-  std::fstream f_;
-
-  // 数据 part 数 = ceil(size/PART_SIZE)。aMule GetPartCount() 同此 (块分配/完成判定基准)。
-  // part_hashes_ 可能多 1 (Red 变体: 文件恰为 PART_SIZE 整数倍时 aMule 追加空尾 part MD4(""),
-  // 见 ed2k_hasher HashVariant::Red + aMule SendHashsetPacket)。空尾 part 无数据, 不参与块分配/
-  // 完成判定, 仅存于 part_hashes_ 供 hashset/.met 保真。故 num_parts 取 size_ 而非 hash 计数。
-  std::size_t num_parts() const { return (size_ + PART_SIZE - 1) / PART_SIZE; }
-  std::uint64_t part_size(std::size_t part) const {
-    std::uint64_t base = static_cast<std::uint64_t>(part) * PART_SIZE;
-    if (base >= size_) return 0;
-    return std::min(PART_SIZE, size_ - base);
-  }
-  std::size_t blocks_in_part(std::size_t part) const {
-    return static_cast<std::size_t>((part_size(part) + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
-  }
-  // P4c-3 M2: .part.met 续传。met-first 恢复 (避整文件重哈希, D1); 失败/陈旧回退 rehash_all。
-  bool try_load_met();           // 解析 .part.met → 恢复 part_done_/block_done_; 返回是否成功应用
-  void rehash_all();             // 回退路径: 逐 part 回读 + MD4 校验 (P4a 原续传逻辑)
-  void save_met() const;         // 把当前 gaps() 落盘 .part.met (part 完成时调用)
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 }

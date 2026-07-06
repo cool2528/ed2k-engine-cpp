@@ -1,4 +1,5 @@
 #include "ed2k/peer/c2c_connection.hpp"
+#include "ed2k/net/connection.hpp"
 #include "ed2k/net/framing.hpp"
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/util/error.hpp"
@@ -130,24 +131,40 @@ accumulate_blocks(net::Connection& conn, const FileHash& h,
 }
 }  // namespace
 
-C2CConnection::C2CConnection(asio::any_io_executor ex) : conn_(ex) {}
-void C2CConnection::close() noexcept { conn_.close(); }
+struct C2CConnection::Impl {
+  explicit Impl(asio::any_io_executor ex) : conn(ex) {}
+  explicit Impl(asio::ip::tcp::socket&& s) : conn(std::move(s)) {}
+
+  asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
+    pump_until(std::uint8_t want, std::chrono::milliseconds budget,
+               std::optional<std::uint8_t> protocol = std::nullopt);
+
+  ed2k::net::Connection conn;
+};
+
+C2CConnection::C2CConnection(asio::any_io_executor ex) : impl_(std::make_unique<Impl>(ex)) {}
+C2CConnection::C2CConnection(asio::ip::tcp::socket&& s) : impl_(std::make_unique<Impl>(std::move(s))) {}
+C2CConnection::~C2CConnection() = default;
+C2CConnection::C2CConnection(C2CConnection&&) noexcept = default;
+C2CConnection& C2CConnection::operator=(C2CConnection&&) noexcept = default;
+
+void C2CConnection::close() noexcept { impl_->conn.close(); }
 void C2CConnection::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
-  conn_.set_ip_filter(std::move(filter), level);
+  impl_->conn.set_ip_filter(std::move(filter), level);
 }
 
 asio::awaitable<tl::expected<void,std::error_code>>
 C2CConnection::connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout){
-  co_return co_await conn_.connect(ip, port, timeout);
+  co_return co_await impl_->conn.connect(ip, port, timeout);
 }
 
 asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
-C2CConnection::pump_until(std::uint8_t want, std::chrono::milliseconds budget, std::optional<std::uint8_t> protocol){
+C2CConnection::Impl::pump_until(std::uint8_t want, std::chrono::milliseconds budget, std::optional<std::uint8_t> protocol){
   auto deadline = clock_type::now() + budget;
   while(true){
     auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
     if(rem.count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
-    auto rp = co_await conn_.recv(rem);
+    auto rp = co_await conn.recv(rem);
     if(!rp) co_return tl::unexpected(rp.error());
     auto pkt = std::move(*rp);
     if(pkt.opcode == want && (!protocol || pkt.protocol == *protocol)) co_return std::move(pkt);
@@ -160,9 +177,9 @@ C2CConnection::pump_until(std::uint8_t want, std::chrono::milliseconds budget, s
 asio::awaitable<tl::expected<HelloInfo,std::error_code>>
 C2CConnection::handshake(const HelloInfo& mine, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::HELLO; req.payload=encode_hello_packet(mine);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::HELLOANSWER, timeout, ed2k::net::proto::eDonkey);
+  auto rp = co_await impl_->pump_until(op::HELLOANSWER, timeout, ed2k::net::proto::eDonkey);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_hello_answer(rp->payload);
 }
@@ -179,67 +196,67 @@ C2CConnection::handshake_acceptor(const HelloInfo& mine, std::chrono::millisecon
   // acceptor: peer (TCP initiator) sends HELLO first; we decode it then reply HELLOANSWER.
   // HELLO 与 HELLOANSWER 不对称: HELLO 前导 0x10 hashsize 字节, HELLOANSWER 无前导(aMule BaseClient.cpp)。
   // 故对端 HELLO 用 decode_hello(校验并跳过 0x10);我方 HELLOANSWER 用 encode_hello(无前导)。
-  auto rp = co_await pump_until(op::HELLO, timeout, ed2k::net::proto::eDonkey);
+  auto rp = co_await impl_->pump_until(op::HELLO, timeout, ed2k::net::proto::eDonkey);
   if(!rp) co_return tl::unexpected(rp.error());
   auto peer = decode_hello(rp->payload);
   if(!peer) co_return tl::unexpected(peer.error());
   ed2k::net::Packet ans; ans.protocol=ed2k::net::proto::eDonkey; ans.opcode=op::HELLOANSWER; ans.payload=encode_hello(mine);
-  auto sr = co_await conn_.send(ans);
+  auto sr = co_await impl_->conn.send(ans);
   if(!sr) co_return tl::unexpected(sr.error());
   co_return std::move(*peer);
 }
 asio::awaitable<tl::expected<C2CHandshakeResult,std::error_code>>
 C2CConnection::handshake_acceptor_with_mule_info(const HelloInfo& mine, const MuleInfo& mule_info, std::chrono::milliseconds timeout){
-  auto rp = co_await pump_until(op::HELLO, timeout, ed2k::net::proto::eDonkey);
+  auto rp = co_await impl_->pump_until(op::HELLO, timeout, ed2k::net::proto::eDonkey);
   if(!rp) co_return tl::unexpected(rp.error());
   auto peer = decode_hello(rp->payload);
   if(!peer) co_return tl::unexpected(peer.error());
   ed2k::net::Packet ans; ans.protocol=ed2k::net::proto::eDonkey; ans.opcode=op::HELLOANSWER; ans.payload=encode_hello(mine);
-  auto sr = co_await conn_.send(ans);
+  auto sr = co_await impl_->conn.send(ans);
   if(!sr) co_return tl::unexpected(sr.error());
 
-  auto mule_req = co_await pump_until(op::EMULEINFO, timeout, ed2k::net::proto::eMule);
+  auto mule_req = co_await impl_->pump_until(op::EMULEINFO, timeout, ed2k::net::proto::eMule);
   if(!mule_req) co_return tl::unexpected(mule_req.error());
   auto peer_mule = decode_mule_info(mule_req->payload);
   if(!peer_mule) co_return tl::unexpected(peer_mule.error());
   ed2k::net::Packet mule_ans; mule_ans.protocol=ed2k::net::proto::eMule; mule_ans.opcode=op::EMULEINFOANSWER; mule_ans.payload=encode_mule_info(mule_info);
-  auto msr = co_await conn_.send(mule_ans);
+  auto msr = co_await impl_->conn.send(mule_ans);
   if(!msr) co_return tl::unexpected(msr.error());
   co_return C2CHandshakeResult{std::move(*peer), std::move(*peer_mule)};
 }
 asio::awaitable<tl::expected<MuleInfo,std::error_code>>
 C2CConnection::exchange_mule_info(const MuleInfo& mine, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::EMULEINFO; req.payload=encode_mule_info(mine);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::EMULEINFOANSWER, timeout, ed2k::net::proto::eMule);
+  auto rp = co_await impl_->pump_until(op::EMULEINFOANSWER, timeout, ed2k::net::proto::eMule);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_mule_info(rp->payload);
 }
 asio::awaitable<tl::expected<FileStatus,std::error_code>>
 C2CConnection::request_file(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::SETREQFILEID; req.payload=encode_set_req_file(h);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::FILESTATUS, timeout);
+  auto rp = co_await impl_->pump_until(op::FILESTATUS, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_file_status(rp->payload);
 }
 asio::awaitable<tl::expected<std::vector<PartHash>,std::error_code>>
 C2CConnection::request_hashset(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::HASHSETREQUEST; req.payload=encode_hashset_request(h);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::HASHSETANSWER, timeout);
+  auto rp = co_await impl_->pump_until(op::HASHSETANSWER, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_hashset_answer(h, rp->payload);
 }
 asio::awaitable<tl::expected<std::string,std::error_code>>
 C2CConnection::request_filename(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::REQUESTFILENAME; req.payload=encode_request_filename(h);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::REQFILENAMEANSWER, timeout);
+  auto rp = co_await impl_->pump_until(op::REQFILENAMEANSWER, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   auto a = decode_req_filename_answer(rp->payload);
   if(!a) co_return tl::unexpected(a.error());
@@ -248,18 +265,18 @@ C2CConnection::request_filename(const FileHash& h, std::chrono::milliseconds tim
 asio::awaitable<tl::expected<void,std::error_code>>
 C2CConnection::start_upload(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::STARTUPLOADREQ; req.payload=encode_start_upload(h);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::ACCEPTUPLOADREQ, timeout);
+  auto rp = co_await impl_->pump_until(op::ACCEPTUPLOADREQ, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return tl::expected<void,std::error_code>{};
 }
 asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
 C2CConnection::request_blocks(const FileHash& h, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::REQUESTPARTS; req.payload=encode_request_parts(h, starts, ends);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  co_return co_await accumulate_blocks(conn_, h,
+  co_return co_await accumulate_blocks(impl_->conn, h,
     std::array<std::uint64_t,3>{starts[0], starts[1], starts[2]},
     std::array<std::uint64_t,3>{ends[0], ends[1], ends[2]},
     op::SENDINGPART, op::COMPRESSEDPART,
@@ -271,9 +288,9 @@ C2CConnection::request_blocks(const FileHash& h, std::array<std::uint32_t,3> sta
 asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
 C2CConnection::request_blocks_i64(const FileHash& h, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::REQUESTPARTS_I64; req.payload=encode_request_parts_i64(h, starts, ends);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  co_return co_await accumulate_blocks(conn_, h, starts, ends,
+  co_return co_await accumulate_blocks(impl_->conn, h, starts, ends,
     op::SENDINGPART_I64, op::COMPRESSEDPART_I64,
     [](std::span<const std::byte> p) { return decode_sending_part_i64(p); },
     [](std::span<const std::byte> p) { return decode_compressed_part_i64_segment(p); },
@@ -284,9 +301,9 @@ asio::awaitable<tl::expected<AICHHash,std::error_code>>
 C2CConnection::request_aich_master_hash(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::AICHFILEHASHREQ;
   req.payload=encode_aich_file_hash_req(h);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::AICHFILEHASHANS, timeout, ed2k::net::proto::eMule);
+  auto rp = co_await impl_->pump_until(op::AICHFILEHASHANS, timeout, ed2k::net::proto::eMule);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return decode_aich_file_hash_ans(rp->payload);
 }
@@ -295,9 +312,9 @@ asio::awaitable<tl::expected<SourceExchangeAnswer,std::error_code>>
 C2CConnection::request_sources2(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::MULTIPACKET;
   req.payload=encode_multipacket_request_sources2(h);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::ANSWERSOURCES2, timeout, ed2k::net::proto::eMule);
+  auto rp = co_await impl_->pump_until(op::ANSWERSOURCES2, timeout, ed2k::net::proto::eMule);
   if(!rp) co_return tl::unexpected(rp.error());
   auto ans = decode_answer_sources2(rp->payload);
   if(!ans) co_return tl::unexpected(ans.error());
@@ -311,16 +328,16 @@ C2CConnection::send_file_desc(std::uint8_t rating, std::string_view comment){
   req.protocol = ed2k::net::proto::eMule;
   req.opcode = op::FILEDESC;
   req.payload = encode_file_desc(rating, comment);
-  co_return co_await conn_.send(req);
+  co_return co_await impl_->conn.send(req);
 }
 
 asio::awaitable<tl::expected<AICHRecoveryData,std::error_code>>
 C2CConnection::request_aich_proof(const FileHash& h, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eMule; req.opcode=op::AICHREQUEST;
   req.payload=encode_aich_request(h, master, part_index);
-  auto sr = co_await conn_.send(req);
+  auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await pump_until(op::AICHANSWER, timeout, ed2k::net::proto::eMule);
+  auto rp = co_await impl_->pump_until(op::AICHANSWER, timeout, ed2k::net::proto::eMule);
   if(!rp) co_return tl::unexpected(rp.error());
   // 校验回显的 master_hash 与请求一致 (aMule DownloadClient.cpp:1634 ahMasterHash == GetMasterHash):
   // 帧 = file_hash(16) + part_index(2) + master_hash(20) + V2 data,master_hash 在偏移 18..38。
