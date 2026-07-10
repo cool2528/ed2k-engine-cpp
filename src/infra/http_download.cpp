@@ -4,9 +4,11 @@
 #include <array>
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
-#include <iterator>
+#include <optional>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -30,11 +32,42 @@ using tcp = asio::ip::tcp;
 
 namespace {
 
+enum class URLScheme { http, https };
+
 struct ParsedURL {
+  URLScheme scheme = URLScheme::http;
   std::string host;
   std::uint16_t port = 80;
-  std::string path = "/";
+  std::string target = "/";
 };
+
+struct ResponseHead {
+  unsigned status = 0;
+  std::optional<std::size_t> content_length;
+  std::optional<std::string> location;
+};
+
+struct HTTPResponse {
+  ResponseHead head;
+  std::vector<std::byte> body;
+};
+
+std::string lower_ascii(std::string text) {
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return text;
+}
+
+std::string_view trim_ascii(std::string_view text) {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) {
+    text.remove_suffix(1);
+  }
+  return text;
+}
 
 tl::expected<std::uint16_t, std::error_code> parse_port(std::string_view text) {
   std::uint32_t port = 0;
@@ -45,106 +78,259 @@ tl::expected<std::uint16_t, std::error_code> parse_port(std::string_view text) {
   return static_cast<std::uint16_t>(port);
 }
 
-tl::expected<ParsedURL, std::error_code> parse_http_url(std::string_view url) {
-  constexpr std::string_view http = "http://";
-  constexpr std::string_view https = "https://";
-  if (url.substr(0, https.size()) == https) {
-    return tl::unexpected(make_error_code(errc::unsupported_version));
+std::string normalize_target(std::string_view target) {
+  const auto query_pos = target.find('?');
+  auto path = target.substr(0, query_pos);
+  const auto query = query_pos == std::string_view::npos ? std::string_view{} : target.substr(query_pos);
+  if (path.empty()) {
+    path = "/";
   }
-  if (url.substr(0, http.size()) != http) {
+
+  const bool trailing_slash = path.size() > 1 && path.back() == '/';
+  std::vector<std::string_view> segments;
+  std::size_t pos = 0;
+  while (pos < path.size()) {
+    while (pos < path.size() && path[pos] == '/') {
+      ++pos;
+    }
+    const auto end = path.find('/', pos);
+    const auto segment = path.substr(pos, end == std::string_view::npos ? path.size() - pos : end - pos);
+    if (segment == "..") {
+      if (!segments.empty()) {
+        segments.pop_back();
+      }
+    } else if (!segment.empty() && segment != ".") {
+      segments.push_back(segment);
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    pos = end + 1;
+  }
+
+  std::string normalized = "/";
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    if (i != 0) {
+      normalized.push_back('/');
+    }
+    normalized.append(segments[i]);
+  }
+  if (trailing_slash && normalized.back() != '/') {
+    normalized.push_back('/');
+  }
+  normalized.append(query);
+  return normalized;
+}
+
+tl::expected<ParsedURL, std::error_code> parse_url(std::string_view url) {
+  const auto scheme_end = url.find("://");
+  if (scheme_end == std::string_view::npos) {
     return tl::unexpected(make_error_code(errc::malformed_link));
   }
 
   ParsedURL out;
-  auto rest = url.substr(http.size());
-  const auto slash = rest.find('/');
-  const auto authority = rest.substr(0, slash);
-  out.path = slash == std::string_view::npos ? "/" : std::string(rest.substr(slash));
-  if (authority.empty()) {
+  const auto scheme = lower_ascii(std::string(url.substr(0, scheme_end)));
+  if (scheme == "http") {
+    out.scheme = URLScheme::http;
+    out.port = 80;
+  } else if (scheme == "https") {
+    out.scheme = URLScheme::https;
+    out.port = 443;
+  } else {
     return tl::unexpected(make_error_code(errc::malformed_link));
   }
 
-  const auto colon = authority.rfind(':');
-  if (colon != std::string_view::npos) {
-    out.host.assign(authority.substr(0, colon));
-    auto port = parse_port(authority.substr(colon + 1));
-    if (!port) {
-      return tl::unexpected(port.error());
+  auto rest = url.substr(scheme_end + 3);
+  const auto authority_end = rest.find_first_of("/?#");
+  const auto authority = rest.substr(0, authority_end);
+  if (authority.empty() || authority.find('@') != std::string_view::npos) {
+    return tl::unexpected(make_error_code(errc::malformed_link));
+  }
+
+  if (authority.front() == '[') {
+    const auto bracket = authority.find(']');
+    if (bracket == std::string_view::npos) {
+      return tl::unexpected(make_error_code(errc::malformed_link));
     }
-    out.port = *port;
+    out.host.assign(authority.substr(1, bracket - 1));
+    const auto suffix = authority.substr(bracket + 1);
+    if (!suffix.empty()) {
+      if (suffix.front() != ':') {
+        return tl::unexpected(make_error_code(errc::malformed_link));
+      }
+      auto port = parse_port(suffix.substr(1));
+      if (!port) {
+        return tl::unexpected(port.error());
+      }
+      out.port = *port;
+    }
   } else {
-    out.host.assign(authority);
+    const auto colon = authority.rfind(':');
+    if (colon != std::string_view::npos) {
+      if (authority.find(':') != colon) {
+        return tl::unexpected(make_error_code(errc::malformed_link));
+      }
+      out.host.assign(authority.substr(0, colon));
+      auto port = parse_port(authority.substr(colon + 1));
+      if (!port) {
+        return tl::unexpected(port.error());
+      }
+      out.port = *port;
+    } else {
+      out.host.assign(authority);
+    }
   }
   if (out.host.empty()) {
+    return tl::unexpected(make_error_code(errc::malformed_link));
+  }
+
+  if (authority_end != std::string_view::npos && rest[authority_end] != '#') {
+    auto raw_target = rest.substr(authority_end);
+    const auto fragment = raw_target.find('#');
+    raw_target = raw_target.substr(0, fragment);
+    out.target = raw_target.front() == '?' ? "/" + std::string(raw_target)
+                                           : normalize_target(raw_target);
+  }
+  if (out.host.find_first_of("\r\n") != std::string::npos ||
+      out.target.find_first_of("\r\n") != std::string::npos) {
     return tl::unexpected(make_error_code(errc::malformed_link));
   }
   return out;
 }
 
-std::string lower_ascii(std::string text) {
-  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return text;
+std::string scheme_name(URLScheme scheme) {
+  return scheme == URLScheme::http ? "http" : "https";
 }
 
-tl::expected<std::size_t, std::error_code> content_length_from(std::string_view headers) {
-  std::size_t pos = 0;
+std::string url_key(const ParsedURL& url) {
+  return scheme_name(url.scheme) + "://" + lower_ascii(url.host) + ":" +
+         std::to_string(url.port) + url.target;
+}
+
+tl::expected<ParsedURL, std::error_code>
+resolve_location(const ParsedURL& base, std::string_view location) {
+  location = trim_ascii(location);
+  const auto fragment = location.find('#');
+  location = location.substr(0, fragment);
+  if (location.empty()) {
+    return base;
+  }
+
+  if (location.find("://") != std::string_view::npos) {
+    return parse_url(location);
+  }
+  if (location.starts_with("//")) {
+    return parse_url(scheme_name(base.scheme) + ":" + std::string(location));
+  }
+
+  ParsedURL resolved = base;
+  if (location.front() == '/') {
+    resolved.target = normalize_target(location);
+  } else if (location.front() == '?') {
+    const auto query = base.target.find('?');
+    resolved.target = base.target.substr(0, query) + std::string(location);
+  } else {
+    const auto query = base.target.find('?');
+    const auto base_path = std::string_view(base.target).substr(0, query);
+    const auto slash = base_path.rfind('/');
+    const auto directory = base_path.substr(0, slash == std::string_view::npos ? 0 : slash + 1);
+    resolved.target = normalize_target(std::string(directory) + std::string(location));
+  }
+  return resolved;
+}
+
+tl::expected<ResponseHead, std::error_code> parse_response_head(std::string_view headers) {
+  const auto status_end = headers.find("\r\n");
+  if (status_end == std::string_view::npos) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+
+  const auto status_line = headers.substr(0, status_end);
+  if (!status_line.starts_with("HTTP/")) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  const auto first_space = status_line.find(' ');
+  if (first_space == std::string_view::npos) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  auto status_text = status_line.substr(first_space + 1);
+  while (!status_text.empty() && status_text.front() == ' ') {
+    status_text.remove_prefix(1);
+  }
+  if (status_text.size() < 3) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+
+  ResponseHead out;
+  auto [status_ptr, status_ec] =
+    std::from_chars(status_text.data(), status_text.data() + 3, out.status);
+  if (status_ec != std::errc{} || status_ptr != status_text.data() + 3 ||
+      (status_text.size() > 3 && status_text[3] != ' ')) {
+    return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+
+  std::size_t pos = status_end + 2;
   while (pos < headers.size()) {
     const auto end = headers.find("\r\n", pos);
     const auto line = headers.substr(pos, end == std::string_view::npos ? headers.size() - pos : end - pos);
+    if (line.empty()) {
+      break;
+    }
     const auto colon = line.find(':');
-    if (colon != std::string_view::npos) {
-      auto name = lower_ascii(std::string(line.substr(0, colon)));
-      if (name == "content-length") {
-        auto value = line.substr(colon + 1);
-        while (!value.empty() && value.front() == ' ') {
-          value.remove_prefix(1);
-        }
-        std::size_t length = 0;
-        auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), length);
-        if (ec == std::errc{} && ptr == value.data() + value.size()) {
-          return length;
-        }
+    if (colon == std::string_view::npos) {
+      return tl::unexpected(make_error_code(errc::server_protocol_error));
+    }
+    const auto name = lower_ascii(std::string(trim_ascii(line.substr(0, colon))));
+    const auto value = trim_ascii(line.substr(colon + 1));
+    if (name == "content-length") {
+      std::size_t length = 0;
+      auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), length);
+      if (ec != std::errc{} || ptr != value.data() + value.size() ||
+          (out.content_length && *out.content_length != length)) {
+        return tl::unexpected(make_error_code(errc::server_protocol_error));
       }
+      out.content_length = length;
+    } else if (name == "location") {
+      if (value.empty() || out.location) {
+        return tl::unexpected(make_error_code(errc::server_protocol_error));
+      }
+      out.location = std::string(value);
     }
     if (end == std::string_view::npos) {
       break;
     }
     pos = end + 2;
   }
-  return tl::unexpected(make_error_code(errc::server_protocol_error));
+  return out;
 }
 
-bool success_status(std::string_view headers) {
-  const auto end = headers.find("\r\n");
-  const auto status = headers.substr(0, end == std::string_view::npos ? headers.size() : end);
-  return status.find(" 200 ") != std::string_view::npos || status.ends_with(" 200");
+bool success_status(unsigned status) {
+  return status >= 200 && status < 300;
 }
 
-} // namespace
+bool redirect_status(unsigned status) {
+  return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
 
-HTTPDownload::HTTPDownload(asio::any_io_executor ex) : executor_(std::move(ex)) {}
+std::string host_header(const ParsedURL& url) {
+  const bool ipv6 = url.host.find(':') != std::string::npos;
+  return (ipv6 ? "[" + url.host + "]" : url.host) + ":" + std::to_string(url.port);
+}
 
-asio::awaitable<tl::expected<void, std::error_code>>
-HTTPDownload::fetch(const std::string& url,
-                    const std::filesystem::path& destination,
-                    std::chrono::milliseconds timeout) {
-  auto parsed = parse_http_url(url);
-  if (!parsed) {
-    co_return tl::unexpected(parsed.error());
-  }
-
-  tcp::resolver resolver(executor_);
+asio::awaitable<tl::expected<HTTPResponse, std::error_code>>
+request_http(asio::any_io_executor executor,
+             const ParsedURL& parsed,
+             std::chrono::milliseconds timeout) {
+  tcp::resolver resolver(executor);
   auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
-    parsed->host,
-    std::to_string(parsed->port),
+    parsed.host,
+    std::to_string(parsed.port),
     asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
   if (resolve_ec) {
     co_return tl::unexpected(make_error_code(errc::connect_failed));
   }
 
-  tcp::socket socket(executor_);
+  tcp::socket socket(executor);
   auto [connect_ec, endpoint] = co_await asio::async_connect(
     socket,
     endpoints,
@@ -156,8 +342,8 @@ HTTPDownload::fetch(const std::string& url,
   }
 
   const std::string request =
-    "GET " + parsed->path + " HTTP/1.1\r\n"
-    "Host: " + parsed->host + ":" + std::to_string(parsed->port) + "\r\n"
+    "GET " + parsed.target + " HTTP/1.1\r\n"
+    "Host: " + host_header(parsed) + "\r\n"
     "Connection: close\r\n\r\n";
   auto [write_ec, written] = co_await asio::async_write(
     socket,
@@ -185,25 +371,26 @@ HTTPDownload::fetch(const std::string& url,
   if (header_end == std::string::npos) {
     co_return tl::unexpected(make_error_code(errc::server_protocol_error));
   }
-  const auto headers = std::string_view(buffered).substr(0, header_end + 2);
-  if (!success_status(headers)) {
-    co_return tl::unexpected(make_error_code(errc::server_protocol_error));
-  }
-  auto expected_length = content_length_from(headers);
-  if (!expected_length) {
-    co_return tl::unexpected(expected_length.error());
+  auto head = parse_response_head(std::string_view(buffered).substr(0, header_end + 2));
+  if (!head) {
+    co_return tl::unexpected(head.error());
   }
 
+  HTTPResponse response{std::move(*head), {}};
+  if (!response.head.content_length) {
+    co_return response;
+  }
+
+  const auto expected_length = *response.head.content_length;
+  response.body.reserve(expected_length);
   const auto body_start = header_end + 4;
-  std::vector<std::byte> body;
-  body.reserve(*expected_length);
-  for (std::size_t i = body_start; i < buffered.size() && body.size() < *expected_length; ++i) {
-    body.push_back(static_cast<std::byte>(static_cast<unsigned char>(buffered[i])));
+  for (std::size_t i = body_start; i < buffered.size() && response.body.size() < expected_length; ++i) {
+    response.body.push_back(static_cast<std::byte>(static_cast<unsigned char>(buffered[i])));
   }
 
-  while (body.size() < *expected_length) {
+  while (response.body.size() < expected_length) {
     std::array<char, 4096> chunk{};
-    auto need = std::min<std::size_t>(chunk.size(), *expected_length - body.size());
+    const auto need = std::min<std::size_t>(chunk.size(), expected_length - response.body.size());
     auto [read_ec, n] = co_await asio::async_read(
       socket,
       asio::buffer(chunk.data(), need),
@@ -213,19 +400,71 @@ HTTPDownload::fetch(const std::string& url,
         read_ec == asio::error::operation_aborted ? errc::timed_out : errc::connection_closed));
     }
     for (std::size_t i = 0; i < n; ++i) {
-      body.push_back(static_cast<std::byte>(static_cast<unsigned char>(chunk[i])));
+      response.body.push_back(static_cast<std::byte>(static_cast<unsigned char>(chunk[i])));
     }
   }
+  co_return response;
+}
 
-  std::ofstream out(destination, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    co_return tl::unexpected(make_error_code(errc::io_error));
+} // namespace
+
+HTTPDownload::HTTPDownload(asio::any_io_executor ex) : executor_(std::move(ex)) {}
+
+asio::awaitable<tl::expected<void, std::error_code>>
+HTTPDownload::fetch(const std::string& url,
+                    const std::filesystem::path& destination,
+                    std::chrono::milliseconds timeout) {
+  auto parsed = parse_url(url);
+  if (!parsed) {
+    co_return tl::unexpected(parsed.error());
   }
-  out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
-  if (!out) {
-    co_return tl::unexpected(make_error_code(errc::io_error));
+
+  constexpr std::size_t max_redirects = 5;
+  std::size_t redirects = 0;
+  std::unordered_set<std::string> visited;
+  visited.insert(url_key(*parsed));
+
+  while (true) {
+    if (parsed->scheme == URLScheme::https) {
+      co_return tl::unexpected(make_error_code(errc::unsupported_version));
+    }
+
+    auto response = co_await request_http(executor_, *parsed, timeout);
+    if (!response) {
+      co_return tl::unexpected(response.error());
+    }
+
+    if (success_status(response->head.status)) {
+      if (!response->head.content_length) {
+        co_return tl::unexpected(make_error_code(errc::server_protocol_error));
+      }
+      std::ofstream out(destination, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        co_return tl::unexpected(make_error_code(errc::io_error));
+      }
+      out.write(reinterpret_cast<const char*>(response->body.data()),
+                static_cast<std::streamsize>(response->body.size()));
+      if (!out) {
+        co_return tl::unexpected(make_error_code(errc::io_error));
+      }
+      co_return tl::expected<void, std::error_code>{};
+    }
+
+    if (!redirect_status(response->head.status) || !response->head.location ||
+        redirects >= max_redirects) {
+      co_return tl::unexpected(make_error_code(errc::server_protocol_error));
+    }
+
+    auto next = resolve_location(*parsed, *response->head.location);
+    if (!next) {
+      co_return tl::unexpected(next.error());
+    }
+    if (!visited.insert(url_key(*next)).second) {
+      co_return tl::unexpected(make_error_code(errc::server_protocol_error));
+    }
+    parsed = std::move(next);
+    ++redirects;
   }
-  co_return tl::expected<void, std::error_code>{};
 }
 
 } // namespace ed2k::infra
