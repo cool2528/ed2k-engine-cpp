@@ -6,7 +6,9 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <new>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -31,6 +33,9 @@ namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
 namespace {
+
+constexpr std::size_t max_response_header_bytes = 64U * 1024U;
+constexpr std::size_t max_response_body_bytes = 256U * 1024U * 1024U;
 
 enum class URLScheme { http, https };
 
@@ -69,6 +74,31 @@ std::string_view trim_ascii(std::string_view text) {
   return text;
 }
 
+bool ascii_alpha(char c) {
+  const auto uc = static_cast<unsigned char>(c);
+  return (uc >= 'A' && uc <= 'Z') || (uc >= 'a' && uc <= 'z');
+}
+
+bool uri_scheme_char(char c) {
+  const auto uc = static_cast<unsigned char>(c);
+  return ascii_alpha(c) || (uc >= '0' && uc <= '9') || c == '+' || c == '-' || c == '.';
+}
+
+std::optional<std::size_t> uri_scheme_end(std::string_view reference) {
+  if (reference.empty() || !ascii_alpha(reference.front())) {
+    return std::nullopt;
+  }
+  for (std::size_t i = 1; i < reference.size(); ++i) {
+    if (reference[i] == ':') {
+      return i;
+    }
+    if (!uri_scheme_char(reference[i])) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
 tl::expected<std::uint16_t, std::error_code> parse_port(std::string_view text) {
   std::uint32_t port = 0;
   auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), port);
@@ -80,52 +110,62 @@ tl::expected<std::uint16_t, std::error_code> parse_port(std::string_view text) {
 
 std::string remove_dot_segments(std::string_view target) {
   const auto query_pos = target.find('?');
-  std::string input(target.substr(0, query_pos));
+  const auto path = target.substr(0, query_pos);
   const auto query = query_pos == std::string_view::npos ? std::string_view{} : target.substr(query_pos);
-  std::string output;
-
-  while (!input.empty()) {
-    if (input.starts_with("../")) {
-      input.erase(0, 3);
-    } else if (input.starts_with("./")) {
-      input.erase(0, 2);
-    } else if (input.starts_with("/./")) {
-      input.erase(0, 2);
-    } else if (input == "/.") {
-      input = "/";
-    } else if (input.starts_with("/../")) {
-      input.erase(0, 3);
-      const auto slash = output.rfind('/');
-      output.erase(slash == std::string::npos ? 0 : slash);
-    } else if (input == "/..") {
-      input = "/";
-      const auto slash = output.rfind('/');
-      output.erase(slash == std::string::npos ? 0 : slash);
-    } else if (input == "." || input == "..") {
-      input.clear();
+  const bool absolute = !path.empty() && path.front() == '/';
+  std::vector<std::string_view> segments;
+  std::size_t pos = absolute ? 1 : 0;
+  while (pos <= path.size()) {
+    const auto slash = path.find('/', pos);
+    const auto segment = path.substr(pos, slash == std::string_view::npos ? path.size() - pos
+                                                                          : slash - pos);
+    const bool last = slash == std::string_view::npos;
+    if (segment == "..") {
+      if (!segments.empty()) {
+        segments.pop_back();
+      }
+      if (last) {
+        segments.emplace_back();
+      }
+    } else if (segment == ".") {
+      if (last) {
+        segments.emplace_back();
+      }
     } else {
-      const auto next = input.front() == '/' ? input.find('/', 1) : input.find('/');
-      const auto count = next == std::string::npos ? input.size() : next;
-      output.append(input, 0, count);
-      input.erase(0, count);
+      segments.push_back(segment);
     }
+    if (last) {
+      break;
+    }
+    pos = slash + 1;
   }
 
+  std::string output;
+  output.reserve(path.size() + query.size());
+  if (absolute) {
+    output.push_back('/');
+  }
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    if (i != 0) {
+      output.push_back('/');
+    }
+    output.append(segments[i]);
+  }
   if (output.empty()) {
-    output = "/";
+    output = absolute ? "/" : std::string{};
   }
   output.append(query);
   return output;
 }
 
 tl::expected<ParsedURL, std::error_code> parse_url(std::string_view url) {
-  const auto scheme_end = url.find("://");
-  if (scheme_end == std::string_view::npos) {
+  const auto scheme_end = uri_scheme_end(url);
+  if (!scheme_end || url.substr(*scheme_end, 3) != "://") {
     return tl::unexpected(make_error_code(errc::malformed_link));
   }
 
   ParsedURL out;
-  const auto scheme = lower_ascii(std::string(url.substr(0, scheme_end)));
+  const auto scheme = lower_ascii(std::string(url.substr(0, *scheme_end)));
   if (scheme == "http") {
     out.scheme = URLScheme::http;
     out.port = 80;
@@ -136,7 +176,7 @@ tl::expected<ParsedURL, std::error_code> parse_url(std::string_view url) {
     return tl::unexpected(make_error_code(errc::malformed_link));
   }
 
-  auto rest = url.substr(scheme_end + 3);
+  auto rest = url.substr(*scheme_end + 3);
   const auto authority_end = rest.find_first_of("/?#");
   const auto authority = rest.substr(0, authority_end);
   if (authority.empty() || authority.find('@') != std::string_view::npos) {
@@ -212,7 +252,7 @@ resolve_location(const ParsedURL& base, std::string_view location) {
     return base;
   }
 
-  if (location.find("://") != std::string_view::npos) {
+  if (uri_scheme_end(location)) {
     return parse_url(location);
   }
   if (location.starts_with("//")) {
@@ -350,7 +390,7 @@ request_http(asio::any_io_executor executor,
     co_return tl::unexpected(make_error_code(errc::connection_closed));
   }
 
-  asio::streambuf buffer;
+  asio::streambuf buffer(max_response_header_bytes);
   auto [header_ec, header_bytes] = co_await asio::async_read_until(
     socket,
     buffer,
@@ -358,6 +398,9 @@ request_http(asio::any_io_executor executor,
     asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
   (void)header_bytes;
   if (header_ec) {
+    if (header_ec == asio::error::not_found || buffer.size() >= max_response_header_bytes) {
+      co_return tl::unexpected(make_error_code(errc::server_protocol_error));
+    }
     co_return tl::unexpected(make_error_code(
       header_ec == asio::error::operation_aborted ? errc::timed_out : errc::connection_closed));
   }
@@ -373,12 +416,24 @@ request_http(asio::any_io_executor executor,
   }
 
   HTTPResponse response{std::move(*head), {}};
+  if (!success_status(response.head.status)) {
+    co_return response;
+  }
   if (!response.head.content_length) {
     co_return response;
   }
 
   const auto expected_length = *response.head.content_length;
-  response.body.reserve(expected_length);
+  if (expected_length > max_response_body_bytes) {
+    co_return tl::unexpected(make_error_code(errc::server_protocol_error));
+  }
+  try {
+    response.body.reserve(expected_length);
+  } catch (const std::length_error&) {
+    co_return tl::unexpected(make_error_code(errc::server_protocol_error));
+  } catch (const std::bad_alloc&) {
+    co_return tl::unexpected(make_error_code(errc::io_error));
+  }
   const auto body_start = header_end + 4;
   for (std::size_t i = body_start; i < buffered.size() && response.body.size() < expected_length; ++i) {
     response.body.push_back(static_cast<std::byte>(static_cast<unsigned char>(buffered[i])));

@@ -132,6 +132,212 @@ TEST(HTTPDownload, FollowsRelativeRedirect) {
   std::filesystem::remove(path);
 }
 
+TEST(HTTPDownload, FollowsAbsoluteHttpRedirect) {
+  IoRuntime rt;
+  ed2k::test::MockPeer first(rt.context());
+  ed2k::test::MockPeer second(rt.context());
+  std::string first_target;
+  std::string second_target;
+
+  first.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    first_target = co_await read_request_target(socket);
+    const std::string response =
+      "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:" +
+      std::to_string(second.port()) + "/new\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+  second.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    second_target = co_await read_request_target(socket);
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_absolute_redirect_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(first.port()) + "/old", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(first_target, "/old");
+  EXPECT_EQ(second_target, "/new");
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, RejectsUnsupportedAbsoluteSchemeWithoutSlashes) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+
+  server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_EQ(co_await read_request_target(socket), "/old");
+    const std::string response =
+      "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: ftp:next\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/old",
+      std::filesystem::temp_directory_path() / "ed2k_http_unsupported_redirect_test.bin",
+      2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::malformed_link));
+    }
+    co_return;
+  });
+}
+
+TEST(HTTPDownload, TreatsHttpLikeTextInRelativeTarget) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::vector<std::string> targets;
+
+  auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
+    const auto target = co_await read_request_target(socket);
+    targets.push_back(target);
+    const std::string response = target == "/dir/old"
+      ? "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: next/http://x\r\n\r\n"
+      : "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  };
+  server.serve(handler);
+  server.serve(handler);
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_scheme_text_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/dir/old", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(targets, (std::vector<std::string>{"/dir/old", "/dir/next/http://x"}));
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, FollowsSchemeRelativeRedirect) {
+  IoRuntime rt;
+  ed2k::test::MockPeer first(rt.context());
+  ed2k::test::MockPeer second(rt.context());
+  std::string first_target;
+  std::string second_target;
+
+  first.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    first_target = co_await read_request_target(socket);
+    const std::string response =
+      "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: //127.0.0.1:" +
+      std::to_string(second.port()) + "/new\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+  second.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    second_target = co_await read_request_target(socket);
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_scheme_relative_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(first.port()) + "/old", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(first_target, "/old");
+  EXPECT_EQ(second_target, "/new");
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, FollowsRedirectWithoutDownloadingDeclaredBody) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::vector<std::string> targets;
+
+  auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
+    const auto target = co_await read_request_target(socket);
+    targets.push_back(target);
+    const std::string response = target == "/old"
+      ? "HTTP/1.1 302 Found\r\nContent-Length: 268435457\r\nLocation: /new\r\n\r\n"
+      : "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  };
+  server.serve(handler);
+  server.serve(handler);
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_redirect_body_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/old", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(targets, (std::vector<std::string>{"/old", "/new"}));
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, RejectsOversizedSuccessBody) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+
+  server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_EQ(co_await read_request_target(socket), "/large");
+    const std::string response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 268435457\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/large",
+      std::filesystem::temp_directory_path() / "ed2k_http_large_body_test.bin",
+      2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::server_protocol_error));
+    }
+    co_return;
+  });
+}
+
+TEST(HTTPDownload, RejectsOversizedResponseHeader) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+
+  server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_EQ(co_await read_request_target(socket), "/large-header");
+    const std::string response =
+      "HTTP/1.1 200 OK\r\nX-Fill: " + std::string(65536, 'a') +
+      "\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/large-header",
+      std::filesystem::temp_directory_path() / "ed2k_http_large_header_test.bin",
+      2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::server_protocol_error));
+    }
+    co_return;
+  });
+}
+
 TEST(HTTPDownload, PreservesRepeatedSlashesInPathRelativeRedirect) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());
