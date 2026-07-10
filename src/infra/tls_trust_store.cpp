@@ -95,7 +95,7 @@ bool add_certificate_authority(asio::ssl::context& context,
   }
   const std::string certificate((std::istreambuf_iterator<char>(input)),
                                 std::istreambuf_iterator<char>());
-  if (certificate.empty() || !input.eof()) {
+  if (certificate.empty() || input.bad()) {
     return false;
   }
 

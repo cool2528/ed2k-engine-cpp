@@ -39,9 +39,15 @@ std::filesystem::path tls_fixture(std::string_view name) {
 
 class LocalTLSServer {
  public:
-  explicit LocalTLSServer(asio::io_context& context)
-      : acceptor_(context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0)),
+  explicit LocalTLSServer(asio::io_context& context, std::string host = "localhost")
+      : acceptor_(context),
         context_(asio::ssl::context::tls_server) {
+    tcp::resolver resolver(context);
+    const auto endpoints = resolver.resolve(host, "0");
+    const auto endpoint = endpoints.begin()->endpoint();
+    acceptor_.open(endpoint.protocol());
+    acceptor_.bind(endpoint);
+    acceptor_.listen();
     context_.use_certificate_chain_file(tls_fixture("server.crt").string());
     context_.use_private_key_file(tls_fixture("server.key").string(),
                                   asio::ssl::context::pem);
@@ -214,7 +220,7 @@ TEST(HTTPDownload, RejectsUntrustedCertificate) {
 
 TEST(HTTPDownload, RejectsHostnameMismatch) {
   IoRuntime rt;
-  LocalTLSServer server(rt.context());
+  LocalTLSServer server(rt.context(), "127.0.0.1");
   server.serve([](asio::ssl::stream<tcp::socket>&) -> asio::awaitable<void> {
     co_return;
   });
