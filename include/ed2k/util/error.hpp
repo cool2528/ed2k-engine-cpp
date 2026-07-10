@@ -6,7 +6,7 @@ enum class errc {
   malformed_link, invalid_hex, invalid_base32, io_error,
   hash_mismatch, count_too_large,
   connect_failed, connection_closed, timed_out, packet_too_large, decompress_failed,
-  login_rejected, server_protocol_error,
+  login_rejected, server_protocol_error, tls_error,
   file_not_found, upload_queued, block_corrupt, ip_filtered
 };
 std::error_code make_error_code(errc) noexcept;

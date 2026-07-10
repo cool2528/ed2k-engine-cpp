@@ -20,8 +20,10 @@ TEST(Error, NetCodesHaveMessages){
 TEST(Error, ServerCodesHaveMessages){
   EXPECT_NE(ed2k::make_error_code(ed2k::errc::login_rejected).message().find("login rejected"), std::string::npos);
   EXPECT_NE(ed2k::make_error_code(ed2k::errc::server_protocol_error).message().find("protocol error"), std::string::npos);
+  EXPECT_NE(ed2k::make_error_code(ed2k::errc::tls_error).message().find("TLS"), std::string::npos);
   EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::login_rejected));
   EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::server_protocol_error));
+  EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::tls_error));
 }
 TEST(Error, DownloadCodesHaveMessages){
   EXPECT_NE(ed2k::make_error_code(ed2k::errc::file_not_found).message().find("not found"), std::string::npos);

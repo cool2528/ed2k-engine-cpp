@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <system_error>
 
@@ -11,9 +12,14 @@
 
 namespace ed2k::infra {
 
+struct HTTPDownloadOptions {
+  std::optional<std::filesystem::path> additional_ca_file;
+};
+
 class HTTPDownload {
  public:
-  explicit HTTPDownload(boost::asio::any_io_executor ex);
+  explicit HTTPDownload(boost::asio::any_io_executor ex,
+                        HTTPDownloadOptions options = {});
 
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     fetch(const std::string& url,
@@ -22,6 +28,7 @@ class HTTPDownload {
 
  private:
   boost::asio::any_io_executor executor_;
+  HTTPDownloadOptions options_;
 };
 
 } // namespace ed2k::infra

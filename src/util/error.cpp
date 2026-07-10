@@ -22,6 +22,7 @@ struct Ed2kCategory : std::error_category {
       case errc::decompress_failed: return "decompress failed";
       case errc::login_rejected: return "login rejected";
       case errc::server_protocol_error: return "server protocol error";
+      case errc::tls_error: return "TLS error";
       case errc::file_not_found: return "file not found";
       case errc::upload_queued: return "upload queued";
       case errc::block_corrupt: return "block corrupt";

@@ -2,6 +2,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -9,7 +10,10 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/buffers_iterator.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/read_until.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/streambuf.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
@@ -29,6 +33,48 @@ namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
 namespace {
+std::filesystem::path tls_fixture(std::string_view name) {
+  return std::filesystem::path(ED2K_TEST_FIXTURE_DIR) / "tls" / name;
+}
+
+class LocalTLSServer {
+ public:
+  explicit LocalTLSServer(asio::io_context& context)
+      : acceptor_(context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0)),
+        context_(asio::ssl::context::tls_server) {
+    context_.use_certificate_chain_file(tls_fixture("server.crt").string());
+    context_.use_private_key_file(tls_fixture("server.key").string(),
+                                  asio::ssl::context::pem);
+  }
+
+  std::uint16_t port() const { return acceptor_.local_endpoint().port(); }
+
+  void serve(std::function<asio::awaitable<void>(asio::ssl::stream<tcp::socket>&)> handler) {
+    asio::co_spawn(
+      acceptor_.get_executor(),
+      [this, handler = std::move(handler)]() -> asio::awaitable<void> {
+        auto [accept_ec, socket] =
+          co_await acceptor_.async_accept(asio::as_tuple(asio::use_awaitable));
+        if (accept_ec) {
+          co_return;
+        }
+
+        asio::ssl::stream<tcp::socket> stream(std::move(socket), context_);
+        auto [handshake_ec] = co_await stream.async_handshake(
+          asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
+        if (handshake_ec) {
+          co_return;
+        }
+        co_await handler(stream);
+      },
+      asio::detached);
+  }
+
+ private:
+  tcp::acceptor acceptor_;
+  asio::ssl::context context_;
+};
+
 template <class F>
 void run_coro(IoRuntime& rt, F&& body) {
   bool done = false;
@@ -57,6 +103,25 @@ asio::awaitable<std::string> read_request_target(tcp::socket& socket) {
   asio::streambuf buffer;
   auto [ec, n] = co_await asio::async_read_until(
     socket, buffer, "\r\n\r\n", asio::as_tuple(asio::use_awaitable));
+  (void)n;
+  if (ec) {
+    co_return std::string{};
+  }
+
+  const std::string request(asio::buffers_begin(buffer.data()), asio::buffers_end(buffer.data()));
+  const auto method_end = request.find(' ');
+  const auto target_end = request.find(' ', method_end == std::string::npos ? 0 : method_end + 1);
+  if (method_end == std::string::npos || target_end == std::string::npos) {
+    co_return std::string{};
+  }
+  co_return request.substr(method_end + 1, target_end - method_end - 1);
+}
+
+asio::awaitable<std::string>
+read_tls_request_target(asio::ssl::stream<tcp::socket>& stream) {
+  asio::streambuf buffer;
+  auto [ec, n] = co_await asio::async_read_until(
+    stream, buffer, "\r\n\r\n", asio::as_tuple(asio::use_awaitable));
   (void)n;
   if (ec) {
     co_return std::string{};
@@ -99,6 +164,134 @@ TEST(HTTPDownload, FetchWritesResponseBodyToFile) {
   EXPECT_NE(request.find("GET /server.met HTTP/1.1"), std::string::npos);
   EXPECT_EQ(read_text(path), "hello");
   std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, FetchesHttpsWithTrustedTestCa) {
+  IoRuntime rt;
+  LocalTLSServer server(rt.context());
+  std::string target;
+
+  server.serve([&](asio::ssl::stream<tcp::socket>& stream) -> asio::awaitable<void> {
+    target = co_await read_tls_request_target(stream);
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    co_await asio::async_write(
+      stream, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_https_download_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor(), HTTPDownloadOptions{tls_fixture("ca.crt")});
+    auto r = co_await http.fetch(
+      "https://localhost:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+  });
+
+  EXPECT_EQ(target, "/server.met");
+  EXPECT_EQ(read_text(path), "hello");
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, RejectsUntrustedCertificate) {
+  IoRuntime rt;
+  LocalTLSServer server(rt.context());
+  server.serve([](asio::ssl::stream<tcp::socket>&) -> asio::awaitable<void> {
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "https://localhost:" + std::to_string(server.port()) + "/server.met",
+      std::filesystem::temp_directory_path() / "ed2k_https_untrusted_test.bin",
+      2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::tls_error));
+    }
+  });
+}
+
+TEST(HTTPDownload, RejectsHostnameMismatch) {
+  IoRuntime rt;
+  LocalTLSServer server(rt.context());
+  server.serve([](asio::ssl::stream<tcp::socket>&) -> asio::awaitable<void> {
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor(), HTTPDownloadOptions{tls_fixture("ca.crt")});
+    auto r = co_await http.fetch(
+      "https://127.0.0.1:" + std::to_string(server.port()) + "/server.met",
+      std::filesystem::temp_directory_path() / "ed2k_https_hostname_test.bin",
+      2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::tls_error));
+    }
+  });
+}
+
+TEST(HTTPDownload, SendsRequestedHostnameAsSni) {
+  IoRuntime rt;
+  LocalTLSServer server(rt.context());
+  std::string server_name;
+
+  server.serve([&](asio::ssl::stream<tcp::socket>& stream) -> asio::awaitable<void> {
+    if (const char* name = SSL_get_servername(stream.native_handle(), TLSEXT_NAMETYPE_host_name)) {
+      server_name = name;
+    }
+    EXPECT_EQ(co_await read_tls_request_target(stream), "/server.met");
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(
+      stream, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_https_sni_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor(), HTTPDownloadOptions{tls_fixture("ca.crt")});
+    auto r = co_await http.fetch(
+      "https://localhost:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+  });
+
+  EXPECT_EQ(server_name, "localhost");
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, UsesSingleDeadlineAcrossRedirects) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::size_t requests = 0;
+
+  auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
+    const auto target = co_await read_request_target(socket);
+    const bool first = requests++ == 0;
+    EXPECT_EQ(target, first ? "/old" : "/new");
+    asio::steady_timer timer(rt.context());
+    timer.expires_after(90ms);
+    co_await timer.async_wait(asio::use_awaitable);
+    const std::string response = first
+      ? "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /new\r\n\r\n"
+      : "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  };
+  server.serve(handler);
+  server.serve(handler);
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/old",
+      std::filesystem::temp_directory_path() / "ed2k_http_deadline_test.bin",
+      150ms);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::timed_out));
+    }
+  });
 }
 
 TEST(HTTPDownload, FollowsRelativeRedirect) {

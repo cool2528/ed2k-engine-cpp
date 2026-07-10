@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <new>
 #include <optional>
 #include <stdexcept>
@@ -22,11 +23,15 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/read_until.hpp>
+#include <boost/asio/ssl/host_name_verification.hpp>
+#include <boost/asio/ssl/stream.hpp>
 #include <boost/asio/streambuf.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
+#include <openssl/ssl.h>
 
 #include "ed2k/util/error.hpp"
+#include "infra/tls_trust_store.hpp"
 
 namespace ed2k::infra {
 namespace asio = boost::asio;
@@ -36,6 +41,7 @@ namespace {
 
 constexpr std::size_t max_response_header_bytes = 64U * 1024U;
 constexpr std::size_t max_response_body_bytes = 256U * 1024U * 1024U;
+using Deadline = std::chrono::steady_clock::time_point;
 
 enum class URLScheme { http, https };
 
@@ -353,56 +359,57 @@ std::string host_header(const ParsedURL& url) {
   return (ipv6 ? "[" + url.host + "]" : url.host) + ":" + std::to_string(url.port);
 }
 
+std::optional<std::chrono::steady_clock::duration> remaining_until(Deadline deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) {
+    return std::nullopt;
+  }
+  return deadline - now;
+}
+
+bool operation_timed_out(const boost::system::error_code& error, Deadline deadline) {
+  return error == asio::error::operation_aborted ||
+         std::chrono::steady_clock::now() >= deadline;
+}
+
+template <class Stream>
 asio::awaitable<tl::expected<HTTPResponse, std::error_code>>
-request_http(asio::any_io_executor executor,
-             const ParsedURL& parsed,
-             std::chrono::milliseconds timeout) {
-  tcp::resolver resolver(executor);
-  auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
-    parsed.host,
-    std::to_string(parsed.port),
-    asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
-  if (resolve_ec) {
-    co_return tl::unexpected(make_error_code(errc::connect_failed));
-  }
-
-  tcp::socket socket(executor);
-  auto [connect_ec, endpoint] = co_await asio::async_connect(
-    socket,
-    endpoints,
-    asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
-  (void)endpoint;
-  if (connect_ec) {
-    co_return tl::unexpected(make_error_code(
-      connect_ec == asio::error::operation_aborted ? errc::timed_out : errc::connect_failed));
-  }
-
+request_over_stream(Stream& stream, const ParsedURL& parsed, Deadline deadline) {
   const std::string request =
     "GET " + parsed.target + " HTTP/1.1\r\n"
     "Host: " + host_header(parsed) + "\r\n"
     "Connection: close\r\n\r\n";
+  auto remaining = remaining_until(deadline);
+  if (!remaining) {
+    co_return tl::unexpected(make_error_code(errc::timed_out));
+  }
   auto [write_ec, written] = co_await asio::async_write(
-    socket,
+    stream,
     asio::buffer(request),
-    asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
+    asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
   (void)written;
   if (write_ec) {
-    co_return tl::unexpected(make_error_code(errc::connection_closed));
+    co_return tl::unexpected(make_error_code(
+      operation_timed_out(write_ec, deadline) ? errc::timed_out : errc::connection_closed));
   }
 
   asio::streambuf buffer(max_response_header_bytes);
+  remaining = remaining_until(deadline);
+  if (!remaining) {
+    co_return tl::unexpected(make_error_code(errc::timed_out));
+  }
   auto [header_ec, header_bytes] = co_await asio::async_read_until(
-    socket,
+    stream,
     buffer,
     "\r\n\r\n",
-    asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
+    asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
   (void)header_bytes;
   if (header_ec) {
     if (header_ec == asio::error::not_found || buffer.size() >= max_response_header_bytes) {
       co_return tl::unexpected(make_error_code(errc::server_protocol_error));
     }
     co_return tl::unexpected(make_error_code(
-      header_ec == asio::error::operation_aborted ? errc::timed_out : errc::connection_closed));
+      operation_timed_out(header_ec, deadline) ? errc::timed_out : errc::connection_closed));
   }
 
   std::string buffered(asio::buffers_begin(buffer.data()), asio::buffers_end(buffer.data()));
@@ -442,13 +449,17 @@ request_http(asio::any_io_executor executor,
   while (response.body.size() < expected_length) {
     std::array<char, 4096> chunk{};
     const auto need = std::min<std::size_t>(chunk.size(), expected_length - response.body.size());
+    remaining = remaining_until(deadline);
+    if (!remaining) {
+      co_return tl::unexpected(make_error_code(errc::timed_out));
+    }
     auto [read_ec, n] = co_await asio::async_read(
-      socket,
+      stream,
       asio::buffer(chunk.data(), need),
-      asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
+      asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
     if (read_ec) {
       co_return tl::unexpected(make_error_code(
-        read_ec == asio::error::operation_aborted ? errc::timed_out : errc::connection_closed));
+        operation_timed_out(read_ec, deadline) ? errc::timed_out : errc::connection_closed));
     }
     for (std::size_t i = 0; i < n; ++i) {
       response.body.push_back(static_cast<std::byte>(static_cast<unsigned char>(chunk[i])));
@@ -457,9 +468,101 @@ request_http(asio::any_io_executor executor,
   co_return response;
 }
 
+asio::awaitable<tl::expected<HTTPResponse, std::error_code>>
+request_http(asio::any_io_executor executor,
+             const ParsedURL& parsed,
+             Deadline deadline) {
+  tcp::resolver resolver(executor);
+  auto remaining = remaining_until(deadline);
+  if (!remaining) {
+    co_return tl::unexpected(make_error_code(errc::timed_out));
+  }
+  auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
+    parsed.host,
+    std::to_string(parsed.port),
+    asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
+  if (resolve_ec) {
+    co_return tl::unexpected(make_error_code(
+      operation_timed_out(resolve_ec, deadline) ? errc::timed_out : errc::connect_failed));
+  }
+
+  tcp::socket socket(executor);
+  remaining = remaining_until(deadline);
+  if (!remaining) {
+    co_return tl::unexpected(make_error_code(errc::timed_out));
+  }
+  auto [connect_ec, endpoint] = co_await asio::async_connect(
+    socket,
+    endpoints,
+    asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
+  (void)endpoint;
+  if (connect_ec) {
+    co_return tl::unexpected(make_error_code(
+      operation_timed_out(connect_ec, deadline) ? errc::timed_out : errc::connect_failed));
+  }
+
+  co_return co_await request_over_stream(socket, parsed, deadline);
+}
+
+asio::awaitable<tl::expected<HTTPResponse, std::error_code>>
+request_https(asio::any_io_executor executor,
+              asio::ssl::context& context,
+              const ParsedURL& parsed,
+              Deadline deadline) {
+  tcp::resolver resolver(executor);
+  auto remaining = remaining_until(deadline);
+  if (!remaining) {
+    co_return tl::unexpected(make_error_code(errc::timed_out));
+  }
+  auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
+    parsed.host,
+    std::to_string(parsed.port),
+    asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
+  if (resolve_ec) {
+    co_return tl::unexpected(make_error_code(
+      operation_timed_out(resolve_ec, deadline) ? errc::timed_out : errc::connect_failed));
+  }
+
+  asio::ssl::stream<tcp::socket> stream(executor, context);
+  remaining = remaining_until(deadline);
+  if (!remaining) {
+    co_return tl::unexpected(make_error_code(errc::timed_out));
+  }
+  auto [connect_ec, endpoint] = co_await asio::async_connect(
+    stream.next_layer(),
+    endpoints,
+    asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
+  (void)endpoint;
+  if (connect_ec) {
+    co_return tl::unexpected(make_error_code(
+      operation_timed_out(connect_ec, deadline) ? errc::timed_out : errc::connect_failed));
+  }
+
+  if (SSL_set_tlsext_host_name(stream.native_handle(), parsed.host.c_str()) != 1) {
+    ERR_clear_error();
+    co_return tl::unexpected(make_error_code(errc::tls_error));
+  }
+  stream.set_verify_callback(asio::ssl::host_name_verification(parsed.host));
+
+  remaining = remaining_until(deadline);
+  if (!remaining) {
+    co_return tl::unexpected(make_error_code(errc::timed_out));
+  }
+  auto [handshake_ec] = co_await stream.async_handshake(
+    asio::ssl::stream_base::client,
+    asio::cancel_after(*remaining, asio::as_tuple(asio::use_awaitable)));
+  if (handshake_ec) {
+    co_return tl::unexpected(make_error_code(
+      operation_timed_out(handshake_ec, deadline) ? errc::timed_out : errc::tls_error));
+  }
+
+  co_return co_await request_over_stream(stream, parsed, deadline);
+}
+
 } // namespace
 
-HTTPDownload::HTTPDownload(asio::any_io_executor ex) : executor_(std::move(ex)) {}
+HTTPDownload::HTTPDownload(asio::any_io_executor ex, HTTPDownloadOptions options)
+    : executor_(std::move(ex)), options_(std::move(options)) {}
 
 asio::awaitable<tl::expected<void, std::error_code>>
 HTTPDownload::fetch(const std::string& url,
@@ -469,18 +572,30 @@ HTTPDownload::fetch(const std::string& url,
   if (!parsed) {
     co_return tl::unexpected(parsed.error());
   }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
 
   constexpr std::size_t max_redirects = 5;
   std::size_t redirects = 0;
   std::unordered_set<std::string> visited;
   visited.insert(url_key(*parsed));
+  std::unique_ptr<asio::ssl::context> tls_context;
 
   while (true) {
-    if (parsed->scheme == URLScheme::https) {
-      co_return tl::unexpected(make_error_code(errc::unsupported_version));
+    if (parsed->scheme == URLScheme::https && !tls_context) {
+      auto created = create_tls_client_context(options_.additional_ca_file);
+      if (!created) {
+        co_return tl::unexpected(created.error());
+      }
+      tls_context = std::move(*created);
     }
 
-    auto response = co_await request_http(executor_, *parsed, timeout);
+    tl::expected<HTTPResponse, std::error_code> response =
+      tl::unexpected(make_error_code(errc::connect_failed));
+    if (parsed->scheme == URLScheme::https) {
+      response = co_await request_https(executor_, *tls_context, *parsed, deadline);
+    } else {
+      response = co_await request_http(executor_, *parsed, deadline);
+    }
     if (!response) {
       co_return tl::unexpected(response.error());
     }
