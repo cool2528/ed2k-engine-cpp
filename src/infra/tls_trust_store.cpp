@@ -1,7 +1,8 @@
 #include "infra/tls_trust_store.hpp"
 
+#include <cstdint>
 #include <fstream>
-#include <iterator>
+#include <limits>
 #include <string>
 
 #include <boost/asio/buffer.hpp>
@@ -22,6 +23,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509err.h>
 
 #include <memory>
 #endif
@@ -54,8 +56,13 @@ struct X509Deleter {
   void operator()(X509* certificate) const noexcept { X509_free(certificate); }
 };
 
-bool import_windows_root_store(asio::ssl::context& context) {
-  WindowsCertificateStore store(CertOpenSystemStoreW(HCRYPTPROV_LEGACY{}, L"ROOT"));
+bool import_windows_root_store(asio::ssl::context& context, DWORD location) {
+  WindowsCertificateStore store(CertOpenStore(
+    CERT_STORE_PROV_SYSTEM_W,
+    0,
+    0,
+    location | CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG,
+    L"ROOT"));
   if (!store.get()) {
     return false;
   }
@@ -65,7 +72,6 @@ bool import_windows_root_store(asio::ssl::context& context) {
     return false;
   }
 
-  bool imported = false;
   PCCERT_CONTEXT certificate = nullptr;
   while ((certificate = CertEnumCertificatesInStore(store.get(), certificate)) != nullptr) {
     const unsigned char* encoded = certificate->pbCertEncoded;
@@ -75,33 +81,65 @@ bool import_windows_root_store(asio::ssl::context& context) {
       ERR_clear_error();
       continue;
     }
-    if (X509_STORE_add_cert(target, decoded.get()) == 1) {
-      imported = true;
-    } else {
-      // Duplicate or unsupported roots only narrow trust; they must not disable verification.
+    if (X509_STORE_add_cert(target, decoded.get()) != 1) {
+      const unsigned long error = ERR_peek_last_error();
+      const bool duplicate = error != 0 && ERR_GET_LIB(error) == ERR_LIB_X509 &&
+                             ERR_GET_REASON(error) == X509_R_CERT_ALREADY_IN_HASH_TABLE;
       ERR_clear_error();
+      if (!duplicate) {
+        return false;
+      }
     }
   }
 
-  return imported && GetLastError() == CRYPT_E_NOT_FOUND;
+  const DWORD enumeration_error = GetLastError();
+  return enumeration_error == CRYPT_E_NOT_FOUND;
 }
 #endif
 
-bool add_certificate_authority(asio::ssl::context& context,
-                               const std::filesystem::path& path) {
+std::error_code add_certificate_authority(asio::ssl::context& context,
+                                          const std::filesystem::path& path) {
+  std::error_code filesystem_error;
+  const auto status = std::filesystem::status(path, filesystem_error);
+  if (filesystem_error) {
+    return make_error_code(filesystem_error == std::errc::no_such_file_or_directory
+                             ? errc::file_not_found
+                             : errc::io_error);
+  }
+  if (!std::filesystem::exists(status)) {
+    return make_error_code(errc::file_not_found);
+  }
+  if (!std::filesystem::is_regular_file(status)) {
+    return make_error_code(errc::io_error);
+  }
+
   std::ifstream input(path, std::ios::binary);
   if (!input) {
-    return false;
+    return make_error_code(errc::io_error);
   }
-  const std::string certificate((std::istreambuf_iterator<char>(input)),
-                                std::istreambuf_iterator<char>());
-  if (certificate.empty() || input.bad()) {
-    return false;
+
+  const auto certificate_size = std::filesystem::file_size(path, filesystem_error);
+  if (filesystem_error) {
+    return make_error_code(errc::io_error);
+  }
+  if (certificate_size == 0) {
+    return make_error_code(errc::tls_error);
+  }
+  if (certificate_size >
+        static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max()) ||
+      certificate_size > static_cast<std::uintmax_t>(std::string{}.max_size())) {
+    return make_error_code(errc::io_error);
+  }
+
+  std::string certificate(static_cast<std::size_t>(certificate_size), '\0');
+  input.read(certificate.data(), static_cast<std::streamsize>(certificate.size()));
+  if (!input || input.gcount() != static_cast<std::streamsize>(certificate.size())) {
+    return make_error_code(errc::io_error);
   }
 
   boost::system::error_code error;
   context.add_certificate_authority(asio::buffer(certificate), error);
-  return !error;
+  return error ? make_error_code(errc::tls_error) : std::error_code{};
 }
 
 } // namespace
@@ -116,7 +154,11 @@ create_tls_client_context(
     boost::system::error_code default_paths_error;
     context->set_default_verify_paths(default_paths_error);
 #ifdef _WIN32
-    if (!import_windows_root_store(*context)) {
+    const bool imported_current_user =
+      import_windows_root_store(*context, CERT_SYSTEM_STORE_CURRENT_USER);
+    const bool imported_local_machine =
+      import_windows_root_store(*context, CERT_SYSTEM_STORE_LOCAL_MACHINE);
+    if (!imported_current_user || !imported_local_machine) {
       return tl::unexpected(make_error_code(errc::tls_error));
     }
 #else
@@ -125,8 +167,11 @@ create_tls_client_context(
     }
 #endif
 
-    if (additional_ca_file && !add_certificate_authority(*context, *additional_ca_file)) {
-      return tl::unexpected(make_error_code(errc::tls_error));
+    if (additional_ca_file) {
+      const auto additional_ca_error = add_certificate_authority(*context, *additional_ca_file);
+      if (additional_ca_error) {
+        return tl::unexpected(additional_ca_error);
+      }
     }
     return context;
   } catch (const std::exception&) {

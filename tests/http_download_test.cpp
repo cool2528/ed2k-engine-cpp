@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include "ed2k/infra/http_download.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/util/error.hpp"
+#include "infra/tls_trust_store.hpp"
 #include "mock_peer.hpp"
 
 using namespace ed2k;
@@ -38,34 +40,44 @@ std::filesystem::path tls_fixture(std::string_view name) {
 }
 
 class LocalTLSServer {
+ private:
+  struct State {
+    explicit State(asio::io_context& io_context, const std::string& host)
+        : acceptor(io_context), context(asio::ssl::context::tls_server) {
+      tcp::resolver resolver(io_context);
+      const auto endpoints = resolver.resolve(host, "0");
+      const auto endpoint = endpoints.begin()->endpoint();
+      acceptor.open(endpoint.protocol());
+      acceptor.bind(endpoint);
+      acceptor.listen();
+      context.use_certificate_chain_file(tls_fixture("server.crt").string());
+      context.use_private_key_file(tls_fixture("server.key").string(),
+                                   asio::ssl::context::pem);
+    }
+
+    tcp::acceptor acceptor;
+    asio::ssl::context context;
+  };
+
  public:
   explicit LocalTLSServer(asio::io_context& context, std::string host = "localhost")
-      : acceptor_(context),
-        context_(asio::ssl::context::tls_server) {
-    tcp::resolver resolver(context);
-    const auto endpoints = resolver.resolve(host, "0");
-    const auto endpoint = endpoints.begin()->endpoint();
-    acceptor_.open(endpoint.protocol());
-    acceptor_.bind(endpoint);
-    acceptor_.listen();
-    context_.use_certificate_chain_file(tls_fixture("server.crt").string());
-    context_.use_private_key_file(tls_fixture("server.key").string(),
-                                  asio::ssl::context::pem);
-  }
+      : state_(std::make_shared<State>(context, host)) {}
 
-  std::uint16_t port() const { return acceptor_.local_endpoint().port(); }
+  std::uint16_t port() const { return state_->acceptor.local_endpoint().port(); }
 
   void serve(std::function<asio::awaitable<void>(asio::ssl::stream<tcp::socket>&)> handler) {
+    auto state = state_;
+    const auto executor = state->acceptor.get_executor();
     asio::co_spawn(
-      acceptor_.get_executor(),
-      [this, handler = std::move(handler)]() -> asio::awaitable<void> {
+      executor,
+      [state = std::move(state), handler = std::move(handler)]() -> asio::awaitable<void> {
         auto [accept_ec, socket] =
-          co_await acceptor_.async_accept(asio::as_tuple(asio::use_awaitable));
+          co_await state->acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
         if (accept_ec) {
           co_return;
         }
 
-        asio::ssl::stream<tcp::socket> stream(std::move(socket), context_);
+        asio::ssl::stream<tcp::socket> stream(std::move(socket), state->context);
         auto [handshake_ec] = co_await stream.async_handshake(
           asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
         if (handshake_ec) {
@@ -77,8 +89,7 @@ class LocalTLSServer {
   }
 
  private:
-  tcp::acceptor acceptor_;
-  asio::ssl::context context_;
+  std::shared_ptr<State> state_;
 };
 
 template <class F>
@@ -196,6 +207,24 @@ TEST(HTTPDownload, FetchesHttpsWithTrustedTestCa) {
   EXPECT_EQ(target, "/server.met");
   EXPECT_EQ(read_text(path), "hello");
   std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, ReportsMissingAdditionalCaFile) {
+  auto context = create_tls_client_context(tls_fixture("missing-ca.crt"));
+  ASSERT_FALSE(context.has_value());
+  EXPECT_EQ(context.error(), make_error_code(errc::file_not_found));
+}
+
+TEST(HTTPDownload, ReportsNonRegularAdditionalCaAsIoError) {
+  auto context = create_tls_client_context(tls_fixture(""));
+  ASSERT_FALSE(context.has_value());
+  EXPECT_EQ(context.error(), make_error_code(errc::io_error));
+}
+
+TEST(HTTPDownload, ReportsMalformedAdditionalCaAsTlsError) {
+  auto context = create_tls_client_context(tls_fixture("server.key"));
+  ASSERT_FALSE(context.has_value());
+  EXPECT_EQ(context.error(), make_error_code(errc::tls_error));
 }
 
 TEST(HTTPDownload, FollowsHttpRedirectToHttps) {
@@ -338,6 +367,8 @@ TEST(HTTPDownload, UsesSingleDeadlineAcrossRedirects) {
       EXPECT_EQ(r.error(), make_error_code(errc::timed_out));
     }
   });
+
+  EXPECT_EQ(requests, 2u);
 }
 
 TEST(HTTPDownload, FollowsRelativeRedirect) {

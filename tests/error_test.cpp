@@ -33,3 +33,11 @@ TEST(Error, DownloadCodesHaveMessages){
   EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::upload_queued));
   EXPECT_TRUE(ed2k::make_error_code(ed2k::errc::block_corrupt));
 }
+
+TEST(Error, LegacyNumericCodesRemainStable) {
+  EXPECT_EQ(static_cast<int>(ed2k::errc::file_not_found), 17);
+  EXPECT_EQ(static_cast<int>(ed2k::errc::upload_queued), 18);
+  EXPECT_EQ(static_cast<int>(ed2k::errc::block_corrupt), 19);
+  EXPECT_EQ(static_cast<int>(ed2k::errc::ip_filtered), 20);
+  EXPECT_EQ(static_cast<int>(ed2k::errc::tls_error), 21);
+}
