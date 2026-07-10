@@ -132,6 +132,38 @@ TEST(HTTPDownload, FollowsRelativeRedirect) {
   std::filesystem::remove(path);
 }
 
+TEST(HTTPDownload, PreservesRepeatedSlashesInPathRelativeRedirect) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::vector<std::string> targets;
+
+  auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
+    const auto target = co_await read_request_target(socket);
+    targets.push_back(target);
+    const std::string response = target == "/dir/old"
+      ? "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: next//file\r\n\r\n"
+      : "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  };
+  server.serve(handler);
+  server.serve(handler);
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_path_redirect_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/dir/old",
+      path,
+      2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(targets, (std::vector<std::string>{"/dir/old", "/dir/next//file"}));
+  std::filesystem::remove(path);
+}
+
 TEST(HTTPDownload, RejectsRedirectLoopAfterFiveHops) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());

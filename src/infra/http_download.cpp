@@ -78,48 +78,44 @@ tl::expected<std::uint16_t, std::error_code> parse_port(std::string_view text) {
   return static_cast<std::uint16_t>(port);
 }
 
-std::string normalize_target(std::string_view target) {
+std::string remove_dot_segments(std::string_view target) {
   const auto query_pos = target.find('?');
-  auto path = target.substr(0, query_pos);
+  std::string input(target.substr(0, query_pos));
   const auto query = query_pos == std::string_view::npos ? std::string_view{} : target.substr(query_pos);
-  if (path.empty()) {
-    path = "/";
+  std::string output;
+
+  while (!input.empty()) {
+    if (input.starts_with("../")) {
+      input.erase(0, 3);
+    } else if (input.starts_with("./")) {
+      input.erase(0, 2);
+    } else if (input.starts_with("/./")) {
+      input.erase(0, 2);
+    } else if (input == "/.") {
+      input = "/";
+    } else if (input.starts_with("/../")) {
+      input.erase(0, 3);
+      const auto slash = output.rfind('/');
+      output.erase(slash == std::string::npos ? 0 : slash);
+    } else if (input == "/..") {
+      input = "/";
+      const auto slash = output.rfind('/');
+      output.erase(slash == std::string::npos ? 0 : slash);
+    } else if (input == "." || input == "..") {
+      input.clear();
+    } else {
+      const auto next = input.front() == '/' ? input.find('/', 1) : input.find('/');
+      const auto count = next == std::string::npos ? input.size() : next;
+      output.append(input, 0, count);
+      input.erase(0, count);
+    }
   }
 
-  const bool trailing_slash = path.size() > 1 && path.back() == '/';
-  std::vector<std::string_view> segments;
-  std::size_t pos = 0;
-  while (pos < path.size()) {
-    while (pos < path.size() && path[pos] == '/') {
-      ++pos;
-    }
-    const auto end = path.find('/', pos);
-    const auto segment = path.substr(pos, end == std::string_view::npos ? path.size() - pos : end - pos);
-    if (segment == "..") {
-      if (!segments.empty()) {
-        segments.pop_back();
-      }
-    } else if (!segment.empty() && segment != ".") {
-      segments.push_back(segment);
-    }
-    if (end == std::string_view::npos) {
-      break;
-    }
-    pos = end + 1;
+  if (output.empty()) {
+    output = "/";
   }
-
-  std::string normalized = "/";
-  for (std::size_t i = 0; i < segments.size(); ++i) {
-    if (i != 0) {
-      normalized.push_back('/');
-    }
-    normalized.append(segments[i]);
-  }
-  if (trailing_slash && normalized.back() != '/') {
-    normalized.push_back('/');
-  }
-  normalized.append(query);
-  return normalized;
+  output.append(query);
+  return output;
 }
 
 tl::expected<ParsedURL, std::error_code> parse_url(std::string_view url) {
@@ -234,7 +230,7 @@ resolve_location(const ParsedURL& base, std::string_view location) {
     const auto base_path = std::string_view(base.target).substr(0, query);
     const auto slash = base_path.rfind('/');
     const auto directory = base_path.substr(0, slash == std::string_view::npos ? 0 : slash + 1);
-    resolved.target = normalize_target(std::string(directory) + std::string(location));
+    resolved.target = remove_dot_segments(std::string(directory) + std::string(location));
   }
   return resolved;
 }
