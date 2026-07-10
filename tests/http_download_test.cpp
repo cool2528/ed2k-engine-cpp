@@ -226,6 +226,70 @@ TEST(HTTPDownload, PreservesInitialRequestTarget) {
   std::filesystem::remove(path);
 }
 
+TEST(HTTPDownload, DoesNotConflateDistinctRedirectTargets) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::vector<std::string> targets;
+
+  auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
+    const auto target = co_await read_request_target(socket);
+    targets.push_back(target);
+    const std::string response = target == "/a//b"
+      ? "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /a/b\r\n\r\n"
+      : "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  };
+  server.serve(handler);
+  server.serve(handler);
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_distinct_target_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/a//b",
+      path,
+      2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(targets, (std::vector<std::string>{"/a//b", "/a/b"}));
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, PreservesRootRelativeRedirectTarget) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::vector<std::string> targets;
+
+  auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
+    const auto target = co_await read_request_target(socket);
+    targets.push_back(target);
+    const std::string response = target == "/old"
+      ? "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /r//x/../y\r\n\r\n"
+      : "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  };
+  server.serve(handler);
+  server.serve(handler);
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_root_redirect_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/old",
+      path,
+      2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(targets, (std::vector<std::string>{"/old", "/r//x/../y"}));
+  std::filesystem::remove(path);
+}
+
 TEST(HTTPDownload, RejectsRedirectWithoutLocation) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());

@@ -204,7 +204,7 @@ std::string scheme_name(URLScheme scheme) {
 
 std::string url_key(const ParsedURL& url) {
   return scheme_name(url.scheme) + "://" + lower_ascii(url.host) + ":" +
-         std::to_string(url.port) + normalize_target(url.target);
+         std::to_string(url.port) + url.target;
 }
 
 tl::expected<ParsedURL, std::error_code>
@@ -225,7 +225,7 @@ resolve_location(const ParsedURL& base, std::string_view location) {
 
   ParsedURL resolved = base;
   if (location.front() == '/') {
-    resolved.target = normalize_target(location);
+    resolved.target = std::string(location);
   } else if (location.front() == '?') {
     const auto query = base.target.find('?');
     resolved.target = base.target.substr(0, query) + std::string(location);
