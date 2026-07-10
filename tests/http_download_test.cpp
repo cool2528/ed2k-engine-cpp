@@ -140,6 +140,41 @@ TEST(HTTPDownload, RejectsRedirectLoopAfterFiveHops) {
   auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
     const auto target = co_await read_request_target(socket);
     targets.push_back(target);
+    const auto hop = targets.size() - 1;
+    const std::string location = hop < 5 ? "/hop-" + std::to_string(hop + 1) : "/hop-0";
+    const std::string response =
+      "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: " + location + "\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  };
+  for (int i = 0; i < 6; ++i) {
+    server.serve(handler);
+  }
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/hop-0",
+      std::filesystem::temp_directory_path() / "ed2k_http_loop_test.bin",
+      2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::server_protocol_error));
+    }
+    co_return;
+  });
+
+  EXPECT_EQ(targets, (std::vector<std::string>{
+                       "/hop-0", "/hop-1", "/hop-2", "/hop-3", "/hop-4", "/hop-5"}));
+}
+
+TEST(HTTPDownload, RejectsShortRedirectLoop) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::vector<std::string> targets;
+
+  auto handler = [&](tcp::socket socket) -> asio::awaitable<void> {
+    const auto target = co_await read_request_target(socket);
+    targets.push_back(target);
     const std::string location = target == "/loop-a" ? "/loop-b" : "/loop-a";
     const std::string response =
       "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: " + location + "\r\n\r\n";
@@ -152,7 +187,7 @@ TEST(HTTPDownload, RejectsRedirectLoopAfterFiveHops) {
     HTTPDownload http(rt.executor());
     auto r = co_await http.fetch(
       "http://127.0.0.1:" + std::to_string(server.port()) + "/loop-a",
-      std::filesystem::temp_directory_path() / "ed2k_http_loop_test.bin",
+      std::filesystem::temp_directory_path() / "ed2k_http_short_loop_test.bin",
       2s);
     EXPECT_FALSE(r.has_value());
     if (!r) {
@@ -162,6 +197,33 @@ TEST(HTTPDownload, RejectsRedirectLoopAfterFiveHops) {
   });
 
   EXPECT_EQ(targets, (std::vector<std::string>{"/loop-a", "/loop-b"}));
+}
+
+TEST(HTTPDownload, PreservesInitialRequestTarget) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  std::string target;
+
+  server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    target = co_await read_request_target(socket);
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    co_await asio::async_write(socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_raw_target_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/a//b/../c?x=1",
+      path,
+      2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_EQ(target, "/a//b/../c?x=1");
+  std::filesystem::remove(path);
 }
 
 TEST(HTTPDownload, RejectsRedirectWithoutLocation) {

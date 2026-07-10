@@ -189,7 +189,7 @@ tl::expected<ParsedURL, std::error_code> parse_url(std::string_view url) {
     const auto fragment = raw_target.find('#');
     raw_target = raw_target.substr(0, fragment);
     out.target = raw_target.front() == '?' ? "/" + std::string(raw_target)
-                                           : normalize_target(raw_target);
+                                           : std::string(raw_target);
   }
   if (out.host.find_first_of("\r\n") != std::string::npos ||
       out.target.find_first_of("\r\n") != std::string::npos) {
@@ -204,7 +204,7 @@ std::string scheme_name(URLScheme scheme) {
 
 std::string url_key(const ParsedURL& url) {
   return scheme_name(url.scheme) + "://" + lower_ascii(url.host) + ":" +
-         std::to_string(url.port) + url.target;
+         std::to_string(url.port) + normalize_target(url.target);
 }
 
 tl::expected<ParsedURL, std::error_code>
