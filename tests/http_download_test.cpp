@@ -198,6 +198,46 @@ TEST(HTTPDownload, FetchesHttpsWithTrustedTestCa) {
   std::filesystem::remove(path);
 }
 
+TEST(HTTPDownload, FollowsHttpRedirectToHttps) {
+  IoRuntime rt;
+  ed2k::test::MockPeer http_server(rt.context());
+  LocalTLSServer tls_server(rt.context());
+  std::string http_target;
+  std::string https_target;
+
+  http_server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    http_target = co_await read_request_target(socket);
+    const std::string response =
+      "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: https://localhost:" +
+      std::to_string(tls_server.port()) + "/secure.met\r\n\r\n";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+  tls_server.serve([&](asio::ssl::stream<tcp::socket>& stream) -> asio::awaitable<void> {
+    https_target = co_await read_tls_request_target(stream);
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    co_await asio::async_write(
+      stream, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_http_to_https_redirect_test.bin";
+  std::filesystem::remove(path);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor(), HTTPDownloadOptions{tls_fixture("ca.crt")});
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(http_server.port()) + "/redirect",
+      path,
+      2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+  });
+
+  EXPECT_EQ(http_target, "/redirect");
+  EXPECT_EQ(https_target, "/secure.met");
+  EXPECT_EQ(read_text(path), "hello");
+  std::filesystem::remove(path);
+}
+
 TEST(HTTPDownload, RejectsUntrustedCertificate) {
   IoRuntime rt;
   LocalTLSServer server(rt.context());
