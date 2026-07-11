@@ -1,10 +1,12 @@
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -155,7 +157,10 @@ class ScopedTestDirectory {
       ("ed2k_http_test_" +
        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
        std::to_string(next_id.fetch_add(1, std::memory_order_relaxed)));
-    std::filesystem::create_directory(path_);
+    std::error_code error;
+    if (!std::filesystem::create_directory(path_, error) || error) {
+      throw std::runtime_error("failed to create HTTP download test directory");
+    }
   }
 
   ~ScopedTestDirectory() {
@@ -168,6 +173,136 @@ class ScopedTestDirectory {
  private:
   std::filesystem::path path_;
 };
+
+TEST(HTTPDownload, PropagatesParentDirectoryOpenFailure) {
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [](const std::filesystem::path&) { return -1; },
+    [](int) { return 0; },
+    [](int) { return 0; },
+    [] { return EACCES; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_FALSE(result.has_value());
+  if (!result) {
+    EXPECT_EQ(result.error(), make_error_code(errc::io_error));
+  }
+}
+
+TEST(HTTPDownload, PropagatesParentDirectoryOpenEinval) {
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [](const std::filesystem::path&) { return -1; },
+    [](int) { return 0; },
+    [](int) { return 0; },
+    [] { return EINVAL; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_FALSE(result.has_value());
+  if (!result) {
+    EXPECT_EQ(result.error(), make_error_code(errc::io_error));
+  }
+}
+
+TEST(HTTPDownload, RetriesInterruptedParentDirectoryOpen) {
+  std::size_t open_calls = 0;
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [&open_calls](const std::filesystem::path&) { return open_calls++ == 0 ? -1 : 7; },
+    [](int) { return 0; },
+    [](int) { return 0; },
+    [] { return EINTR; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_TRUE(result.has_value()) << (result ? "" : result.error().message());
+  EXPECT_EQ(open_calls, 2u);
+}
+
+TEST(HTTPDownload, PropagatesParentDirectoryFsyncFailure) {
+  bool close_called = false;
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [](const std::filesystem::path&) { return 7; },
+    [](int) { return -1; },
+    [&close_called](int) {
+      close_called = true;
+      return 0;
+    },
+    [] { return EIO; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_TRUE(close_called);
+  if (!result) {
+    EXPECT_EQ(result.error(), make_error_code(errc::io_error));
+  }
+}
+
+TEST(HTTPDownload, IgnoresUnsupportedParentDirectoryFsync) {
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [](const std::filesystem::path&) { return 7; },
+    [](int) { return -1; },
+    [](int) { return 0; },
+    [] { return EINVAL; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_TRUE(result.has_value()) << (result ? "" : result.error().message());
+}
+
+TEST(HTTPDownload, RetriesInterruptedParentDirectoryFsync) {
+  std::size_t sync_calls = 0;
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [](const std::filesystem::path&) { return 7; },
+    [&sync_calls](int) { return sync_calls++ == 0 ? -1 : 0; },
+    [](int) { return 0; },
+    [] { return EINTR; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_TRUE(result.has_value()) << (result ? "" : result.error().message());
+  EXPECT_EQ(sync_calls, 2u);
+}
+
+TEST(HTTPDownload, PropagatesParentDirectoryCloseFailure) {
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [](const std::filesystem::path&) { return 7; },
+    [](int) { return 0; },
+    [](int) { return -1; },
+    [] { return EIO; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_FALSE(result.has_value());
+  if (!result) {
+    EXPECT_EQ(result.error(), make_error_code(errc::io_error));
+  }
+}
+
+TEST(HTTPDownload, DoesNotRetryInterruptedParentDirectoryClose) {
+  std::size_t close_calls = 0;
+  const ed2k::infra::detail::ParentDirectorySyncOps ops{
+    [](const std::filesystem::path&) { return 7; },
+    [](int) { return 0; },
+    [&close_calls](int) {
+      ++close_calls;
+      return -1;
+    },
+    [] { return EINTR; },
+  };
+
+  const auto result = ed2k::infra::detail::sync_parent_directory("destination.bin", ops);
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(close_calls, 1u);
+}
 
 asio::awaitable<std::string> read_request_target(tcp::socket& socket) {
   asio::streambuf buffer;
@@ -210,6 +345,7 @@ read_tls_request_target(asio::ssl::stream<tcp::socket>& stream) {
 TEST(HTTPDownload, FetchWritesResponseBodyToFile) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());
+  ScopedTestDirectory directory;
   std::string request;
 
   server.serve([&](tcp::socket s) -> asio::awaitable<void> {
@@ -222,8 +358,7 @@ TEST(HTTPDownload, FetchWritesResponseBodyToFile) {
     co_return;
   });
 
-  const auto path = std::filesystem::temp_directory_path() / "ed2k_http_download_test.bin";
-  std::filesystem::remove(path);
+  const auto path = directory.path("destination.bin");
   run_coro(rt, [&]() -> asio::awaitable<void> {
     HTTPDownload http(rt.executor());
     auto r = co_await http.fetch("http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
@@ -233,12 +368,12 @@ TEST(HTTPDownload, FetchWritesResponseBodyToFile) {
 
   EXPECT_NE(request.find("GET /server.met HTTP/1.1"), std::string::npos);
   EXPECT_EQ(read_text(path), "hello");
-  std::filesystem::remove(path);
 }
 
 TEST(HTTPDownload, PreservesExistingDestinationWhenBodyIsTruncated) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());
+  ScopedTestDirectory directory;
   server.serve([](tcp::socket socket) -> asio::awaitable<void> {
     EXPECT_FALSE((co_await read_request_target(socket)).empty());
     const std::string response =
@@ -247,9 +382,7 @@ TEST(HTTPDownload, PreservesExistingDestinationWhenBodyIsTruncated) {
       socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
   });
 
-  const auto path =
-    std::filesystem::temp_directory_path() / "ed2k_http_truncated_preserves_test.bin";
-  std::filesystem::remove(path);
+  const auto path = directory.path("destination.bin");
   write_text(path, "old-data");
 
   run_coro(rt, [&]() -> asio::awaitable<void> {
@@ -264,19 +397,17 @@ TEST(HTTPDownload, PreservesExistingDestinationWhenBodyIsTruncated) {
 
   EXPECT_EQ(read_text(path), "old-data");
   EXPECT_EQ(sibling_artifact_count(path), 0u);
-  std::filesystem::remove(path);
 }
 
 TEST(HTTPDownload, PreservesExistingDestinationWhenTlsValidationFails) {
   IoRuntime rt;
   LocalTLSServer server(rt.context());
+  ScopedTestDirectory directory;
   server.serve([](asio::ssl::stream<tcp::socket>&) -> asio::awaitable<void> {
     co_return;
   });
 
-  const auto path =
-    std::filesystem::temp_directory_path() / "ed2k_https_failure_preserves_test.bin";
-  std::filesystem::remove(path);
+  const auto path = directory.path("destination.bin");
   write_text(path, "old-data");
 
   run_coro(rt, [&]() -> asio::awaitable<void> {
@@ -291,12 +422,12 @@ TEST(HTTPDownload, PreservesExistingDestinationWhenTlsValidationFails) {
 
   EXPECT_EQ(read_text(path), "old-data");
   EXPECT_EQ(sibling_artifact_count(path), 0u);
-  std::filesystem::remove(path);
 }
 
 TEST(HTTPDownload, PreservesExistingDestinationForNonSuccessResponse) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());
+  ScopedTestDirectory directory;
   server.serve([](tcp::socket socket) -> asio::awaitable<void> {
     EXPECT_FALSE((co_await read_request_target(socket)).empty());
     const std::string response =
@@ -305,9 +436,7 @@ TEST(HTTPDownload, PreservesExistingDestinationForNonSuccessResponse) {
       socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
   });
 
-  const auto path =
-    std::filesystem::temp_directory_path() / "ed2k_http_non_success_preserves_test.bin";
-  std::filesystem::remove(path);
+  const auto path = directory.path("destination.bin");
   write_text(path, "old-data");
 
   run_coro(rt, [&]() -> asio::awaitable<void> {
@@ -322,7 +451,6 @@ TEST(HTTPDownload, PreservesExistingDestinationForNonSuccessResponse) {
 
   EXPECT_EQ(read_text(path), "old-data");
   EXPECT_EQ(sibling_artifact_count(path), 0u);
-  std::filesystem::remove(path);
 }
 
 TEST(HTTPDownload, ReplacesExistingDestinationOnlyAfterCompleteSuccessfulBody) {
@@ -365,6 +493,7 @@ TEST(HTTPDownload, ReplacesExistingDestinationOnlyAfterCompleteSuccessfulBody) {
 TEST(HTTPDownload, RejectsDirectoryDestinationWithoutReplacingIt) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());
+  ScopedTestDirectory directory;
   server.serve([](tcp::socket socket) -> asio::awaitable<void> {
     EXPECT_FALSE((co_await read_request_target(socket)).empty());
     const std::string response =
@@ -373,9 +502,7 @@ TEST(HTTPDownload, RejectsDirectoryDestinationWithoutReplacingIt) {
       socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
   });
 
-  const auto path =
-    std::filesystem::temp_directory_path() / "ed2k_http_directory_destination_test";
-  std::filesystem::remove_all(path);
+  const auto path = directory.path("destination");
   ASSERT_TRUE(std::filesystem::create_directory(path));
 
   run_coro(rt, [&]() -> asio::awaitable<void> {
@@ -390,7 +517,6 @@ TEST(HTTPDownload, RejectsDirectoryDestinationWithoutReplacingIt) {
 
   EXPECT_TRUE(std::filesystem::is_directory(path));
   EXPECT_EQ(sibling_artifact_count(path), 0u);
-  std::filesystem::remove_all(path);
 }
 
 TEST(HTTPDownload, ReportsIoErrorWhenDestinationParentIsMissing) {
@@ -678,6 +804,7 @@ TEST(HTTPDownload, ReportsBackupCleanupFailureAfterCompletedReplacement) {
 TEST(HTTPDownload, PreservesExistingDestinationWhenAtomicReplaceFails) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());
+  ScopedTestDirectory directory;
   server.serve([](tcp::socket socket) -> asio::awaitable<void> {
     EXPECT_FALSE((co_await read_request_target(socket)).empty());
     const std::string response =
@@ -686,9 +813,7 @@ TEST(HTTPDownload, PreservesExistingDestinationWhenAtomicReplaceFails) {
       socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
   });
 
-  const auto path =
-    std::filesystem::temp_directory_path() / "ed2k_http_replace_failure_test.bin";
-  std::filesystem::remove(path);
+  const auto path = directory.path("destination.bin");
   write_text(path, "old-data");
   const HANDLE locked = CreateFileW(path.c_str(),
                                     GENERIC_READ,
@@ -712,7 +837,6 @@ TEST(HTTPDownload, PreservesExistingDestinationWhenAtomicReplaceFails) {
   EXPECT_EQ(read_text(path), "old-data");
   EXPECT_EQ(sibling_artifact_count(path), 0u);
   EXPECT_TRUE(CloseHandle(locked));
-  std::filesystem::remove(path);
 }
 #endif
 

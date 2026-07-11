@@ -54,9 +54,74 @@ namespace ed2k::infra {
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
-#ifdef _WIN32
 namespace detail {
 
+bool operation_not_supported(int error) {
+#ifdef ENOTSUP
+  if (error == ENOTSUP) {
+    return true;
+  }
+#endif
+#ifdef EOPNOTSUPP
+  if (error == EOPNOTSUPP) {
+    return true;
+  }
+#endif
+  return false;
+}
+
+bool parent_directory_fsync_unsupported(int error) {
+  // Linux and several Unix filesystems use EINVAL when directory fsync is not
+  // implemented. ENOTSUP/EOPNOTSUPP explicitly mean the same thing.
+  return error == EINVAL || operation_not_supported(error);
+}
+
+tl::expected<void, std::error_code>
+sync_parent_directory(const std::filesystem::path& destination,
+                      const ParentDirectorySyncOps& ops) {
+  const auto parent = destination.parent_path().empty()
+    ? std::filesystem::path(".")
+    : destination.parent_path();
+  int descriptor = -1;
+  int open_error = 0;
+  do {
+    descriptor = ops.open_directory(parent);
+    if (descriptor < 0) {
+      open_error = ops.last_error();
+    }
+  } while (descriptor < 0 && open_error == EINTR);
+  if (descriptor < 0) {
+    // Only explicit operation-not-supported errors mean O_DIRECTORY is
+    // unavailable. EINVAL and all other errors are genuine open failures.
+    if (operation_not_supported(open_error)) {
+      return {};
+    }
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+
+  int sync_result = 0;
+  int sync_error = 0;
+  do {
+    sync_result = ops.sync_directory(descriptor);
+    if (sync_result != 0) {
+      sync_error = ops.last_error();
+    }
+  } while (sync_result != 0 && sync_error == EINTR);
+
+  const int close_result = ops.close_directory(descriptor);
+  if (sync_result != 0 && !parent_directory_fsync_unsupported(sync_error)) {
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+  if (close_result != 0) {
+    // Do not retry close after EINTR: on Linux the descriptor has already been
+    // released, and a retry could close an unrelated descriptor reused by
+    // another thread.
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+  return {};
+}
+
+#ifdef _WIN32
 tl::expected<void, std::error_code>
 replace_existing_file_windows(const std::filesystem::path& temporary,
                               const std::filesystem::path& destination,
@@ -93,9 +158,9 @@ replace_existing_file_windows(const std::filesystem::path& temporary,
   ops.remove_file(temporary);
   return tl::unexpected(make_error_code(errc::io_error));
 }
+#endif
 
 } // namespace detail
-#endif
 
 namespace {
 
@@ -467,17 +532,15 @@ detail::WindowsNativeFileOps windows_native_file_ops() {
   };
 }
 #else
-void sync_parent_directory_best_effort(const std::filesystem::path& destination) {
-  const auto parent = destination.parent_path().empty()
-    ? std::filesystem::path(".")
-    : destination.parent_path();
-  const int descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
-  if (descriptor < 0) {
-    return;
-  }
-  while (::fsync(descriptor) != 0 && errno == EINTR) {
-  }
-  ::close(descriptor);
+detail::ParentDirectorySyncOps parent_directory_sync_ops() {
+  return {
+    [](const std::filesystem::path& path) {
+      return ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+    },
+    [](int descriptor) { return ::fsync(descriptor); },
+    [](int descriptor) { return ::close(descriptor); },
+    [] { return errno; },
+  };
 }
 #endif
 
@@ -509,8 +572,7 @@ replace_destination(const std::filesystem::path& temporary,
   std::error_code rename_error;
   std::filesystem::rename(temporary, destination, rename_error);
   if (!rename_error) {
-    sync_parent_directory_best_effort(destination);
-    return {};
+    return detail::sync_parent_directory(destination, parent_directory_sync_ops());
   }
   remove_best_effort(temporary);
   return tl::unexpected(make_error_code(errc::io_error));

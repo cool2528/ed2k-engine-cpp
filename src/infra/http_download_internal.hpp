@@ -1,7 +1,5 @@
 #pragma once
 
-#ifdef _WIN32
-
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -10,6 +8,19 @@
 #include <tl/expected.hpp>
 
 namespace ed2k::infra::detail {
+
+struct ParentDirectorySyncOps {
+  std::function<int(const std::filesystem::path&)> open_directory;
+  std::function<int(int)> sync_directory;
+  std::function<int(int)> close_directory;
+  std::function<int()> last_error;
+};
+
+tl::expected<void, std::error_code>
+sync_parent_directory(const std::filesystem::path& destination,
+                      const ParentDirectorySyncOps& ops);
+
+#ifdef _WIN32
 
 struct WindowsNativeFileOps {
   std::function<bool(const std::filesystem::path&,
@@ -30,6 +41,6 @@ replace_existing_file_windows(const std::filesystem::path& temporary,
                               const std::filesystem::path& backup,
                               const WindowsNativeFileOps& ops);
 
-} // namespace ed2k::infra::detail
-
 #endif
+
+} // namespace ed2k::infra::detail
