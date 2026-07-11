@@ -77,9 +77,8 @@ replace_existing_file_windows(const std::filesystem::path& temporary,
 
   const auto error = ops.last_error();
   if (error == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
-    if (ops.move_file(backup, destination)) {
-      ops.remove_file(temporary);
-    }
+    ops.move_file(backup, destination);
+    ops.remove_file(temporary);
     return tl::unexpected(make_error_code(errc::io_error));
   }
 

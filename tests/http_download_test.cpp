@@ -569,7 +569,7 @@ TEST(HTTPDownload, RestoresBackupAfterUnableToMoveReplacement2) {
   EXPECT_FALSE(std::filesystem::exists(backup));
 }
 
-TEST(HTTPDownload, PreservesBothFilesWhenBackupRestoreFails) {
+TEST(HTTPDownload, PreservesBackupAndCleansTempWhenBackupRestoreFails) {
   ScopedTestDirectory directory;
   const auto destination = directory.path("destination.bin");
   const auto temporary = directory.path("temporary.bin");
@@ -588,7 +588,7 @@ TEST(HTTPDownload, PreservesBothFilesWhenBackupRestoreFails) {
   EXPECT_FALSE(result.has_value());
   EXPECT_TRUE(move_called);
   EXPECT_FALSE(std::filesystem::exists(destination));
-  EXPECT_EQ(read_text(temporary), "new-data");
+  EXPECT_FALSE(std::filesystem::exists(temporary));
   EXPECT_EQ(read_text(backup), "old-data");
 }
 
