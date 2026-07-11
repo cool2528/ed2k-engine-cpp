@@ -134,11 +134,10 @@ try {
   $linuxConfig = Convert-ToWslPath $configDir
   $peerIp = (Invoke-WslText "hostname -I | awk '{print `$1}'").Text
   if ($peerIp -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Could not determine the WSL peer address: '$peerIp'" }
-  $daemonLinkArgument = ''
+  $uploadLink = $null
   if ($Mode -eq 'optional') {
       $uploadLink = (Get-Content -LiteralPath (Join-Path $stateRoot 'upload.link') -Raw).Trim()
       $uploadLink += "|sources,$peerIp`:$uploadPort|/"
-      $daemonLinkArgument = ' ' + (Bash-Quote $uploadLink)
   }
   $linuxPidFile = Convert-ToWslPath (Join-Path $logsDir 'amuled.pid')
   $launcherPath = Join-Path $logsDir 'launch-amuled.sh'
@@ -146,7 +145,7 @@ try {
     '#!/bin/bash',
     'umask 077',
     "echo `$`$ > $(Bash-Quote $linuxPidFile)",
-    "exec /usr/bin/amuled -c $(Bash-Quote $linuxConfig) -o$daemonLinkArgument"
+    "exec /usr/bin/amuled -c $(Bash-Quote $linuxConfig) -o"
 ) -join "`n"
   Set-Content -LiteralPath $launcherPath -Value ($launcher + "`n") -NoNewline
   $linuxLauncher = Convert-ToWslPath $launcherPath
@@ -182,6 +181,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if (-not $ready) { throw "amuled readiness timed out after 30 seconds. See $logsDir" }
+    Write-Host 'aMule daemon ready.'
 
     if ($Mode -eq 'optional') {
         $uploadFile = Convert-ToWslPath (Join-Path $stateRoot 'live-obfuscation-upload-evidence.bin')
@@ -209,6 +209,30 @@ try {
         if ($FailureInjection -eq 'after-upload-start') {
             throw 'Injected failure after upload evidence process start.'
         }
+
+        $listenerReady = $false
+        $listenerReadyDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        while ([DateTime]::UtcNow -lt $listenerReadyDeadline) {
+            if ($uploadProcess.HasExited) {
+                throw 'LiveUpload evidence test exited before its listener became ready.'
+            }
+            $probe = Invoke-WslText "ss -ltnH | awk '{print `$4}' | grep -Eq '(^|:)$uploadPort`$'" -AllowFailure
+            if ($probe.ExitCode -eq 0) {
+                $listenerReady = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $listenerReady) {
+            throw "LiveUpload listener readiness timed out after 15 seconds on port $uploadPort."
+        }
+        Write-Host "LiveUpload listener ready on port $uploadPort."
+
+        $addResult = Invoke-AmuleCmd ('Add ' + $uploadLink) -AllowFailure
+        if ($addResult.ExitCode -ne 0) {
+            throw "amulecmd Add failed after listener readiness: $($addResult.Text)"
+        }
+        Write-Host 'aMule source link injected through amulecmd Add.'
     }
 
     $fixtureLink = (Get-Content -LiteralPath (Join-Path $stateRoot 'fixture.link') -Raw).Trim()
