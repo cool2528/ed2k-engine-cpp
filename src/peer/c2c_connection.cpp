@@ -19,6 +19,14 @@ std::optional<std::chrono::milliseconds> remaining(clock_type::time_point deadli
   if (value.count() <= 0) return std::nullopt;
   return value;
 }
+
+std::chrono::milliseconds preferred_negotiation_budget(std::chrono::milliseconds available) {
+  if (available <= std::chrono::milliseconds{1}) return available;
+  const auto minimum_reserve = std::min(std::chrono::milliseconds{50}, available / 2);
+  auto reserve = std::max(minimum_reserve, available / 4);
+  reserve = std::min(reserve, std::chrono::milliseconds{2000});
+  return available - reserve;
+}
 // 累积 OP_SENDINGPART/OP_COMPRESSEDPART 子帧到 per-range 缓冲, 直到每个活跃区间 [start,end)
 // 连续覆盖完成。aMule CreateStandardPackets 把每个请求区间切成 ~10240 字节的子帧(非一帧一块),
 // 故不能假定「一区间一帧」——必须按字节偏移拼接。返回每个完成区间一个 Block(整区间数据)。
@@ -236,7 +244,9 @@ C2CConnection::connect(const PeerIdentity& peer, ObfuscationPolicy policy,
       co_return tl::unexpected(connected.error());
     budget = remaining(deadline);
     if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
-    auto negotiated = co_await encrypted.handshake_initiator(*peer.user_hash, *budget);
+    const auto negotiation_budget = policy == ObfuscationPolicy::preferred
+        ? preferred_negotiation_budget(*budget) : *budget;
+    auto negotiated = co_await encrypted.handshake_initiator(*peer.user_hash, negotiation_budget);
     if (negotiated) co_return tl::expected<void,std::error_code>{};
     encrypted.close();
     if (policy == ObfuscationPolicy::required)

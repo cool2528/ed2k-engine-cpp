@@ -22,8 +22,15 @@ enum class ObfuscationPolicy { disabled, preferred, required };
 
 struct PeerIdentity {
   server::SourceEndpoint endpoint;
+  // Server/Kad source replies contain only endpoint data. A missing hash means
+  // preferred mode intentionally uses plaintext; required mode fails before dialing.
+  // Source Exchange v2 callers can preserve its PeerSource::user_hash here.
   std::optional<UserHash> user_hash;
 };
+
+inline PeerIdentity peer_identity(const PeerSource& source) {
+  return PeerIdentity{{source.client_id, source.port}, source.user_hash};
+}
 
 struct C2CHandshakeResult {
   HelloInfo hello;

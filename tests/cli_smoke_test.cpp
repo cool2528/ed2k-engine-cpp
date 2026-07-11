@@ -233,6 +233,77 @@ TEST(CliConfig, SetWritesPreferencesFile) {
   std::filesystem::remove(path);
 }
 
+TEST(CliObfuscation, CommentRejectsHashlessPeerWithActionableError) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+  const auto output = std::filesystem::temp_directory_path() / "ed2k_cli_comment_obfuscation.txt";
+  std::filesystem::remove(output);
+  const std::string link = "ed2k://|file|one.bin|123|00112233445566778899aabbccddeeff|/";
+  const auto command = shell_path(*tool) + " --obfuscation comment " + shell_arg(link) +
+      " --rating:1 --comment:test --peer:127.0.0.1:9 > " +
+      shell_arg(shell_path(output)) + " 2>&1";
+  EXPECT_NE(shell_exit_code(std::system(command.c_str())), 0);
+  EXPECT_NE(read_text(output).find("--peer-hash"), std::string::npos);
+  std::filesystem::remove(output);
+}
+
+TEST(CliObfuscation, CommentRejectsInvalidPeerHashActionably) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+  const auto output = std::filesystem::temp_directory_path() / "ed2k_cli_comment_bad_hash.txt";
+  std::filesystem::remove(output);
+  const std::string link = "ed2k://|file|one.bin|123|00112233445566778899aabbccddeeff|/";
+  const auto command = shell_path(*tool) + " --obfuscation comment " + shell_arg(link) +
+      " --rating:1 --comment:test --peer:127.0.0.1:9 --peer-hash:not-a-hash > " +
+      shell_arg(shell_path(output)) + " 2>&1";
+  EXPECT_NE(shell_exit_code(std::system(command.c_str())), 0);
+  EXPECT_NE(read_text(output).find("32-hex"), std::string::npos);
+  std::filesystem::remove(output);
+}
+
+TEST(CliObfuscation, CommentRejectsPeerHashWithoutValue) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+  const auto output = std::filesystem::temp_directory_path() / "ed2k_cli_comment_missing_hash.txt";
+  std::filesystem::remove(output);
+  const std::string link = "ed2k://|file|one.bin|123|00112233445566778899aabbccddeeff|/";
+  const auto command = shell_path(*tool) + " comment " + shell_arg(link) +
+      " --rating:1 --comment:test --peer:127.0.0.1:9 --peer-hash > " +
+      shell_arg(shell_path(output)) + " 2>&1";
+  EXPECT_NE(shell_exit_code(std::system(command.c_str())), 0);
+  EXPECT_NE(read_text(output).find("requires a value"), std::string::npos);
+  std::filesystem::remove(output);
+}
+
+TEST(CliObfuscation, CommentAcceptsValidPeerHashIntoConnectionPath) {
+  auto tool = find_tool();
+  if (!tool) {
+    GTEST_SKIP() << "ed2k-tool executable not built";
+  }
+  const auto output = std::filesystem::temp_directory_path() / "ed2k_cli_comment_valid_hash.txt";
+  std::filesystem::remove(output);
+  asio::io_context context;
+  tcp::acceptor unused(context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const auto unused_port = unused.local_endpoint().port();
+  unused.close();
+  const std::string link = "ed2k://|file|one.bin|123|00112233445566778899aabbccddeeff|/";
+  const auto command = shell_path(*tool) + " --obfuscation comment " + shell_arg(link) +
+      " --rating:1 --comment:test --peer:127.0.0.1:" + std::to_string(unused_port) + " " +
+      "--peer-hash:00112233445566778899aabbccddeeff > " +
+      shell_arg(shell_path(output)) + " 2>&1";
+  EXPECT_NE(shell_exit_code(std::system(command.c_str())), 0);
+  const auto text = read_text(output);
+  EXPECT_NE(text.find("connect failed"), std::string::npos);
+  EXPECT_EQ(text.find("requires --peer-hash"), std::string::npos);
+  std::filesystem::remove(output);
+}
+
 TEST(CliConfig, GlobalConfigOptionSuppliesPreferencesPath) {
   auto tool = find_tool();
   if (!tool) {

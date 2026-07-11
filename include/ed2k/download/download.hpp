@@ -60,6 +60,11 @@ class MultiSourceDownload {
       return *this;
     }
     Builder& sources(std::vector<peer::PeerIdentity> s) { sources_ = std::move(s); return *this; }
+    Builder& peer_sources(std::vector<peer::PeerSource> s) {
+      sources_.clear(); sources_.reserve(s.size());
+      for (const auto& source : s) sources_.push_back(peer::peer_identity(source));
+      return *this;
+    }
     Builder& obfuscation(peer::ObfuscationPolicy policy, std::optional<UserHash> local_user_hash) {
       obfuscation_policy_ = policy;
       local_user_hash_ = std::move(local_user_hash);

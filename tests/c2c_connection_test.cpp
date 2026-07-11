@@ -67,6 +67,18 @@ static UserHash obfuscation_test_hash() {
   return *UserHash::from_hex("00112233445566778899aabbccddeeff");
 }
 
+TEST(PeerIdentity, SourceExchangePreservesUserHash) {
+  PeerSource source;
+  source.client_id = 0x0100007Fu;
+  source.port = 4662;
+  source.user_hash = obfuscation_test_hash();
+  auto identity = peer_identity(source);
+  EXPECT_EQ(identity.endpoint.id, source.client_id);
+  EXPECT_EQ(identity.endpoint.port, source.port);
+  ASSERT_TRUE(identity.user_hash.has_value());
+  EXPECT_EQ(*identity.user_hash, source.user_hash);
+}
+
 TEST(C2CConnection, RequiredObfuscationWithoutTargetHashFailsBeforeTcpDial) {
   IoRuntime rt;
   tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
@@ -79,6 +91,34 @@ TEST(C2CConnection, RequiredObfuscationWithoutTargetHashFailsBeforeTcpDial) {
         asio::cancel_after(50ms, asio::as_tuple(asio::use_awaitable)));
     EXPECT_EQ(ec, asio::error::operation_aborted);
     EXPECT_FALSE(socket.is_open());
+    co_return;
+  });
+}
+
+TEST(C2CConnection, PreferredHashlessSourceUsesObservablePlaintext) {
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  std::byte marker{};
+  peer.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    auto [ec, n] = co_await asio::async_read(socket, asio::buffer(&marker, 1),
+                                             asio::as_tuple(asio::use_awaitable));
+    (void)ec; (void)n;
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    C2CConnection c(rt.executor());
+    auto connected = co_await c.connect(loopback_identity(peer.port()),
+                                        ObfuscationPolicy::preferred, 500ms);
+    EXPECT_TRUE(connected.has_value());
+    EXPECT_FALSE(c.encrypted());
+    if (!connected) co_return;
+    HelloInfo mine;
+    mine.nickname = "client";
+    mine.version = 0x3c;
+    mine.user_hash = obfuscation_test_hash();
+    auto handshake = co_await c.handshake(mine, 100ms);
+    EXPECT_FALSE(handshake.has_value());
+    EXPECT_EQ(marker, std::byte{proto::eDonkey});
     co_return;
   });
 }
@@ -111,6 +151,36 @@ TEST(C2CConnection, PreferredObfuscationReconnectsPlaintextAfterNegotiationFailu
     EXPECT_NE(first_marker, std::byte{proto::eMule});
     EXPECT_NE(first_marker, std::byte{proto::zlib});
     EXPECT_FALSE(c.encrypted());
+    c.close();
+    co_return;
+  });
+}
+
+TEST(C2CConnection, PreferredSilentEncryptedAttemptFallsBackPlainWithinBudget) {
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  std::size_t accepts = 0;
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+    auto encrypted = co_await acceptor.async_accept(asio::use_awaitable);
+    ++accepts;
+    std::array<std::byte, 1> marker{};
+    (void)co_await asio::async_read(encrypted, asio::buffer(marker), asio::as_tuple(asio::use_awaitable));
+    auto plain = co_await acceptor.async_accept(asio::use_awaitable);
+    ++accepts;
+    std::array<std::byte, 1> hold{};
+    (void)co_await plain.async_read_some(asio::buffer(hold), asio::as_tuple(asio::use_awaitable));
+  }, asio::detached);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    const auto start = std::chrono::steady_clock::now();
+    C2CConnection c(rt.executor());
+    auto r = co_await c.connect(loopback_identity(
+        acceptor.local_endpoint().port(), obfuscation_test_hash()),
+        ObfuscationPolicy::preferred, 300ms);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    EXPECT_EQ(accepts, 2u);
+    EXPECT_FALSE(c.encrypted());
+    EXPECT_LT(elapsed, 300ms);
     c.close();
     co_return;
   });

@@ -50,7 +50,7 @@ static int usage(){ std::puts("usage: ed2k-tool hash <file> [--aich] [--red]\n"
   "       ed2k-tool search <server.met> <keyword>\n"
   "       ed2k-tool sources <server.met> <ed2k-link>\n"
   "       ed2k-tool publish <dir> [--server:server.met] [--ip:x.x.x.x] [--port:n]\n"
-  "       ed2k-tool comment <ed2k-link> --rating:n --comment:text [--peer:ip:port]\n"
+  "       ed2k-tool comment <ed2k-link> --rating:n --comment:text [--peer:ip:port] [--peer-hash:32hex]\n"
   "       ed2k-tool ipfilter <ipfilter.dat> [--block-check:ip] [--level:n]\n"
   "       ed2k-tool config <preferences.dat> [--set:key=value]\n"
   "       ed2k-tool stats <statistics.dat>\n"
@@ -673,6 +673,9 @@ int main(int argc,char** argv){
     std::optional<unsigned> rating;
     std::string comment;
     std::optional<std::pair<IPv4, std::uint16_t>> peer;
+    std::optional<UserHash> peer_hash;
+    bool invalid_peer_hash = false;
+    bool missing_peer_hash_value = false;
     for(int i=3;i<argc;++i){
       std::string a=argv[i];
       if(a=="--rating" && i+1<argc) rating = static_cast<unsigned>(std::stoul(argv[++i]));
@@ -680,14 +683,32 @@ int main(int argc,char** argv){
       else if(a=="--comment" && i+1<argc) comment = argv[++i];
       else if(a.rfind("--comment:",0)==0) comment = a.substr(10);
       else if(a.rfind("--peer:",0)==0) peer = parse_peer(a.substr(7));
+      else if(a=="--peer-hash") {
+        if(i+1>=argc) missing_peer_hash_value = true;
+        else {
+          auto parsed = UserHash::from_hex(argv[++i]);
+          if(parsed) peer_hash = *parsed; else invalid_peer_hash = true;
+        }
+      }
+      else if(a.rfind("--peer-hash:",0)==0) {
+        auto parsed = UserHash::from_hex(a.substr(12));
+        if(parsed) peer_hash = *parsed; else invalid_peer_hash = true;
+      }
     }
     if(!rating || *rating > 5){ std::printf("error: rating must be 0..5\n"); return 1; }
     if(comment.empty()){ std::printf("error: comment required\n"); return 1; }
+    if(missing_peer_hash_value){ std::printf("error: --peer-hash requires a value\n"); return 1; }
+    if(invalid_peer_hash){ std::printf("error: --peer-hash must be a 32-hex user hash\n"); return 1; }
     auto payload = ed2k::peer::encode_file_desc(static_cast<std::uint8_t>(*rating), comment);
     if(!peer){
       std::printf("file=%s rating=%u comment=%s payload=%s\n",
         f->hash.to_hex().c_str(), *rating, comment.c_str(), hex_bytes(payload).c_str());
       return 0;
+    }
+    const auto obfuscation_policy = cli_obfuscation_policy(*startup_prefs);
+    if(obfuscation_policy != ed2k::peer::ObfuscationPolicy::disabled && !peer_hash){
+      std::printf("error: obfuscation for comment peer requires --peer-hash:<32-hex-user-hash>\n");
+      return 1;
     }
     auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
     if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
@@ -699,10 +720,10 @@ int main(int argc,char** argv){
       const auto wire = ((host & 0xFFu) << 24) | ((host & 0xFF00u) << 8) |
                         ((host & 0xFF0000u) >> 8) | ((host & 0xFF000000u) >> 24);
       auto cr = co_await c.connect(
-        ed2k::peer::PeerIdentity{{wire, peer->second}, std::nullopt},
-        cli_obfuscation_policy(*startup_prefs), std::chrono::milliseconds(15000));
+        ed2k::peer::PeerIdentity{{wire, peer->second}, peer_hash},
+        obfuscation_policy, std::chrono::milliseconds(15000));
       if(!cr){ std::printf("error: %s\n", cr.error().message().c_str()); rc=1; rt.stop(); co_return; }
-      auto hs = co_await c.handshake(cli_hello(cli_obfuscation_policy(*startup_prefs)),
+      auto hs = co_await c.handshake(cli_hello(obfuscation_policy),
                                      std::chrono::milliseconds(15000));
       if(!hs){ std::printf("error: %s\n", hs.error().message().c_str()); rc=1; rt.stop(); co_return; }
       auto fs = co_await c.request_file(f->hash, std::chrono::milliseconds(15000));
