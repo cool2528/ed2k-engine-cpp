@@ -87,19 +87,28 @@ asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
 UdpServerConnection::request_response(const ed2k::net::Packet& request, std::uint8_t want,
                                       std::chrono::milliseconds timeout){
   last_response_encrypted_ = false;
+  const auto deadline = clock_type::now() + timeout;
+  const auto remaining = [&]() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
+  };
   if(obfuscation_.enabled()){
     auto sr = co_await send_request(request, true);
     if(!sr) co_return tl::unexpected(sr.error());
+    auto request_remaining = remaining();
+    if(request_remaining.count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
     auto probe_timeout = obfuscation_.probe_timeout;
-    if(probe_timeout.count() <= 0 || probe_timeout > timeout) probe_timeout = timeout;
+    if(probe_timeout.count() <= 0 || probe_timeout > request_remaining) probe_timeout = request_remaining;
     auto rp = co_await pump_until(want, probe_timeout);
     if(rp || !obfuscation_.fallback_plain || rp.error() != make_error_code(errc::timed_out)){
       co_return rp;
     }
   }
+  if(remaining().count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
   auto sr = co_await send_request(request, false);
   if(!sr) co_return tl::unexpected(sr.error());
-  co_return co_await pump_until(want, timeout);
+  auto request_remaining = remaining();
+  if(request_remaining.count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
+  co_return co_await pump_until(want, request_remaining);
 }
 
 asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>

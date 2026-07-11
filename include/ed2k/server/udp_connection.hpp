@@ -68,6 +68,8 @@ class UdpServerConnection {
     server_list(IPv4 ask_ip, std::uint16_t ask_port, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<ServerDesc,std::error_code>>
     server_desc(std::uint32_t challenge, std::chrono::milliseconds timeout);
+  // Diagnostic for sequential request use. Like the request operations themselves,
+  // this connection is not safe for concurrent calls.
   [[nodiscard]] bool last_response_encrypted() const noexcept { return last_response_encrypted_; }
   void close() noexcept;
  private:

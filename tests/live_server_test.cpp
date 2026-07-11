@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <chrono>
+#include <random>
 #include <boost/asio/co_spawn.hpp>
 #include "ed2k/app/server_session.hpp"
 #include "ed2k/net/runtime.hpp"
@@ -105,9 +106,14 @@ TEST(LiveServer, UdpObfuscationProbe){
   ed2k::net::IoRuntime rt;
   std::string capability_unavailable;
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    constexpr std::uint32_t stat_challenge = 0x55AA4C49u;
-    constexpr std::uint32_t encrypted_stat_challenge = 0x55AA4C4Au;
-    constexpr std::uint32_t desc_challenge = 0x4F42F0FFu;
+    std::mt19937 generator(std::random_device{}());
+    std::uniform_int_distribution<std::uint32_t> nonce(1, 0xFFFFu);
+    const auto stat_nonce = nonce(generator);
+    auto encrypted_stat_nonce = nonce(generator);
+    while(encrypted_stat_nonce == stat_nonce) encrypted_stat_nonce = nonce(generator);
+    const auto stat_challenge = 0x55AA0000u | stat_nonce;
+    const auto encrypted_stat_challenge = 0x55AA0000u | encrypted_stat_nonce;
+    const auto desc_challenge = (nonce(generator) << 16) | 0xF0FFu;
     const auto plain_udp_port = static_cast<std::uint16_t>(target->port + 4);
     UdpServerConnection plain(rt.executor(), target->ip, plain_udp_port);
     auto stat = co_await plain.server_status(stat_challenge, 5000ms);

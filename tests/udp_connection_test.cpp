@@ -249,6 +249,32 @@ TEST(UdpConnection, ServerStatusFallsBackToPlainUdpWhenObfuscatedProbeTimesOut){
     c.close(); co_return;
   });
 }
+TEST(UdpConnection, ObfuscatedFallbackSharesOneTotalTimeoutBudget){
+  IoRuntime rt;
+  udp::socket drop_obfuscated(rt.context(), udp::endpoint(asio::ip::address_v4::loopback(), 0));
+  ed2k::test::MockUdpServer drop_plain(rt.context());
+  drop_plain.serve([](udp::socket&, const Packet&, const udp::endpoint&) -> asio::awaitable<void>{
+    co_return;
+  });
+
+  const auto started = std::chrono::steady_clock::now();
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    UdpServerConnection c(rt.executor(), *IPv4::from_dotted("127.0.0.1"), drop_plain.port(),
+                          UdpServerObfuscation{
+                              .udp_key = 0x11223344u,
+                              .udp_port = drop_obfuscated.local_endpoint().port(),
+                              .probe_timeout = 200ms,
+                              .fallback_plain = true,
+                          });
+    auto r = co_await c.server_status(0xCAFEBABEu, 300ms);
+    EXPECT_FALSE(r.has_value());
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::timed_out));
+    c.close(); co_return;
+  });
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_GE(elapsed, 250ms);
+  EXPECT_LT(elapsed, 420ms);
+}
 TEST(UdpConnection, ServerStatusChallengeMismatch){
   IoRuntime rt;
   ed2k::test::MockUdpServer srv(rt.context());

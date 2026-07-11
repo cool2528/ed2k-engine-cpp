@@ -5,18 +5,20 @@ param(
     [string]$ToolPath = '',
     [string]$OutputDirectory = '.tmp_live_server_probe',
     [ValidateRange(100, 10000)]
-    [int]$ConnectTimeoutMs = 2000
+    [int]$ConnectTimeoutMs = 2000,
+    [string[]]$FallbackEndpoints = @(
+        '45.82.80.155:5687',
+        '176.123.5.89:4725',
+        '91.208.162.87:4232',
+        '85.121.5.137:4232',
+        '77.42.68.79:4232'
+    )
 )
 
 $ErrorActionPreference = 'Stop'
 $DefaultServerListUrl = 'https://upd.emule-security.org/server.met'
-$StaticFallback = @(
-    '45.82.80.155:5687',
-    '176.123.5.89:4725',
-    '91.208.162.87:4232',
-    '85.121.5.137:4232',
-    '77.42.68.79:4232'
-)
+$MaxAttempts = 5
+$RetrievedAttemptSlots = 3
 
 if ([string]::IsNullOrWhiteSpace($ServerListUrl)) {
     $ServerListUrl = $DefaultServerListUrl
@@ -59,6 +61,27 @@ function Test-TcpEndpoint {
     }
 }
 
+function Get-DailyRotation {
+    param([string[]]$Items)
+    if ($Items.Count -eq 0) { return @() }
+    $offset = ([DateTime]::UtcNow.DayOfYear - 1) % $Items.Count
+    $rotated = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $Items.Count; ++$i) {
+        $rotated.Add($Items[($offset + $i) % $Items.Count])
+    }
+    return $rotated.ToArray()
+}
+
+function Add-UniqueEndpoint {
+    param(
+        [System.Collections.Generic.List[string]]$Queue,
+        [string]$Endpoint
+    )
+    if ($Queue.Count -lt $MaxAttempts -and -not $Queue.Contains($Endpoint)) {
+        $Queue.Add($Endpoint)
+    }
+}
+
 $retrieved = $false
 & $ToolPath update-serverlist $ServerListUrl $serverMet 2>&1 |
     Tee-Object -FilePath $downloadLog | Write-Host
@@ -66,7 +89,7 @@ if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $serverMet -PathType Leaf))
     $retrieved = $true
 }
 
-$endpoints = [System.Collections.Generic.List[string]]::new()
+$retrievedEndpoints = [System.Collections.Generic.List[string]]::new()
 if ($retrieved) {
     $parsed = & $ToolPath serverlist $serverMet 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -75,25 +98,42 @@ if ($retrieved) {
     foreach ($line in $parsed) {
         if ($line -match '^\s*(?<ip>(?:\d{1,3}\.){3}\d{1,3})\s+(?<port>\d{1,5})\s+') {
             $endpoint = "$($Matches.ip):$($Matches.port)"
-            if (-not $endpoints.Contains($endpoint)) {
-                $endpoints.Add($endpoint)
+            if (-not $retrievedEndpoints.Contains($endpoint)) {
+                $retrievedEndpoints.Add($endpoint)
             }
         }
     }
-    if ($endpoints.Count -eq 0) {
+    if ($retrievedEndpoints.Count -eq 0) {
         throw 'downloaded server.met contained no candidates recognized by ed2k-tool'
     }
 }
 else {
     Write-Warning 'server-list retrieval failed; using the project-maintained static fallback endpoints'
-    foreach ($endpoint in $StaticFallback) {
-        $endpoints.Add($endpoint)
+}
+
+$endpoints = [System.Collections.Generic.List[string]]::new()
+$rotatedRetrieved = @(Get-DailyRotation -Items $retrievedEndpoints.ToArray())
+$rotatedFallback = @(Get-DailyRotation -Items $FallbackEndpoints)
+if ($retrieved) {
+    foreach ($endpoint in ($rotatedRetrieved | Select-Object -First $RetrievedAttemptSlots)) {
+        Add-UniqueEndpoint -Queue $endpoints -Endpoint $endpoint
+    }
+    foreach ($endpoint in $rotatedFallback) {
+        Add-UniqueEndpoint -Queue $endpoints -Endpoint $endpoint
+    }
+    foreach ($endpoint in $rotatedRetrieved) {
+        Add-UniqueEndpoint -Queue $endpoints -Endpoint $endpoint
+    }
+}
+else {
+    foreach ($endpoint in $rotatedFallback) {
+        Add-UniqueEndpoint -Queue $endpoints -Endpoint $endpoint
     }
 }
 
 $attempts = [System.Collections.Generic.List[string]]::new()
 $selected = $null
-foreach ($endpoint in ($endpoints | Select-Object -First 5)) {
+foreach ($endpoint in $endpoints) {
     $parts = $endpoint.Split(':')
     $reachable = Test-TcpEndpoint -Ip $parts[0] -Port ([int]$parts[1])
     $status = if ($reachable) { 'reachable' } else { 'unreachable' }
@@ -105,9 +145,10 @@ foreach ($endpoint in ($endpoints | Select-Object -First 5)) {
     }
 }
 
-$source = if ($retrieved) { "downloaded $ServerListUrl" } else { 'static fallback after retrieval failure' }
+$source = if ($retrieved) { 'downloaded + static fallback' } else { 'static fallback after retrieval failure' }
 @(
-    "source=$source"
+    "candidate_source=$source"
+    "server_list_url=$ServerListUrl"
     "tool=$ToolPath"
     "connect_timeout_ms=$ConnectTimeoutMs"
     "attempts=$($attempts.Count)"

@@ -22,7 +22,7 @@ permissions:
 jobs:
   probe:
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -62,8 +62,20 @@ jobs:
       - name: Configure Release
         run: cmake --preset default-release
 
+      - name: Clear cache credentials before building probe binaries
+        shell: pwsh
+        run: |
+          "ACTIONS_CACHE_URL=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ACTIONS_RUNTIME_TOKEN=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Remove-Item Env:ACTIONS_CACHE_URL -ErrorAction SilentlyContinue
+          Remove-Item Env:ACTIONS_RUNTIME_TOKEN -ErrorAction SilentlyContinue
+
       - name: Build Release
         run: cmake --build --preset default-release --target ed2k-tool ed2k_tests
+
+      - name: Test bounded server selector
+        shell: pwsh
+        run: ./scripts/live/select-public-server.tests.ps1
 
       - name: Select reachable public server
         id: select
