@@ -8,6 +8,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/net/connection.hpp"
+#include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/share/client_credits.hpp"
 #include "ed2k/share/known_file.hpp"
@@ -18,6 +19,16 @@ namespace ed2k::share {
 
 class UploadSession {
  public:
+  UploadSession(ed2k::peer::C2CConnection&& connection,
+                KnownFileDB& files,
+                ed2k::peer::HelloInfo self);
+  UploadSession(ed2k::peer::C2CConnection&& connection,
+                KnownFileDB& files,
+                ed2k::peer::HelloInfo self,
+                boost::asio::any_io_executor disk_executor,
+                UploadQueue* queue = nullptr,
+                UploadBandwidthThrottler* throttler = nullptr,
+                ClientCredits* credits = nullptr);
   UploadSession(boost::asio::ip::tcp::socket&& socket,
                 KnownFileDB& files,
                 ed2k::peer::HelloInfo self);
@@ -60,7 +71,7 @@ class UploadSession {
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     send_requested_parts(const KnownFile& file, const ed2k::peer::RequestParts& req);
 
-  ed2k::net::Connection conn_;
+  ed2k::peer::C2CConnection conn_;
   KnownFileDB& files_;
   ed2k::peer::HelloInfo self_;
   std::optional<ed2k::peer::HelloInfo> peer_;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <random>
 
 #include <boost/asio/as_tuple.hpp>
@@ -27,6 +28,13 @@ constexpr std::uint32_t k_magic_sync = 0x835e6fc4u;
 constexpr std::uint8_t k_method_obfuscation = 0x00;
 constexpr std::size_t k_rc4_discard = 1024;
 constexpr std::uint8_t k_default_max_padding = 16;
+using clock_type = std::chrono::steady_clock;
+
+std::optional<std::chrono::milliseconds> remaining(clock_type::time_point deadline) {
+  auto value = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
+  if (value.count() <= 0) return std::nullopt;
+  return value;
+}
 
 bool is_plain_protocol_marker(std::byte value) noexcept {
   const auto marker = std::to_integer<std::uint8_t>(value);
@@ -181,6 +189,7 @@ EncryptedStreamSocket::read_decrypted(std::size_t size, std::chrono::millisecond
 asio::awaitable<tl::expected<void, std::error_code>>
 EncryptedStreamSocket::handshake_initiator(const UserHash& target_hash, std::chrono::milliseconds timeout,
                                            const TcpObfuscationOptions& options) {
+  const auto deadline = clock_type::now() + timeout;
   const auto random_key_part = options.random_key_part.value_or(random_u32());
   send_rc4_.emplace(make_tcp_rc4(target_hash, k_magic_requester, random_key_part));
   receive_rc4_.emplace(make_tcp_rc4(target_hash, k_magic_server, random_key_part));
@@ -206,7 +215,9 @@ EncryptedStreamSocket::handshake_initiator(const UserHash& target_hash, std::chr
     co_return tl::unexpected(written.error());
   }
 
-  auto magic = co_await read_decrypted(4, timeout, *receive_rc4_);
+  auto budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto magic = co_await read_decrypted(4, *budget, *receive_rc4_);
   if (!magic) {
     co_return tl::unexpected(magic.error());
   }
@@ -214,7 +225,9 @@ EncryptedStreamSocket::handshake_initiator(const UserHash& target_hash, std::chr
     co_return tl::unexpected(make_error_code(errc::bad_magic));
   }
 
-  auto method_and_padding = co_await read_decrypted(2, timeout, *receive_rc4_);
+  budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto method_and_padding = co_await read_decrypted(2, *budget, *receive_rc4_);
   if (!method_and_padding) {
     co_return tl::unexpected(method_and_padding.error());
   }
@@ -222,7 +235,9 @@ EncryptedStreamSocket::handshake_initiator(const UserHash& target_hash, std::chr
     co_return tl::unexpected(make_error_code(errc::unsupported_version));
   }
   const auto padding_len = std::to_integer<std::uint8_t>((*method_and_padding)[1]);
-  auto ignored_padding = co_await read_decrypted(padding_len, timeout, *receive_rc4_);
+  budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto ignored_padding = co_await read_decrypted(padding_len, *budget, *receive_rc4_);
   if (!ignored_padding) {
     co_return tl::unexpected(ignored_padding.error());
   }
@@ -234,8 +249,11 @@ EncryptedStreamSocket::handshake_initiator(const UserHash& target_hash, std::chr
 asio::awaitable<tl::expected<void, std::error_code>>
 EncryptedStreamSocket::handshake_acceptor(const UserHash& local_hash, std::chrono::milliseconds timeout,
                                           const TcpObfuscationOptions& options) {
+  const auto deadline = clock_type::now() + timeout;
   std::array<std::byte, 1> marker{};
-  auto marker_read = co_await read_exact(marker, timeout);
+  auto budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto marker_read = co_await read_exact(marker, *budget);
   if (!marker_read) {
     co_return tl::unexpected(marker_read.error());
   }
@@ -244,7 +262,9 @@ EncryptedStreamSocket::handshake_acceptor(const UserHash& local_hash, std::chron
   }
 
   std::array<std::byte, 4> random_bytes{};
-  auto random_read = co_await read_exact(random_bytes, timeout);
+  budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto random_read = co_await read_exact(random_bytes, *budget);
   if (!random_read) {
     co_return tl::unexpected(random_read.error());
   }
@@ -253,7 +273,9 @@ EncryptedStreamSocket::handshake_acceptor(const UserHash& local_hash, std::chron
   receive_rc4_.emplace(make_tcp_rc4(local_hash, k_magic_requester, random_key_part));
   send_rc4_.emplace(make_tcp_rc4(local_hash, k_magic_server, random_key_part));
 
-  auto magic = co_await read_decrypted(4, timeout, *receive_rc4_);
+  budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto magic = co_await read_decrypted(4, *budget, *receive_rc4_);
   if (!magic) {
     co_return tl::unexpected(magic.error());
   }
@@ -261,7 +283,9 @@ EncryptedStreamSocket::handshake_acceptor(const UserHash& local_hash, std::chron
     co_return tl::unexpected(make_error_code(errc::bad_magic));
   }
 
-  auto methods = co_await read_decrypted(3, timeout, *receive_rc4_);
+  budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto methods = co_await read_decrypted(3, *budget, *receive_rc4_);
   if (!methods) {
     co_return tl::unexpected(methods.error());
   }
@@ -269,7 +293,9 @@ EncryptedStreamSocket::handshake_acceptor(const UserHash& local_hash, std::chron
     co_return tl::unexpected(make_error_code(errc::unsupported_version));
   }
   const auto request_padding_len = std::to_integer<std::uint8_t>((*methods)[2]);
-  auto ignored_padding = co_await read_decrypted(request_padding_len, timeout, *receive_rc4_);
+  budget = remaining(deadline);
+  if (!budget) co_return tl::unexpected(make_error_code(errc::timed_out));
+  auto ignored_padding = co_await read_decrypted(request_padding_len, *budget, *receive_rc4_);
   if (!ignored_padding) {
     co_return tl::unexpected(ignored_padding.error());
   }

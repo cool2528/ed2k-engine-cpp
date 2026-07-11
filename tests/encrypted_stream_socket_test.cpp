@@ -11,6 +11,7 @@
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -213,6 +214,45 @@ TEST(EncryptedStreamSocket, AcceptorRejectsPlainProtocolMarker) {
     co_return;
   });
   EXPECT_TRUE(checked);
+}
+
+TEST(EncryptedStreamSocket, AcceptorHandshakeUsesSingleTimeoutBudgetAcrossReads) {
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  boost::asio::experimental::channel<void(boost::system::error_code, std::chrono::milliseconds)>
+      completed(rt.executor(), 1);
+  peer.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    EncryptedStreamSocket encrypted(std::move(socket));
+    const auto start = std::chrono::steady_clock::now();
+    auto result = co_await encrypted.handshake_acceptor(user_hash(), 80ms);
+    EXPECT_FALSE(result.has_value());
+    completed.try_send(boost::system::error_code{},
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start));
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    tcp::socket client(rt.executor());
+    co_await client.async_connect(
+        tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()),
+        asio::use_awaitable);
+    asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+      asio::steady_timer first_delay(rt.executor(), 55ms);
+      co_await first_delay.async_wait(asio::use_awaitable);
+      const std::byte marker{0x42};
+      (void)co_await asio::async_write(client, asio::buffer(&marker, 1),
+                                      asio::as_tuple(asio::use_awaitable));
+      asio::steady_timer second_delay(rt.executor(), 55ms);
+      co_await second_delay.async_wait(asio::use_awaitable);
+      std::array<std::byte, 4> random_part{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+      (void)co_await asio::async_write(client, asio::buffer(random_part),
+                                      asio::as_tuple(asio::use_awaitable));
+      co_return;
+    }, asio::detached);
+    const auto elapsed = co_await completed.async_receive(asio::use_awaitable);
+    EXPECT_LT(elapsed, 150ms);
+    co_return;
+  });
 }
 
 TEST(EncryptedStreamSocket, AcceptorRejectsEncryptedWrongMagic) {

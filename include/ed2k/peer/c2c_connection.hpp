@@ -14,7 +14,17 @@
 #include "ed2k/core/hash.hpp"
 #include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/peer/c2c_messages.hpp"
+#include "ed2k/server/messages.hpp"
+namespace ed2k::net { class EncryptedStreamSocket; struct Packet; }
+namespace ed2k::share { class UploadSession; }
 namespace ed2k::peer {
+enum class ObfuscationPolicy { disabled, preferred, required };
+
+struct PeerIdentity {
+  server::SourceEndpoint endpoint;
+  std::optional<UserHash> user_hash;
+};
+
 struct C2CHandshakeResult {
   HelloInfo hello;
   MuleInfo mule_info;
@@ -33,6 +43,9 @@ class C2CConnection {
   void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     connect(IPv4 ip, std::uint16_t port, std::chrono::milliseconds timeout);
+  boost::asio::awaitable<tl::expected<void,std::error_code>>
+    connect(const PeerIdentity& peer, ObfuscationPolicy policy,
+            std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<HelloInfo,std::error_code>>
     handshake(const HelloInfo& mine, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<C2CHandshakeResult,std::error_code>>
@@ -71,7 +84,17 @@ class C2CConnection {
   boost::asio::awaitable<tl::expected<AICHRecoveryData,std::error_code>>
     request_aich_proof(const FileHash&, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout);
   void close() noexcept;
+  bool encrypted() const noexcept;
  private:
+  friend class InboundListener;
+  friend class ed2k::share::UploadSession;
+  C2CConnection(ed2k::net::EncryptedStreamSocket&& stream, std::optional<IPv4> remote);
+  boost::asio::awaitable<tl::expected<void,std::error_code>>
+    send_packet(const ed2k::net::Packet& packet);
+  boost::asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
+    recv_packet(std::chrono::milliseconds timeout);
+  boost::asio::any_io_executor executor();
+  std::optional<IPv4> remote_ip() const;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

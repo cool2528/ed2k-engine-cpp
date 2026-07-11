@@ -13,6 +13,7 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/cancel_after.hpp>
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/framing.hpp"
@@ -55,6 +56,111 @@ TEST(C2CConnection, IpFilterRejectsConnectBeforeTcpDial) {
     if (!r) {
       EXPECT_EQ(r.error(), make_error_code(errc::ip_filtered));
     }
+    co_return;
+  });
+}
+
+static PeerIdentity loopback_identity(std::uint16_t port, std::optional<UserHash> hash = std::nullopt) {
+  return PeerIdentity{{0x0100007Fu, port}, std::move(hash)};
+}
+static UserHash obfuscation_test_hash() {
+  return *UserHash::from_hex("00112233445566778899aabbccddeeff");
+}
+
+TEST(C2CConnection, RequiredObfuscationWithoutTargetHashFailsBeforeTcpDial) {
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    C2CConnection c(rt.executor());
+    auto r = co_await c.connect(loopback_identity(acceptor.local_endpoint().port()),
+                                ObfuscationPolicy::required, 200ms);
+    EXPECT_FALSE(r.has_value());
+    auto [ec, socket] = co_await acceptor.async_accept(
+        asio::cancel_after(50ms, asio::as_tuple(asio::use_awaitable)));
+    EXPECT_EQ(ec, asio::error::operation_aborted);
+    EXPECT_FALSE(socket.is_open());
+    co_return;
+  });
+}
+
+TEST(C2CConnection, PreferredObfuscationReconnectsPlaintextAfterNegotiationFailure) {
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  std::size_t accepts = 0;
+  std::byte first_marker{};
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+    auto first = co_await acceptor.async_accept(asio::use_awaitable);
+    ++accepts;
+    auto [read_ec, n] = co_await asio::async_read(first, asio::buffer(&first_marker, 1),
+                                                  asio::as_tuple(asio::use_awaitable));
+    (void)read_ec; (void)n;
+    first.close();
+    auto second = co_await acceptor.async_accept(asio::use_awaitable);
+    ++accepts;
+    std::array<std::byte, 1> hold{};
+    (void)co_await second.async_read_some(asio::buffer(hold), asio::as_tuple(asio::use_awaitable));
+  }, asio::detached);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    C2CConnection c(rt.executor());
+    auto r = co_await c.connect(loopback_identity(
+        acceptor.local_endpoint().port(), obfuscation_test_hash()),
+        ObfuscationPolicy::preferred, 500ms);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    EXPECT_EQ(accepts, 2u);
+    EXPECT_NE(first_marker, std::byte{proto::eDonkey});
+    EXPECT_NE(first_marker, std::byte{proto::eMule});
+    EXPECT_NE(first_marker, std::byte{proto::zlib});
+    EXPECT_FALSE(c.encrypted());
+    c.close();
+    co_return;
+  });
+}
+
+TEST(C2CConnection, RequiredObfuscationNeverDowngrades) {
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  std::size_t accepts = 0;
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+    auto first = co_await acceptor.async_accept(asio::use_awaitable);
+    ++accepts;
+    std::array<std::byte, 1> marker{};
+    (void)co_await asio::async_read(first, asio::buffer(marker), asio::as_tuple(asio::use_awaitable));
+    first.close();
+    auto [ec, second] = co_await acceptor.async_accept(
+        asio::cancel_after(100ms, asio::as_tuple(asio::use_awaitable)));
+    if (!ec) ++accepts;
+  }, asio::detached);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    C2CConnection c(rt.executor());
+    auto r = co_await c.connect(loopback_identity(
+        acceptor.local_endpoint().port(), obfuscation_test_hash()),
+        ObfuscationPolicy::required, 500ms);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(accepts, 1u);
+    EXPECT_FALSE(c.encrypted());
+    co_return;
+  });
+}
+
+TEST(C2CConnection, PreferredNegotiationStaysWithinSingleTimeoutBudget) {
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+    auto socket = co_await acceptor.async_accept(asio::use_awaitable);
+    std::array<std::byte, 1> marker{};
+    (void)co_await asio::async_read(socket, asio::buffer(marker), asio::as_tuple(asio::use_awaitable));
+    asio::steady_timer hold(rt.executor(), 1s);
+    (void)co_await hold.async_wait(asio::as_tuple(asio::use_awaitable));
+  }, asio::detached);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    const auto start = std::chrono::steady_clock::now();
+    C2CConnection c(rt.executor());
+    auto r = co_await c.connect(loopback_identity(
+        acceptor.local_endpoint().port(), obfuscation_test_hash()),
+        ObfuscationPolicy::preferred, 80ms);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    if (r) EXPECT_FALSE(c.encrypted());
+    EXPECT_LT(elapsed, 160ms);
     co_return;
   });
 }

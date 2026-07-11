@@ -58,6 +58,8 @@ struct DownloadOpts {
   std::optional<ed2k::infra::ProxyConfig> proxy;
   std::shared_ptr<const ed2k::infra::IPFilter> ip_filter;
   std::uint8_t ip_filter_level = 127;
+  ed2k::peer::ObfuscationPolicy obfuscation_policy = ed2k::peer::ObfuscationPolicy::disabled;
+  std::optional<ed2k::UserHash> local_user_hash;
 };
 // Keep sources whose id is a HighID (!low_id(), i.e. id >= 0x1000000).
 // 保留定义供 CLI/测试复用; download_link 本身(M3)不再调用——LowID 源留给回调路径。

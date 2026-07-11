@@ -16,6 +16,7 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/cancel_after.hpp>
 #include "ed2k/download/download.hpp"
 #include "ed2k/download/part_file.hpp"
 #include "ed2k/download/block_allocator.hpp"
@@ -391,6 +392,27 @@ TEST(Download, BlockLevelSingleSource){
     co_return;
   });
   std::filesystem::remove_all(dir);
+}
+
+TEST(Download, RequiredObfuscationWithoutPeerHashFailsBeforeTcpDial) {
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const auto out = std::filesystem::temp_directory_path() / "ed2k_required_missing_hash";
+  std::filesystem::remove(out);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    Download download(rt.executor(), out, FileHash{}, 1,
+                      PeerIdentity{{0x0100007Fu, acceptor.local_endpoint().port()}, std::nullopt},
+                      ObfuscationPolicy::required,
+                      *UserHash::from_hex("00112233445566778899aabbccddeeff"));
+    auto result = co_await download.run(200ms);
+    EXPECT_FALSE(result.has_value());
+    auto [ec, socket] = co_await acceptor.async_accept(
+        asio::cancel_after(50ms, asio::as_tuple(asio::use_awaitable)));
+    EXPECT_EQ(ec, asio::error::operation_aborted);
+    EXPECT_FALSE(socket.is_open());
+    co_return;
+  });
+  std::filesystem::remove(out);
 }
 
 TEST(Download, ResumesFromAmulePartMetSibling){

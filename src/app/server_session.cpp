@@ -86,7 +86,8 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
               std::span<const std::byte> met_bytes, std::optional<ServerTarget> override,
               const DownloadOpts& opts){
   ed2k::server::LoginParams p; p.nickname="ed2k-tool"; p.client_port=opts.client_port;
-  p.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  p.user_hash = opts.local_user_hash.value_or(
+      *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210"));
   auto lg = co_await login_with_rotation(ex, met_bytes, override, p, opts.per_server_timeout,
                                          opts.proxy, opts.ip_filter, opts.ip_filter_level);
   if(!lg) co_return tl::unexpected(lg.error());
@@ -119,6 +120,7 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
                    .size(link.size)
                    .aich(std::nullopt)
                    .sources(std::move(gs->sources))
+                   .obfuscation(opts.obfuscation_policy, opts.local_user_hash)
                    .server(lg->conn);
   if(listener) builder.listener(*listener);
   if(opts.kad_network) builder.kad_network(opts.kad_network->get());

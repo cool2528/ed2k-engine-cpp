@@ -15,12 +15,15 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/framing.hpp"
+#include "ed2k/net/encrypted_stream_socket.hpp"
 #include "ed2k/infra/ip_filter.hpp"
 #include "ed2k/download/aich_checker.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
+#include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
 #include "ed2k/share/client_credits.hpp"
@@ -147,6 +150,58 @@ TEST(UploadSession, IpFilterRejectsRemoteBeforeHandshake) {
         tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), acceptor.local_endpoint().port()),
         asio::as_tuple(asio::use_awaitable));
     EXPECT_FALSE(connect_ec);
+    co_return;
+  });
+}
+
+TEST(UploadSession, EncryptedNegotiatedInboundStreamReadsAndWritesPackets) {
+  net::IoRuntime rt;
+  InboundListener listener(rt.executor(), 0);
+  KnownFileDB db;
+  boost::asio::experimental::channel<void(boost::system::error_code, bool)> server_ready(rt.executor(), 1);
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+    auto accepted = co_await listener.accept_peer(
+        hello("server").user_hash, ObfuscationPolicy::preferred, 1s);
+    if (!accepted) {
+      server_ready.try_send(boost::system::error_code{}, false);
+      co_return;
+    }
+    UploadSession session(std::move(*accepted), db, hello("server"));
+    server_ready.try_send(boost::system::error_code{}, true);
+    (void)co_await session.run(1s);
+    co_return;
+  }, asio::detached);
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    net::EncryptedStreamSocket client(rt.executor());
+    auto connected = co_await client.connect(*IPv4::from_dotted("127.0.0.1"),
+                                             listener.local_port(), 1s);
+    EXPECT_TRUE(connected.has_value());
+    if (!connected) co_return;
+    auto negotiated = co_await client.handshake_initiator(hello("server").user_hash, 1s);
+    EXPECT_TRUE(negotiated.has_value());
+    if (!negotiated) co_return;
+    EXPECT_TRUE(co_await server_ready.async_receive(asio::use_awaitable));
+
+    net::Packet hello_packet;
+    hello_packet.protocol = net::proto::eDonkey;
+    hello_packet.opcode = op::HELLO;
+    hello_packet.payload = encode_hello_packet(hello("encrypted-client"));
+    EXPECT_TRUE((co_await client.send(hello_packet)).has_value());
+    auto answer = co_await client.recv(1s);
+    EXPECT_TRUE(answer.has_value());
+    if (!answer) co_return;
+    EXPECT_EQ(answer->opcode, op::HELLOANSWER);
+
+    net::Packet request;
+    request.protocol = net::proto::eDonkey;
+    request.opcode = op::SETREQFILEID;
+    request.payload = encode_set_req_file(FileHash{});
+    EXPECT_TRUE((co_await client.send(request)).has_value());
+    auto not_found = co_await client.recv(1s);
+    EXPECT_TRUE(not_found.has_value());
+    if (not_found) EXPECT_EQ(not_found->opcode, op::FILEREQANSNOFIL);
+    client.close();
     co_return;
   });
 }

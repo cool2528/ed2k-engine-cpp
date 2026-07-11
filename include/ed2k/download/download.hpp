@@ -25,6 +25,9 @@ class Download {
  public:
   Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
            const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source);
+  Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
+           const FileHash& hash, std::uint64_t size, peer::PeerIdentity source,
+           peer::ObfuscationPolicy policy, std::optional<UserHash> local_user_hash = std::nullopt);
   void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(std::chrono::milliseconds timeout);
  private:
@@ -32,7 +35,9 @@ class Download {
   std::filesystem::path out_;
   FileHash hash_;
   std::uint64_t size_;
-  ed2k::server::SourceEndpoint source_;
+  peer::PeerIdentity source_;
+  peer::ObfuscationPolicy obfuscation_policy_ = peer::ObfuscationPolicy::disabled;
+  std::optional<UserHash> local_user_hash_;
   std::shared_ptr<const infra::IPFilter> ip_filter_;
   std::uint8_t ip_filter_level_ = 127;
 };
@@ -49,7 +54,17 @@ class MultiSourceDownload {
     Builder& hash(FileHash h) { hash_ = h; return *this; }
     Builder& size(std::uint64_t s) { size_ = s; return *this; }
     Builder& aich(std::optional<AICHHash> a) { aich_ = std::move(a); return *this; }
-    Builder& sources(std::vector<server::SourceEndpoint> s) { sources_ = std::move(s); return *this; }
+    Builder& sources(std::vector<server::SourceEndpoint> s) {
+      sources_.clear(); sources_.reserve(s.size());
+      for (auto& endpoint : s) sources_.push_back(peer::PeerIdentity{endpoint, std::nullopt});
+      return *this;
+    }
+    Builder& sources(std::vector<peer::PeerIdentity> s) { sources_ = std::move(s); return *this; }
+    Builder& obfuscation(peer::ObfuscationPolicy policy, std::optional<UserHash> local_user_hash) {
+      obfuscation_policy_ = policy;
+      local_user_hash_ = std::move(local_user_hash);
+      return *this;
+    }
     Builder& server(server::ServerConnection& s) { server_ = std::ref(s); return *this; }
     Builder& listener(peer::InboundListener& l) { listener_ = std::ref(l); return *this; }
     Builder& kad_network(kad::KadNetwork& k) { kad_network_ = std::ref(k); return *this; }
@@ -67,7 +82,9 @@ class MultiSourceDownload {
     FileHash hash_{};
     std::uint64_t size_ = 0;
     std::optional<AICHHash> aich_;
-    std::vector<server::SourceEndpoint> sources_;
+    std::vector<peer::PeerIdentity> sources_;
+    peer::ObfuscationPolicy obfuscation_policy_ = peer::ObfuscationPolicy::disabled;
+    std::optional<UserHash> local_user_hash_;
     std::optional<std::reference_wrapper<server::ServerConnection>> server_;
     std::optional<std::reference_wrapper<peer::InboundListener>> listener_;
     std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
@@ -100,12 +117,14 @@ class MultiSourceDownload {
                       boost::asio::any_io_executor disk_ex,
                       std::filesystem::path out, FileHash hash, std::uint64_t size,
                       std::optional<AICHHash> aich,
-                      std::vector<server::SourceEndpoint> sources,
+                      std::vector<peer::PeerIdentity> sources,
                       std::optional<std::reference_wrapper<server::ServerConnection>> server_conn,
                       std::optional<std::reference_wrapper<peer::InboundListener>> listener,
                       std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network,
                       std::shared_ptr<const infra::IPFilter> ip_filter,
-                      std::uint8_t ip_filter_level);
+                      std::uint8_t ip_filter_level,
+                      peer::ObfuscationPolicy obfuscation_policy,
+                      std::optional<UserHash> local_user_hash);
   struct Impl;
   std::unique_ptr<Impl> impl_;
   friend class Builder;

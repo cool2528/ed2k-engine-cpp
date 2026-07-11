@@ -47,12 +47,17 @@ std::optional<server::SourceEndpoint> endpoint_from_kad_source(const kad::KadSea
   return server::SourceEndpoint{ipv4_to_wire(*ip), tcp_port};
 }
 
-peer::HelloInfo default_hello() {
+peer::HelloInfo default_hello(peer::ObfuscationPolicy policy = peer::ObfuscationPolicy::disabled,
+                              std::optional<UserHash> local_user_hash = std::nullopt) {
   peer::HelloInfo mine;
-  mine.user_hash = *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  mine.user_hash = local_user_hash.value_or(
+      *ed2k::UserHash::from_hex("0123456789abcdeffedcba9876543210"));
   mine.nickname = "ed2k";
   mine.version = 0x3C;
   mine.port = 4662;
+  mine.supports_obfuscation = policy != peer::ObfuscationPolicy::disabled;
+  mine.requests_obfuscation = policy != peer::ObfuscationPolicy::disabled;
+  mine.requires_obfuscation = policy == peer::ObfuscationPolicy::required;
   return mine;
 }
 
@@ -66,18 +71,6 @@ std::vector<bool> normalize_file_status_parts(std::vector<bool> parts, std::uint
   // (所有 part 可用), 不是 "0 part"。非空位图 (PartFile 不完整源) 按实际 have-part 过滤。
   if(parts.empty()) parts.assign(data_part_count(size), true);
   return parts;
-}
-
-boost::asio::awaitable<tl::expected<void,std::error_code>>
-connect_and_handshake_phase(peer::C2CConnection& conn,
-                            const server::SourceEndpoint& source,
-                            std::chrono::milliseconds timeout) {
-  IPv4 ip = IPv4::from_wire(source.id);
-  auto cr = co_await conn.connect(ip, source.port, timeout);
-  if(!cr) co_return tl::unexpected(cr.error());
-  auto hr = co_await conn.handshake(default_hello(), timeout);
-  if(!hr) co_return tl::unexpected(hr.error());
-  co_return tl::expected<void,std::error_code>{};
 }
 
 struct FileSetup {
@@ -152,7 +145,14 @@ dispatch_blocks_phase(peer::C2CConnection& conn,
 
 Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
                    const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source)
-  : conn_(ex), out_(out), hash_(hash), size_(size), source_(source) {}
+  : Download(ex, out, hash, size, peer::PeerIdentity{source, std::nullopt},
+             peer::ObfuscationPolicy::disabled) {}
+
+Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
+                   const FileHash& hash, std::uint64_t size, peer::PeerIdentity source,
+                   peer::ObfuscationPolicy policy, std::optional<UserHash> local_user_hash)
+  : conn_(ex), out_(out), hash_(hash), size_(size), source_(std::move(source)),
+    obfuscation_policy_(policy), local_user_hash_(std::move(local_user_hash)) {}
 
 void Download::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
   ip_filter_ = std::move(filter);
@@ -163,8 +163,10 @@ void Download::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std:
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 Download::run(std::chrono::milliseconds timeout){
   conn_.set_ip_filter(ip_filter_, ip_filter_level_);
-  auto connected = co_await connect_and_handshake_phase(conn_, source_, timeout);
-  if(!connected) co_return tl::unexpected(connected.error());
+  auto cr = co_await conn_.connect(source_, obfuscation_policy_, timeout);
+  if(!cr) co_return tl::unexpected(cr.error());
+  auto hr = co_await conn_.handshake(default_hello(obfuscation_policy_, local_user_hash_), timeout);
+  if(!hr) co_return tl::unexpected(hr.error());
   auto setup = co_await fetch_hashset_phase(conn_, hash_, size_, timeout);
   if(!setup) co_return tl::unexpected(setup.error());
   PartFile pf(out_, size_, hash_, std::move(setup->part_hashes));
@@ -182,17 +184,20 @@ struct MultiSourceDownload::Impl {
        boost::asio::any_io_executor disk_ex_arg,
        std::filesystem::path out_arg, FileHash hash_arg, std::uint64_t size_arg,
        std::optional<AICHHash> aich_arg,
-       std::vector<server::SourceEndpoint> sources_arg,
+       std::vector<peer::PeerIdentity> sources_arg,
        std::optional<std::reference_wrapper<server::ServerConnection>> server_conn_arg,
        std::optional<std::reference_wrapper<peer::InboundListener>> listener_arg,
        std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_arg,
        std::shared_ptr<const infra::IPFilter> ip_filter_arg,
-       std::uint8_t ip_filter_level_arg)
+       std::uint8_t ip_filter_level_arg,
+       peer::ObfuscationPolicy obfuscation_policy_arg,
+       std::optional<UserHash> local_user_hash_arg)
     : ex(net_ex), disk_ex(std::move(disk_ex_arg)), out(std::move(out_arg)), hash(hash_arg), size(size_arg),
       aich(std::move(aich_arg)), sources(std::move(sources_arg)),
       server_conn(std::move(server_conn_arg)), listener(std::move(listener_arg)),
       kad_network(std::move(kad_network_arg)), ip_filter(std::move(ip_filter_arg)),
-      ip_filter_level(ip_filter_level_arg) {}
+      ip_filter_level(ip_filter_level_arg), obfuscation_policy(obfuscation_policy_arg),
+      local_user_hash(std::move(local_user_hash_arg)) {}
 
   boost::asio::any_io_executor ex;
   boost::asio::any_io_executor disk_ex;   // 默认 = ex (同步等效), Builder.disk_executor 注入 disk 池
@@ -200,12 +205,14 @@ struct MultiSourceDownload::Impl {
   FileHash hash;
   std::uint64_t size;
   std::optional<AICHHash> aich;
-  std::vector<server::SourceEndpoint> sources;
+  std::vector<peer::PeerIdentity> sources;
   std::optional<std::reference_wrapper<server::ServerConnection>> server_conn;
   std::optional<std::reference_wrapper<peer::InboundListener>> listener;
   std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network;
   std::shared_ptr<const infra::IPFilter> ip_filter;
   std::uint8_t ip_filter_level = 127;
+  peer::ObfuscationPolicy obfuscation_policy = peer::ObfuscationPolicy::disabled;
+  std::optional<UserHash> local_user_hash;
 };
 
 MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
@@ -216,25 +223,32 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
                                           server::ServerConnection* server_conn,
                                           peer::InboundListener* listener)
   : impl_(std::make_unique<Impl>(
-      ex, ex, out, hash, size, aich, std::move(sources),
+      ex, ex, out, hash, size, aich, [&] {
+        std::vector<peer::PeerIdentity> peers;
+        peers.reserve(sources.size());
+        for (auto& endpoint : sources) peers.push_back(peer::PeerIdentity{endpoint, std::nullopt});
+        return peers;
+      }(),
       server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt,
       listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt,
-      std::nullopt, nullptr, 127)) {}
+      std::nullopt, nullptr, 127, peer::ObfuscationPolicy::disabled, std::nullopt)) {}
 
 MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor net_ex,
                                          boost::asio::any_io_executor disk_ex,
                                          std::filesystem::path out, FileHash hash, std::uint64_t size,
                                          std::optional<AICHHash> aich,
-                                         std::vector<server::SourceEndpoint> sources,
+                                         std::vector<peer::PeerIdentity> sources,
                                          std::optional<std::reference_wrapper<server::ServerConnection>> server_conn,
                                          std::optional<std::reference_wrapper<peer::InboundListener>> listener,
                                          std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network,
                                          std::shared_ptr<const infra::IPFilter> ip_filter,
-                                         std::uint8_t ip_filter_level)
+                                         std::uint8_t ip_filter_level,
+                                         peer::ObfuscationPolicy obfuscation_policy,
+                                         std::optional<UserHash> local_user_hash)
   : impl_(std::make_unique<Impl>(net_ex, std::move(disk_ex), std::move(out), hash, size,
                                  std::move(aich), std::move(sources), std::move(server_conn),
                                  std::move(listener), std::move(kad_network), std::move(ip_filter),
-                                 ip_filter_level)) {}
+                                 ip_filter_level, obfuscation_policy, std::move(local_user_hash))) {}
 
 MultiSourceDownload::~MultiSourceDownload() = default;
 MultiSourceDownload::MultiSourceDownload(MultiSourceDownload&&) noexcept = default;
@@ -248,7 +262,8 @@ MultiSourceDownload MultiSourceDownload::Builder::build() {
   return MultiSourceDownload(net_ex_, disk_ex_, std::move(out_), hash_, size_,
                              std::move(aich_), std::move(sources_),
                              std::move(server_), std::move(listener_),
-                             std::move(kad_network_), std::move(ip_filter_), ip_filter_level_);
+                             std::move(kad_network_), std::move(ip_filter_), ip_filter_level_,
+                             obfuscation_policy_, std::move(local_user_hash_));
 }
 
 // === raccoon 多源并发 (P4c-3) ===
@@ -266,34 +281,39 @@ struct FetchResult {
 };
 static boost::asio::awaitable<tl::expected<FetchResult,std::error_code>>
 fetch_hashset(boost::asio::any_io_executor ex,
-              const ed2k::server::SourceEndpoint& source, const FileHash& hash,
+              const ed2k::peer::PeerIdentity& source, const FileHash& hash,
               std::uint64_t size,
               std::chrono::milliseconds timeout,
               std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
               std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
               std::shared_ptr<const infra::IPFilter> ip_filter,
-              std::uint8_t ip_filter_level){
+              std::uint8_t ip_filter_level,
+              ed2k::peer::ObfuscationPolicy obfuscation_policy,
+              std::optional<UserHash> local_user_hash){
   bool accepted = false;   // LowID 回调路径下我方是 TCP acceptor, 握手角色随之翻转
   std::optional<ed2k::peer::C2CConnection> conn_opt;
-  if(source.low_id()){
+  if(source.endpoint.low_id()){
     if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
-    auto cb = co_await server_conn->get().callback_request(source.id, timeout);
+    auto cb = co_await server_conn->get().callback_request(source.endpoint.id, timeout);
     if(!cb) co_return tl::unexpected(cb.error());
-    auto acc = co_await listener->get().accept(timeout);
+    auto acc = co_await listener->get().accept_peer(local_user_hash, obfuscation_policy, timeout,
+                                                     ip_filter, ip_filter_level);
     if(!acc) co_return tl::unexpected(acc.error());
     conn_opt.emplace(std::move(*acc));
     accepted = true;
   } else {
     ed2k::peer::C2CConnection c(ex);
     c.set_ip_filter(ip_filter, ip_filter_level);
-    auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
+    auto cr = co_await c.connect(source, obfuscation_policy, timeout);
     if(!cr) co_return tl::unexpected(cr.error());
     conn_opt.emplace(std::move(c));
     accepted = false;
   }
   tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
-  if(accepted) hr = co_await conn_opt->handshake_acceptor(default_hello(), timeout);
-  else         hr = co_await conn_opt->handshake(default_hello(), timeout);
+  if(accepted) hr = co_await conn_opt->handshake_acceptor(
+      default_hello(obfuscation_policy, local_user_hash), timeout);
+  else         hr = co_await conn_opt->handshake(
+      default_hello(obfuscation_policy, local_user_hash), timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
@@ -359,7 +379,7 @@ struct PeerSetup {
 
 static boost::asio::awaitable<tl::expected<PeerSetup,std::error_code>>
 setup_source_phase(boost::asio::any_io_executor ex,
-                   const ed2k::server::SourceEndpoint& source,
+                   const ed2k::peer::PeerIdentity& source,
                    std::optional<ed2k::peer::C2CConnection> pre_conn,
                    std::vector<bool> pre_parts,
                    const FileHash& hash,
@@ -368,7 +388,9 @@ setup_source_phase(boost::asio::any_io_executor ex,
                    std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
                    std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
                    std::shared_ptr<const infra::IPFilter> ip_filter,
-                   std::uint8_t ip_filter_level) {
+                   std::uint8_t ip_filter_level,
+                   ed2k::peer::ObfuscationPolicy obfuscation_policy,
+                   std::optional<UserHash> local_user_hash) {
   if(pre_conn.has_value()){
     // 复用 setup 连接 (已 HELLO+SETREQFILEID; 多 part 还含 HASHSETREQUEST); 直接进 REQUESTFILENAME。
     co_return PeerSetup{std::move(*pre_conn), std::move(pre_parts)};
@@ -376,26 +398,29 @@ setup_source_phase(boost::asio::any_io_executor ex,
 
   bool accepted = false;
   std::optional<ed2k::peer::C2CConnection> conn_opt;
-  if(source.low_id()){
+  if(source.endpoint.low_id()){
     if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
-    auto cb = co_await server_conn->get().callback_request(source.id, timeout);
+    auto cb = co_await server_conn->get().callback_request(source.endpoint.id, timeout);
     if(!cb) co_return tl::unexpected(cb.error());
-    auto acc = co_await listener->get().accept(timeout);
+    auto acc = co_await listener->get().accept_peer(local_user_hash, obfuscation_policy, timeout,
+                                                     ip_filter, ip_filter_level);
     if(!acc) co_return tl::unexpected(acc.error());
     conn_opt.emplace(std::move(*acc));
     accepted = true;
   } else {
     ed2k::peer::C2CConnection c(ex);
     c.set_ip_filter(ip_filter, ip_filter_level);
-    auto cr = co_await c.connect(IPv4::from_wire(source.id), source.port, timeout);
+    auto cr = co_await c.connect(source, obfuscation_policy, timeout);
     if(!cr) co_return tl::unexpected(cr.error());
     conn_opt.emplace(std::move(c));
     accepted = false;
   }
 
   tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
-  if(accepted) hr = co_await conn_opt->handshake_acceptor(default_hello(), timeout);
-  else         hr = co_await conn_opt->handshake(default_hello(), timeout);
+  if(accepted) hr = co_await conn_opt->handshake_acceptor(
+      default_hello(obfuscation_policy, local_user_hash), timeout);
+  else         hr = co_await conn_opt->handshake(
+      default_hello(obfuscation_policy, local_user_hash), timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
@@ -491,7 +516,7 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
 // 或失败 → finally_send 退出; 整文件完成由 st.complete 判定 (最后一块 mark_done 置位)。
 static boost::asio::awaitable<void>
 peer_worker(boost::asio::any_io_executor ex,
-            const ed2k::server::SourceEndpoint& source,
+            const ed2k::peer::PeerIdentity& source,
             std::optional<ed2k::peer::C2CConnection> pre_conn,
             std::vector<bool> pre_parts,
             SharedState& st,
@@ -500,6 +525,8 @@ peer_worker(boost::asio::any_io_executor ex,
             std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener,
             std::shared_ptr<const infra::IPFilter> ip_filter,
             std::uint8_t ip_filter_level,
+            ed2k::peer::ObfuscationPolicy obfuscation_policy,
+            std::optional<UserHash> local_user_hash,
             ResultCh& done_ch){
   auto finish = [&](std::error_code ec){
     st.set_error(ec);        // 首个失败错误 (单网络线程 → 无竞争)
@@ -509,7 +536,8 @@ peer_worker(boost::asio::any_io_executor ex,
 
   auto setup = co_await setup_source_phase(ex, source, std::move(pre_conn), std::move(pre_parts),
                                            st.hash, st.size, timeout, server_conn, listener,
-                                           std::move(ip_filter), ip_filter_level);
+                                           std::move(ip_filter), ip_filter_level,
+                                           obfuscation_policy, std::move(local_user_hash));
   if(!setup){ finish(setup.error()); co_return; }
   auto upload = co_await start_upload_phase(setup->conn, st.hash, timeout);
   if(!upload){ finish(upload.error()); co_return; }
@@ -535,10 +563,10 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
           if(!endpoint) continue;
           if(self.ip_filter && self.ip_filter->blocked(IPv4::from_wire(endpoint->id), self.ip_filter_level)) continue;
           const auto duplicate = std::any_of(self.sources.begin(), self.sources.end(),
-                                             [&](const server::SourceEndpoint& current){
-                                               return same_source(current, *endpoint);
+                                             [&](const peer::PeerIdentity& current){
+                                               return same_source(current.endpoint, *endpoint);
                                              });
-          if(!duplicate) self.sources.push_back(*endpoint);
+          if(!duplicate) self.sources.push_back(peer::PeerIdentity{*endpoint, std::nullopt});
         }
       }
     }
@@ -550,7 +578,8 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   std::error_code setup_err = make_error_code(errc::connect_failed);
   for(; setup_idx < self.sources.size(); ++setup_idx){
     auto r = co_await fetch_hashset(self.ex, self.sources[setup_idx], self.hash, self.size, total_timeout,
-                                    self.server_conn, self.listener, self.ip_filter, self.ip_filter_level);
+                                    self.server_conn, self.listener, self.ip_filter, self.ip_filter_level,
+                                    self.obfuscation_policy, self.local_user_hash);
     if(r){ fr = std::move(*r); break; }
     setup_err = r.error();
   }
@@ -573,7 +602,8 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
     boost::asio::co_spawn(self.ex,
       peer_worker(self.ex, self.sources[i], std::move(pre_conn), std::move(pre_parts), st,
                   total_timeout, max_retries, self.server_conn, self.listener,
-                  self.ip_filter, self.ip_filter_level, done_ch),
+                  self.ip_filter, self.ip_filter_level, self.obfuscation_policy,
+                  self.local_user_hash, done_ch),
       boost::asio::detached);
   }
   // 收集 N 个完成信号 (worker 退出即 try_send; run 挂起在 async_receive, 网络线程跑 worker)。

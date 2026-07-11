@@ -96,6 +96,22 @@ recovery_for(std::span<const std::byte> full, std::uint16_t part_index) {
 }
 }
 
+UploadSession::UploadSession(ed2k::peer::C2CConnection&& connection,
+                             KnownFileDB& files,
+                             ed2k::peer::HelloInfo self)
+  : conn_(std::move(connection)), files_(files), self_(std::move(self)),
+    disk_executor_(conn_.executor()) {}
+
+UploadSession::UploadSession(ed2k::peer::C2CConnection&& connection,
+                             KnownFileDB& files,
+                             ed2k::peer::HelloInfo self,
+                             asio::any_io_executor disk_executor,
+                             UploadQueue* queue,
+                             UploadBandwidthThrottler* throttler,
+                             ClientCredits* credits)
+  : conn_(std::move(connection)), files_(files), self_(std::move(self)),
+    disk_executor_(std::move(disk_executor)), queue_(queue), throttler_(throttler), credits_(credits) {}
+
 UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
                              KnownFileDB& files,
                              ed2k::peer::HelloInfo self)
@@ -153,7 +169,7 @@ void UploadSession::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter,
 
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handshake(std::chrono::milliseconds timeout) {
-  auto rp = co_await conn_.recv(timeout);
+  auto rp = co_await conn_.recv_packet(timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   if(rp->opcode != ed2k::peer::op::HELLO)
     co_return tl::unexpected(make_error_code(errc::server_protocol_error));
@@ -164,7 +180,7 @@ UploadSession::handshake(std::chrono::milliseconds timeout) {
   ans.protocol = ed2k::net::proto::eDonkey;
   ans.opcode = ed2k::peer::op::HELLOANSWER;
   ans.payload = ed2k::peer::encode_hello(self_);
-  auto sr = co_await conn_.send(ans);
+  auto sr = co_await conn_.send_packet(ans);
   if(!sr) co_return tl::unexpected(sr.error());
   co_return tl::expected<void, std::error_code>{};
 }
@@ -175,7 +191,7 @@ UploadSession::send_not_found(const ed2k::FileHash& hash) {
   ans.protocol = ed2k::net::proto::eDonkey;
   ans.opcode = ed2k::peer::op::FILEREQANSNOFIL;
   ans.payload = ed2k::peer::encode_set_req_file(hash);
-  co_return co_await conn_.send(ans);
+  co_return co_await conn_.send_packet(ans);
 }
 
 asio::awaitable<tl::expected<void, std::error_code>>
@@ -224,7 +240,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
         default:
           co_return tl::expected<void, std::error_code>{};
       }
-      auto sr = co_await conn_.send(ans);
+      auto sr = co_await conn_.send_packet(ans);
       if(!sr) co_return tl::unexpected(sr.error());
     }
     if(!r.ok()) co_return tl::unexpected(make_error_code(errc::buffer_underflow));
@@ -241,7 +257,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     ans.protocol = ed2k::net::proto::eDonkey;
     ans.opcode = ed2k::peer::op::ASKSHAREDFILESANSWER;
     ans.payload = ed2k::peer::encode_shared_files_answer(entries);
-    co_return co_await conn_.send(ans);
+    co_return co_await conn_.send_packet(ans);
   }
 
   if(pkt.opcode == ed2k::peer::op::REQUESTSOURCES2) {
@@ -253,7 +269,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     ans.protocol = ed2k::net::proto::eMule;
     ans.opcode = ed2k::peer::op::ANSWERSOURCES2;
     ans.payload = ed2k::peer::encode_answer_sources2(file->hash, file->sources);
-    co_return co_await conn_.send(ans);
+    co_return co_await conn_.send_packet(ans);
   }
 
   if(pkt.opcode == ed2k::peer::op::FILEDESC) {
@@ -275,7 +291,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     ans.protocol = ed2k::net::proto::eMule;
     ans.opcode = ed2k::peer::op::PREVIEWANSWER;
     ans.payload = ed2k::peer::encode_preview_answer(*decoded, frames);
-    co_return co_await conn_.send(ans);
+    co_return co_await conn_.send_packet(ans);
   }
 
   if(pkt.opcode == ed2k::peer::op::STARTUPLOADREQ) {
@@ -297,7 +313,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
         ans.payload = ed2k::peer::encode_queue_ranking(decision.rank);
       }
     }
-    co_return co_await conn_.send(ans);
+    co_return co_await conn_.send_packet(ans);
   }
 
   if(pkt.opcode == ed2k::peer::op::REQUESTPARTS) {
@@ -317,7 +333,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     ans.protocol = ed2k::net::proto::eMule;
     ans.opcode = ed2k::peer::op::AICHFILEHASHANS;
     ans.payload = ed2k::peer::encode_aich_file_hash_ans(*decoded, file->aich_root);
-    co_return co_await conn_.send(ans);
+    co_return co_await conn_.send_packet(ans);
   }
 
   if(pkt.opcode == ed2k::peer::op::AICHREQUEST) {
@@ -337,7 +353,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     ans.protocol = ed2k::net::proto::eMule;
     ans.opcode = ed2k::peer::op::AICHANSWER;
     ans.payload = ed2k::peer::encode_aich_answer(hash, file->aich_root, part_index, *proof);
-    co_return co_await conn_.send(ans);
+    co_return co_await conn_.send_packet(ans);
   }
 
   if(pkt.opcode != ed2k::peer::op::REQUESTFILENAME &&
@@ -373,7 +389,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
       co_return tl::expected<void, std::error_code>{};
   }
 
-  auto sr = co_await conn_.send(ans);
+  auto sr = co_await conn_.send_packet(ans);
   if(!sr) co_return tl::unexpected(sr.error());
   co_return tl::expected<void, std::error_code>{};
 }
@@ -418,7 +434,7 @@ UploadSession::send_requested_parts(const KnownFile& file, const ed2k::peer::Req
       ans.opcode = ed2k::peer::op::SENDINGPART;
       ans.payload = ed2k::peer::encode_sending_part(req.hash, cur, chunk);
       if(throttler_) co_await throttler_->acquire(chunk.size());
-      auto sr = co_await conn_.send(ans);
+      auto sr = co_await conn_.send_packet(ans);
       if(!sr) co_return tl::unexpected(sr.error());
       if(credits_ && peer_) credits_->add_uploaded(peer_->user_hash, chunk.size());
       cur += n;
@@ -454,7 +470,7 @@ UploadSession::send_requested_parts(const KnownFile& file, const ed2k::peer::Req
           ans.opcode = ed2k::peer::op::COMPRESSEDPART;
           ans.payload = w.take();
           if(throttler_) co_await throttler_->acquire(n);
-          auto sr = co_await conn_.send(ans);
+          auto sr = co_await conn_.send_packet(ans);
           if(!sr) co_return tl::unexpected(sr.error());
           offset += n;
         }
@@ -476,7 +492,7 @@ UploadSession::send_requested_parts(const KnownFile& file, const ed2k::peer::Req
       ans.opcode = ed2k::peer::op::SENDINGPART;
       ans.payload = ed2k::peer::encode_sending_part(req.hash, cur, *data);
       if(throttler_) co_await throttler_->acquire(data->size());
-      auto sr = co_await conn_.send(ans);
+      auto sr = co_await conn_.send_packet(ans);
       if(!sr) co_return tl::unexpected(sr.error());
       if(credits_ && peer_) credits_->add_uploaded(peer_->user_hash, data->size());
       cur = chunk_end;
@@ -497,7 +513,7 @@ UploadSession::run(std::chrono::milliseconds timeout) {
   auto hs = co_await handshake(timeout);
   if(!hs) co_return tl::unexpected(hs.error());
   while(true) {
-    auto rp = co_await conn_.recv(timeout);
+    auto rp = co_await conn_.recv_packet(timeout);
     if(!rp) {
       if(rp.error() == make_error_code(errc::connection_closed)) {
         if(queue_ && peer_) queue_->remove(peer_->user_hash);

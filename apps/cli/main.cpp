@@ -101,12 +101,16 @@ static std::optional<std::pair<IPv4, std::uint16_t>> parse_peer(std::string_view
   if(!ip) return std::nullopt;
   return std::pair{*ip, static_cast<std::uint16_t>(std::stoi(std::string(s.substr(colon + 1))))};
 }
-static ed2k::peer::HelloInfo cli_hello(){
+static ed2k::peer::HelloInfo cli_hello(
+    ed2k::peer::ObfuscationPolicy policy = ed2k::peer::ObfuscationPolicy::disabled){
   ed2k::peer::HelloInfo h;
   h.nickname = "ed2k-tool";
   h.version = 0x3C;
   h.port = 4662;
   h.user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
+  h.supports_obfuscation = policy != ed2k::peer::ObfuscationPolicy::disabled;
+  h.requests_obfuscation = policy != ed2k::peer::ObfuscationPolicy::disabled;
+  h.requires_obfuscation = policy == ed2k::peer::ObfuscationPolicy::required;
   return h;
 }
 static ed2k::UserHash cli_user_hash(){
@@ -125,6 +129,12 @@ static ed2k::server::LoginParams cli_login_params(const ed2k::infra::Preferences
   p.client_port = prefs.tcp_port;
   p.user_hash = cli_user_hash();
   return p;
+}
+static ed2k::peer::ObfuscationPolicy cli_obfuscation_policy(const ed2k::infra::Preferences& prefs) {
+  if(prefs.require_obfuscation) return ed2k::peer::ObfuscationPolicy::required;
+  if(prefs.enable_obfuscation && prefs.request_obfuscation)
+    return ed2k::peer::ObfuscationPolicy::preferred;
+  return ed2k::peer::ObfuscationPolicy::disabled;
 }
 static ed2k::kad::KadNetworkOptions cli_kad_options(
     std::uint16_t tcp_port,
@@ -685,9 +695,15 @@ int main(int argc,char** argv){
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
       ed2k::peer::C2CConnection c(rt.executor());
       c.set_ip_filter(*global_filter, startup_prefs->ip_filter_level);
-      auto cr = co_await c.connect(peer->first, peer->second, std::chrono::milliseconds(15000));
+      const auto host = peer->first.host();
+      const auto wire = ((host & 0xFFu) << 24) | ((host & 0xFF00u) << 8) |
+                        ((host & 0xFF0000u) >> 8) | ((host & 0xFF000000u) >> 24);
+      auto cr = co_await c.connect(
+        ed2k::peer::PeerIdentity{{wire, peer->second}, std::nullopt},
+        cli_obfuscation_policy(*startup_prefs), std::chrono::milliseconds(15000));
       if(!cr){ std::printf("error: %s\n", cr.error().message().c_str()); rc=1; rt.stop(); co_return; }
-      auto hs = co_await c.handshake(cli_hello(), std::chrono::milliseconds(15000));
+      auto hs = co_await c.handshake(cli_hello(cli_obfuscation_policy(*startup_prefs)),
+                                     std::chrono::milliseconds(15000));
       if(!hs){ std::printf("error: %s\n", hs.error().message().c_str()); rc=1; rt.stop(); co_return; }
       auto fs = co_await c.request_file(f->hash, std::chrono::milliseconds(15000));
       if(!fs){ std::printf("error: %s\n", fs.error().message().c_str()); rc=1; rt.stop(); co_return; }
@@ -867,6 +883,8 @@ int main(int argc,char** argv){
       o.proxy=globals.proxy;
       o.ip_filter=*global_filter;
       o.ip_filter_level=startup_prefs->ip_filter_level;
+      o.obfuscation_policy=cli_obfuscation_policy(*startup_prefs);
+      o.local_user_hash=cli_user_hash();
       auto r = co_await ed2k::app::download_link(rt.executor(), *f, metbytes, ov, o);
       if(!r){ std::printf("error: %s\n", r.error().message().c_str()); rc=1; }
       else std::printf("downloaded %s\n", out.string().c_str());
