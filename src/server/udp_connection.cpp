@@ -86,6 +86,7 @@ UdpServerConnection::send_request(const ed2k::net::Packet& request, bool obfusca
 asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
 UdpServerConnection::request_response(const ed2k::net::Packet& request, std::uint8_t want,
                                       std::chrono::milliseconds timeout){
+  last_response_encrypted_ = false;
   if(obfuscation_.enabled()){
     auto sr = co_await send_request(request, true);
     if(!sr) co_return tl::unexpected(sr.error());
@@ -113,6 +114,7 @@ UdpServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds bud
     const bool from_plain = sender == plain_server_;
     const bool from_obfuscated = obfuscation_.enabled() && sender == obfuscated_endpoint();
     if(!from_plain && !from_obfuscated) continue; // 过滤非目标源
+    bool response_encrypted = false;
     if(obfuscation_.enabled()){
       auto decoded = ed2k::net::decode_server_udp_obfuscated_datagram(
           datagram,
@@ -121,10 +123,12 @@ UdpServerConnection::pump_until(std::uint8_t want, std::chrono::milliseconds bud
               .direction = ed2k::net::ServerUdpObfuscationDirection::server_to_client,
           });
       if(!decoded) co_return tl::unexpected(decoded.error());
+      response_encrypted = decoded->encrypted;
       datagram = std::move(decoded->datagram);
     }
     auto parsed = ed2k::net::parse_udp_datagram(datagram);
     if(!parsed) co_return tl::unexpected(parsed.error());
+    last_response_encrypted_ = response_encrypted;
     auto pkt = std::move(*parsed);
     if(matches_wanted_opcode(pkt.opcode, want)) co_return std::move(pkt);
     auto dispatch = [&](UdpEvent event) {

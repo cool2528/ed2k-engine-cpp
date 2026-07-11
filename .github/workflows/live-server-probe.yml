@@ -1,0 +1,112 @@
+name: Live public server probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_list_url:
+        description: Optional reviewed server.met URL (defaults to eMule Security)
+        required: false
+        type: string
+      search_term:
+        description: Search term expected to return at least one result
+        required: false
+        default: emule
+        type: string
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache credentials
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Read vcpkg baseline
+        id: baseline
+        shell: bash
+        run: |
+          BASELINE=$(grep builtin-baseline vcpkg.json | head -1 | sed 's/.*"\([0-9a-f]\{40\}\)".*/\1/')
+          echo "commit=$BASELINE" >> "$GITHUB_OUTPUT"
+
+      - name: Cache vcpkg clone
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg
+          key: vcpkg-${{ steps.baseline.outputs.commit }}
+
+      - name: Set up pinned vcpkg
+        shell: bash
+        run: |
+          set -e
+          VCPKG_DIR="$RUNNER_TEMP/vcpkg"
+          if [ ! -d "$VCPKG_DIR/.git" ]; then
+            git clone https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
+          fi
+          git -C "$VCPKG_DIR" fetch --tags origin
+          git -C "$VCPKG_DIR" checkout -f "${{ steps.baseline.outputs.commit }}"
+          "$VCPKG_DIR/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VCPKG_DIR" >> "$GITHUB_ENV"
+
+      - name: Configure Release
+        run: cmake --preset default-release
+
+      - name: Build Release
+        run: cmake --build --preset default-release --target ed2k-tool ed2k_tests
+
+      - name: Select reachable public server
+        id: select
+        shell: pwsh
+        env:
+          SERVER_LIST_URL: ${{ inputs.server_list_url }}
+        run: |
+          $arguments = @{
+            ToolPath = 'build/default-release/Release/ed2k-tool.exe'
+            OutputDirectory = 'live-server-probe-logs'
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:SERVER_LIST_URL)) {
+            $arguments.ServerListUrl = $env:SERVER_LIST_URL
+          }
+          ./scripts/live/select-public-server.ps1 @arguments
+
+      - name: Run strict TCP live tests
+        shell: pwsh
+        env:
+          ED2K_LIVE: '1'
+          ED2K_SERVER: ${{ steps.select.outputs.server }}
+          ED2K_SEARCH_TERM: ${{ inputs.search_term }}
+        run: |
+          & build/default-release/Release/ed2k_tests.exe `
+            '--gtest_filter=LiveServer.LoginReturnsId:LiveServer.SearchReturnsResults:LiveServer.GetSourcesReturnsOk' `
+            2>&1 | Tee-Object -FilePath live-server-probe-logs/tcp-tests.log
+          exit $LASTEXITCODE
+
+      - name: Probe UDP obfuscation capability
+        shell: pwsh
+        env:
+          ED2K_LIVE: '1'
+          ED2K_SERVER: ${{ steps.select.outputs.server }}
+        run: |
+          & build/default-release/Release/ed2k_tests.exe `
+            '--gtest_filter=LiveServer.UdpObfuscationProbe' `
+            2>&1 | Tee-Object -FilePath live-server-probe-logs/udp-obfuscation-probe.log
+          exit $LASTEXITCODE
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-public-server-probe
+          path: live-server-probe-logs
+          if-no-files-found: warn

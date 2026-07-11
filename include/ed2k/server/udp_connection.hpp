@@ -68,6 +68,7 @@ class UdpServerConnection {
     server_list(IPv4 ask_ip, std::uint16_t ask_port, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<ServerDesc,std::error_code>>
     server_desc(std::uint32_t challenge, std::chrono::milliseconds timeout);
+  [[nodiscard]] bool last_response_encrypted() const noexcept { return last_response_encrypted_; }
   void close() noexcept;
  private:
   boost::asio::ip::udp::endpoint obfuscated_endpoint() const;
@@ -80,6 +81,7 @@ class UdpServerConnection {
   ed2k::net::UdpSocket sock_;
   boost::asio::ip::udp::endpoint plain_server_;
   UdpServerObfuscation obfuscation_;
+  bool last_response_encrypted_ = false;
   std::shared_ptr<SubscriptionState> observers_;
 };
 }

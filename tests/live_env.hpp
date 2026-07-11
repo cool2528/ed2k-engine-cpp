@@ -28,8 +28,17 @@ inline std::optional<ed2k::app::ServerTarget> env_server(){
   if(colon == std::string::npos) return std::nullopt;
   auto ip = ed2k::IPv4::from_dotted(s.substr(0, colon));
   if(!ip) return std::nullopt;
-  ed2k::app::ServerTarget t; t.ip = *ip; t.port = std::uint16_t(std::stoi(s.substr(colon + 1)));
+  std::uint32_t port = 0;
+  const auto port_text = std::string_view{s}.substr(colon + 1);
+  const auto parsed = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
+  if(parsed.ec != std::errc{} || parsed.ptr != port_text.data() + port_text.size() ||
+     port == 0 || port > 65535) return std::nullopt;
+  ed2k::app::ServerTarget t; t.ip = *ip; t.port = static_cast<std::uint16_t>(port);
   return t;
+}
+inline std::string env_search_term(){
+  const char* v = std::getenv("ED2K_SEARCH_TERM");
+  return v && *v ? v : "emule";
 }
 inline std::string env_link(){ const char* v = std::getenv("ED2K_LINK"); return v ? v : ""; }
 inline std::string env_source(){ const char* v = std::getenv("ED2K_SOURCE"); return v ? v : ""; }

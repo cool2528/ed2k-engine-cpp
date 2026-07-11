@@ -216,6 +216,7 @@ TEST(UdpConnection, ServerStatusUsesObfuscatedUdpPortAndDecodesResponse){
     if(!r) co_return;
     EXPECT_EQ(r->users, 100u);
     EXPECT_TRUE(saw_encrypted_request);
+    EXPECT_TRUE(c.last_response_encrypted());
     c.close(); co_return;
   });
 }
@@ -244,6 +245,7 @@ TEST(UdpConnection, ServerStatusFallsBackToPlainUdpWhenObfuscatedProbeTimesOut){
     EXPECT_TRUE(r.has_value());
     if(!r) co_return;
     EXPECT_EQ(r->users, 42u);
+    EXPECT_FALSE(c.last_response_encrypted());
     c.close(); co_return;
   });
 }
