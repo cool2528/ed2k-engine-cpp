@@ -1,5 +1,7 @@
 # ed2k-engine-cpp
 
+[简体中文](README.zh-CN.md)
+
 A from-scratch C++20 implementation of the **eDonkey2000 / eMule (eD2k) protocol** engine —
 link parsing, server and Kad sessions, upload/share, multi-source download with AICH corruption
 recovery, and cross-client resume.
@@ -103,6 +105,11 @@ ed2k-tool kad-bootstrap nodes.dat
 ed2k-tool kad-search nodes.dat "ubuntu"
 ed2k-tool kad-find-sources nodes.dat "ed2k://|file|ubuntu.iso|...|/"
 ```
+
+`update-serverlist` accepts HTTP and HTTPS URLs. HTTPS always verifies the certificate chain and
+requested hostname; there is no insecure verification bypass. The command follows at most five
+redirects under one overall deadline, then atomically replaces the destination only after the
+complete response has been written and durably synchronized.
 
 `download` without `--server` falls back to an internal fallback server list. Downloaded files
 are written via a sparse `PartFile` with per-part MD4 verification and `.part.met` resume —

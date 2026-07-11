@@ -3,6 +3,13 @@
 All notable changes to ed2kengine. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
+## Unreleased
+
+### Changed
+- `update-serverlist` now accepts HTTP and HTTPS, strictly verifies certificate chains and
+  hostnames without an insecure bypass, follows at most five redirects under one overall
+  deadline, and atomically/durably replaces the destination only after a complete download.
+
 ## [2.2.0] — 2026-07-06
 
 ### Added — aMule protocol-level feature parity
