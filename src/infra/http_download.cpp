@@ -910,6 +910,9 @@ HTTPDownload::fetch(const std::string& url,
     if (!next) {
       co_return tl::unexpected(next.error());
     }
+    if (parsed->scheme == URLScheme::https && next->scheme == URLScheme::http) {
+      co_return tl::unexpected(make_error_code(errc::server_protocol_error));
+    }
     if (!visited.insert(url_key(*next)).second) {
       co_return tl::unexpected(make_error_code(errc::server_protocol_error));
     }

@@ -924,6 +924,54 @@ TEST(HTTPDownload, FollowsHttpRedirectToHttps) {
   std::filesystem::remove(path);
 }
 
+TEST(HTTPDownload, RejectsHttpsRedirectToHttp) {
+  IoRuntime rt;
+  LocalTLSServer https_server(rt.context());
+  ed2k::test::MockPeer plaintext_server(rt.context());
+  std::string https_target;
+  std::size_t plaintext_requests = 0;
+
+  https_server.serve([&](asio::ssl::stream<tcp::socket>& stream) -> asio::awaitable<void> {
+    https_target = co_await read_tls_request_target(stream);
+    const std::string response =
+      "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: hTtP://127.0.0.1:" +
+      std::to_string(plaintext_server.port()) + "/plaintext.met\r\n\r\n";
+    co_await asio::async_write(
+      stream, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+  plaintext_server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    ++plaintext_requests;
+    (void)co_await read_request_target(socket);
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nattacker";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_https_downgrade_redirect_test.bin";
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << "original";
+  }
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor(), HTTPDownloadOptions{tls_fixture("ca.crt")});
+    auto r = co_await http.fetch(
+      "https://localhost:" + std::to_string(https_server.port()) + "/secure.met",
+      path,
+      2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::server_protocol_error));
+    }
+  });
+
+  EXPECT_EQ(https_target, "/secure.met");
+  EXPECT_EQ(plaintext_requests, 0u);
+  EXPECT_EQ(read_text(path), "original");
+  std::filesystem::remove(path);
+}
+
 TEST(HTTPDownload, RejectsUntrustedCertificate) {
   IoRuntime rt;
   LocalTLSServer server(rt.context());
