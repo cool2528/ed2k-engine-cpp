@@ -2,7 +2,9 @@
 param(
     [ValidateSet('required', 'optional')]
     [string]$Mode = 'required',
-    [string]$TestExe
+    [string]$TestExe,
+    [ValidateSet('', 'after-upload-start')]
+    [string]$FailureInjection = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,8 +17,10 @@ $ecPassword = 'ed2k-live'
 $daemonPid = $null
 $wslProcess = $null
 $uploadProcess = $null
+$uploadPid = $null
 $succeeded = $false
 $testInWsl = $false
+$linuxConfig = $null
 
 function Fail-Setup([string]$Message) {
     throw "$Message`nRun: ./scripts/live/setup-amule-obfuscation.ps1"
@@ -126,46 +130,29 @@ if ($Mode -eq 'optional') {
     if ($LASTEXITCODE -ne 0) { throw "Could not stage aMule partial upload evidence (exit $LASTEXITCODE)." }
 }
 
-$linuxConfig = Convert-ToWslPath $configDir
-$peerIp = (Invoke-WslText "hostname -I | awk '{print `$1}'").Text
-if ($peerIp -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Could not determine the WSL peer address: '$peerIp'" }
-$daemonLinkArgument = ''
-if ($Mode -eq 'optional') {
-    $uploadLink = (Get-Content -LiteralPath (Join-Path $stateRoot 'upload.link') -Raw).Trim()
-    $uploadLink += "|sources,$peerIp`:$uploadPort|/"
-    $daemonLinkArgument = ' ' + (Bash-Quote $uploadLink)
-    $uploadFile = Convert-ToWslPath (Join-Path $stateRoot 'live-obfuscation-upload-evidence.bin')
-    $uploadOut = Join-Path $logsDir 'live-upload-test.stdout.log'
-    $uploadErr = Join-Path $logsDir 'live-upload-test.stderr.log'
-    $uploadLauncherPath = Join-Path $logsDir 'launch-upload-test.sh'
-    $uploadLauncher = @(
-        '#!/bin/bash',
-        'export ED2K_LIVE=1',
-        "export ED2K_UPLOAD_FILE=$(Bash-Quote $uploadFile)",
-        "export ED2K_UPLOAD_PORT=$(Bash-Quote ([string]$uploadPort))",
-        "exec $(Bash-Quote $linuxTestExe) --gtest_filter=LiveUpload.AcceptsLocalPeerUploadSession"
-    ) -join "`n"
-    Set-Content -LiteralPath $uploadLauncherPath -Value ($uploadLauncher + "`n") -NoNewline
-    $linuxUploadLauncher = Convert-ToWslPath $uploadLauncherPath
-    $uploadProcess = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-e', 'bash', $linuxUploadLauncher) `
-        -WindowStyle Hidden -PassThru -RedirectStandardOutput $uploadOut -RedirectStandardError $uploadErr
-    Start-Sleep -Seconds 1
-    if ($uploadProcess.HasExited) { throw 'LiveUpload evidence test exited before aMule startup.' }
-}
-$linuxPidFile = Convert-ToWslPath (Join-Path $logsDir 'amuled.pid')
-$launcherPath = Join-Path $logsDir 'launch-amuled.sh'
-$launcher = @(
+try {
+  $linuxConfig = Convert-ToWslPath $configDir
+  $peerIp = (Invoke-WslText "hostname -I | awk '{print `$1}'").Text
+  if ($peerIp -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Could not determine the WSL peer address: '$peerIp'" }
+  $daemonLinkArgument = ''
+  if ($Mode -eq 'optional') {
+      $uploadLink = (Get-Content -LiteralPath (Join-Path $stateRoot 'upload.link') -Raw).Trim()
+      $uploadLink += "|sources,$peerIp`:$uploadPort|/"
+      $daemonLinkArgument = ' ' + (Bash-Quote $uploadLink)
+  }
+  $linuxPidFile = Convert-ToWslPath (Join-Path $logsDir 'amuled.pid')
+  $launcherPath = Join-Path $logsDir 'launch-amuled.sh'
+  $launcher = @(
     '#!/bin/bash',
     'umask 077',
     "echo `$`$ > $(Bash-Quote $linuxPidFile)",
     "exec /usr/bin/amuled -c $(Bash-Quote $linuxConfig) -o$daemonLinkArgument"
 ) -join "`n"
-Set-Content -LiteralPath $launcherPath -Value ($launcher + "`n") -NoNewline
-$linuxLauncher = Convert-ToWslPath $launcherPath
-$daemonOut = Join-Path $logsDir 'amuled.stdout.log'
-$daemonErr = Join-Path $logsDir 'amuled.stderr.log'
+  Set-Content -LiteralPath $launcherPath -Value ($launcher + "`n") -NoNewline
+  $linuxLauncher = Convert-ToWslPath $launcherPath
+  $daemonOut = Join-Path $logsDir 'amuled.stdout.log'
+  $daemonErr = Join-Path $logsDir 'amuled.stderr.log'
 
-try {
     $wslProcess = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-e', 'bash', $linuxLauncher) `
         -WindowStyle Hidden -PassThru -RedirectStandardOutput $daemonOut -RedirectStandardError $daemonErr
 
@@ -195,6 +182,34 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if (-not $ready) { throw "amuled readiness timed out after 30 seconds. See $logsDir" }
+
+    if ($Mode -eq 'optional') {
+        $uploadFile = Convert-ToWslPath (Join-Path $stateRoot 'live-obfuscation-upload-evidence.bin')
+        $uploadOut = Join-Path $logsDir 'live-upload-test.stdout.log'
+        $uploadErr = Join-Path $logsDir 'live-upload-test.stderr.log'
+        $uploadLauncherPath = Join-Path $logsDir 'launch-upload-test.sh'
+        $linuxUploadPidFile = Convert-ToWslPath (Join-Path $logsDir 'upload-test.pid')
+        $uploadLauncher = @(
+            '#!/bin/bash',
+            "echo `$`$ > $(Bash-Quote $linuxUploadPidFile)",
+            'export ED2K_LIVE=1',
+            "export ED2K_UPLOAD_FILE=$(Bash-Quote $uploadFile)",
+            "export ED2K_UPLOAD_PORT=$(Bash-Quote ([string]$uploadPort))",
+            "exec $(Bash-Quote $linuxTestExe) --gtest_filter=LiveUpload.AcceptsLocalPeerUploadSession"
+        ) -join "`n"
+        Set-Content -LiteralPath $uploadLauncherPath -Value ($uploadLauncher + "`n") -NoNewline
+        $linuxUploadLauncher = Convert-ToWslPath $uploadLauncherPath
+        $uploadProcess = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-e', 'bash', $linuxUploadLauncher) `
+            -WindowStyle Hidden -PassThru -RedirectStandardOutput $uploadOut -RedirectStandardError $uploadErr
+        Start-Sleep -Seconds 1
+        if ($uploadProcess.HasExited) { throw 'LiveUpload evidence test exited during local peer registration.' }
+        $uploadPidPath = Join-Path $logsDir 'upload-test.pid'
+        if (-not (Test-Path -LiteralPath $uploadPidPath)) { throw 'LiveUpload evidence test did not publish its Linux PID.' }
+        $uploadPid = [int](Get-Content -LiteralPath $uploadPidPath -Raw).Trim()
+        if ($FailureInjection -eq 'after-upload-start') {
+            throw 'Injected failure after upload evidence process start.'
+        }
+    }
 
     $fixtureLink = (Get-Content -LiteralPath (Join-Path $stateRoot 'fixture.link') -Raw).Trim()
     $fixtureHash = (Get-Content -LiteralPath (Join-Path $stateRoot 'fixture.hash') -Raw).Trim()
@@ -267,7 +282,26 @@ try {
         }
     }
     if ($wslProcess -and -not $wslProcess.HasExited) { $wslProcess.WaitForExit(5000) | Out-Null }
-    if ($uploadProcess -and -not $uploadProcess.HasExited) { $uploadProcess.Kill() }
+    if ($uploadPid) {
+        $uploadAlive = Invoke-WslText "kill -0 $uploadPid 2>/dev/null" -AllowFailure
+        if ($uploadAlive.ExitCode -eq 0) {
+            $uploadIdentity = Invoke-WslText "tr '\0' ' ' </proc/$uploadPid/cmdline 2>/dev/null" -AllowFailure
+            if ($uploadIdentity.ExitCode -eq 0 -and $uploadIdentity.Text -match 'ed2k_tests' -and
+                $uploadIdentity.Text -match 'LiveUpload.AcceptsLocalPeerUploadSession') {
+                Invoke-WslText "kill -TERM $uploadPid" -AllowFailure | Out-Null
+                $uploadStopDeadline = [DateTime]::UtcNow.AddSeconds(5)
+                do {
+                    $uploadAlive = Invoke-WslText "kill -0 $uploadPid 2>/dev/null" -AllowFailure
+                    if ($uploadAlive.ExitCode -ne 0) { break }
+                    Start-Sleep -Milliseconds 100
+                } while ([DateTime]::UtcNow -lt $uploadStopDeadline)
+                if ($uploadAlive.ExitCode -eq 0) { Write-Warning "Upload evidence PID $uploadPid did not exit after SIGTERM." }
+            } else {
+                Write-Warning "PID $uploadPid no longer identifies this harness's upload test; it was not signalled."
+            }
+        }
+    }
+    if ($uploadProcess -and -not $uploadProcess.HasExited) { $uploadProcess.WaitForExit(5000) | Out-Null }
     Remove-Item Env:ED2K_UPLOAD_FILE, Env:ED2K_UPLOAD_PORT -ErrorAction SilentlyContinue
     if (-not $succeeded) { Write-Warning "Harness failed; logs retained at $logsDir" }
 }
