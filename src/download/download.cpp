@@ -41,7 +41,7 @@ std::optional<server::SourceEndpoint> endpoint_from_kad_source(const kad::KadSea
   }
   const auto ip = kad::source_ip(entry);
   const auto tcp_port = kad::source_tcp_port(entry);
-  if (!ip || tcp_port == 0) {
+  if (!ip || ip->host() == 0 || tcp_port == 0) {
     return std::nullopt;
   }
   return server::SourceEndpoint{ipv4_to_wire(*ip), tcp_port};
@@ -142,6 +142,13 @@ dispatch_blocks_phase(peer::C2CConnection& conn,
   co_return tl::expected<void,std::error_code>{};
 }
 } // namespace
+
+std::optional<peer::PeerIdentity>
+peer_identity_from_kad_source(const kad::KadSearchEntry& entry) {
+  auto endpoint = endpoint_from_kad_source(entry);
+  if (!endpoint) return std::nullopt;
+  return peer::PeerIdentity{*endpoint, UserHash::from_bytes(entry.answer_id.bytes())};
+}
 
 Download::Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
                    const FileHash& hash, std::uint64_t size, const ed2k::server::SourceEndpoint& source)
@@ -559,14 +566,15 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
       auto kad_sources = co_await kad_network.find_sources(peers, file_id, self.size, total_timeout);
       if(kad_sources){
         for(const auto& entry : *kad_sources){
-          auto endpoint = endpoint_from_kad_source(entry);
-          if(!endpoint) continue;
-          if(self.ip_filter && self.ip_filter->blocked(IPv4::from_wire(endpoint->id), self.ip_filter_level)) continue;
+          auto identity = peer_identity_from_kad_source(entry);
+          if(!identity) continue;
+          if(self.ip_filter && self.ip_filter->blocked(
+              IPv4::from_wire(identity->endpoint.id), self.ip_filter_level)) continue;
           const auto duplicate = std::any_of(self.sources.begin(), self.sources.end(),
                                              [&](const peer::PeerIdentity& current){
-                                               return same_source(current.endpoint, *endpoint);
+                                               return same_source(current.endpoint, identity->endpoint);
                                              });
-          if(!duplicate) self.sources.push_back(peer::PeerIdentity{*endpoint, std::nullopt});
+          if(!duplicate) self.sources.push_back(std::move(*identity));
         }
       }
     }

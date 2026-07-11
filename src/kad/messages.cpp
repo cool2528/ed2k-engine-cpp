@@ -932,21 +932,30 @@ std::uint64_t file_size(const KadSearchEntry& entry) noexcept {
 
 std::uint8_t source_type(const KadSearchEntry& entry) noexcept {
   if (const auto* tag_value = find_tag(entry, tag::source_type)) {
-    return static_cast<std::uint8_t>(integer_value(*tag_value));
+    const auto value = integer_value(*tag_value);
+    if (value <= std::numeric_limits<std::uint8_t>::max()) {
+      return static_cast<std::uint8_t>(value);
+    }
   }
   return 0;
 }
 
 std::optional<IPv4> source_ip(const KadSearchEntry& entry) noexcept {
   if (const auto* tag_value = find_tag(entry, tag::source_ip)) {
-    return IPv4::from_host(static_cast<std::uint32_t>(integer_value(*tag_value)));
+    const auto value = integer_value(*tag_value);
+    if (value <= std::numeric_limits<std::uint32_t>::max()) {
+      return IPv4::from_host(static_cast<std::uint32_t>(value));
+    }
   }
   return std::nullopt;
 }
 
 std::uint16_t source_tcp_port(const KadSearchEntry& entry) noexcept {
   if (const auto* tag_value = find_tag(entry, tag::source_port)) {
-    return static_cast<std::uint16_t>(integer_value(*tag_value));
+    const auto value = integer_value(*tag_value);
+    if (value <= std::numeric_limits<std::uint16_t>::max()) {
+      return static_cast<std::uint16_t>(value);
+    }
   }
   return 0;
 }

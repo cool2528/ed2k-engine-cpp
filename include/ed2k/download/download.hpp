@@ -18,8 +18,12 @@
 #include "ed2k/peer/inbound_listener.hpp"  // InboundListener (M3 LowID callback)
 namespace ed2k::kad {
 class KadNetwork;
+struct KadSearchEntry;
 }
 namespace ed2k::download {
+
+std::optional<peer::PeerIdentity>
+peer_identity_from_kad_source(const kad::KadSearchEntry& entry);
 
 class Download {
  public:

@@ -193,8 +193,17 @@ TEST(AppDownload, EndToEndHighIdMockDownload){
 TEST(AppDownload, KadSourcesCompleteWhenServerReturnsNoSources){
   auto mf = make_mock_file(0x77, 0x88);
   IoRuntime rt;
-  ed2k::test::MockPeer peer(rt.context());
-  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  tcp::acceptor peer_acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  std::byte encrypted_marker{};
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    auto encrypted = co_await peer_acceptor.async_accept(asio::use_awaitable);
+    (void)co_await asio::async_read(encrypted, asio::buffer(&encrypted_marker, 1),
+                                   asio::as_tuple(asio::use_awaitable));
+    encrypted.close();
+    auto plain = co_await peer_acceptor.async_accept(asio::use_awaitable);
+    co_await serve_full_peer(std::move(plain), mf);
+    co_return;
+  }, asio::detached);
   ed2k::test::MockServer srv(rt.context());
   srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
     (void)co_await read_frame(s);   // LOGINREQUEST
@@ -210,7 +219,7 @@ TEST(AppDownload, KadSourcesCompleteWhenServerReturnsNoSources){
   ed2k::kad::KadNetwork publisher(rt.executor(), ed2k::kad::KadNetworkOptions{
     .id = kad_id("00000000000000000000000000000001"),
     .ip = IPv4::from_dotted("127.0.0.1").value(),
-    .tcp_port = peer.port(),
+    .tcp_port = peer_acceptor.local_endpoint().port(),
     .version = ed2k::kad::kad2_version,
   });
   ed2k::kad::KadNetwork indexer(rt.executor(), ed2k::kad::KadNetworkOptions{
@@ -232,7 +241,7 @@ TEST(AppDownload, KadSourcesCompleteWhenServerReturnsNoSources){
   auto tmp = std::filesystem::temp_directory_path() / "ed2k_app_dl_kad_sources_test";
   std::filesystem::remove(tmp);
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    auto source = kad_source_entry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", peer.port(),
+    auto source = kad_source_entry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", peer_acceptor.local_endpoint().port(),
                                    publisher.self_contact().udp_port, link.size);
     asio::co_spawn(rt.context(), serve_kad_n(indexer, 1), asio::detached);
     auto published = co_await publisher.publish_source(indexer.self_contact(), kad_id(link.hash), source, 1s);
@@ -244,14 +253,77 @@ TEST(AppDownload, KadSourcesCompleteWhenServerReturnsNoSources){
 
     DownloadOpts o; o.out_path=tmp; o.per_server_timeout=3000ms; o.total_timeout=20000ms;
     o.kad_network = std::ref(searcher);
+    o.obfuscation_policy = ed2k::peer::ObfuscationPolicy::preferred;
+    o.local_user_hash = *UserHash::from_hex("0123456789abcdeffedcba9876543210");
     auto r = co_await download_link(rt.executor(), link, metbytes,
       ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()}, o);
     EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
     co_return;
   });
   ASSERT_TRUE(std::filesystem::exists(tmp));
+  EXPECT_NE(encrypted_marker, std::byte{proto::eDonkey});
+  EXPECT_NE(encrypted_marker, std::byte{proto::eMule});
+  EXPECT_NE(encrypted_marker, std::byte{proto::zlib});
   EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
   std::filesystem::remove(tmp);
+}
+
+TEST(AppDownload, KadSourceIdentityAllowsRequiredObfuscationToReachTcp) {
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  auto source = kad_source_entry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                 acceptor.local_endpoint().port(), 4672, 123);
+  source.tags.push_back(kad_int_tag(ed2k::kad::tag::source_ip,
+                                   IPv4::from_dotted("127.0.0.1")->host()));
+  auto identity = download::peer_identity_from_kad_source(source);
+  ASSERT_TRUE(identity.has_value());
+  ASSERT_TRUE(identity->user_hash.has_value());
+  EXPECT_EQ(identity->user_hash->to_hex(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+  bool accepted = false;
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
+    auto socket = co_await acceptor.async_accept(asio::use_awaitable);
+    accepted = true;
+    std::array<std::byte, 1> marker{};
+    (void)co_await asio::async_read(socket, asio::buffer(marker), asio::as_tuple(asio::use_awaitable));
+    socket.close();
+    co_return;
+  }, asio::detached);
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    peer::C2CConnection connection(rt.executor());
+    auto result = co_await connection.connect(*identity, peer::ObfuscationPolicy::required, 500ms);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_TRUE(accepted);
+    co_return;
+  });
+}
+
+TEST(AppDownload, KadNonSourceEntryDoesNotBecomePeerIdentity) {
+  auto entry = kad_source_entry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 4662, 4672, 123);
+  entry.tags[0] = kad_int_tag(ed2k::kad::tag::source_type, 2);
+  EXPECT_FALSE(download::peer_identity_from_kad_source(entry).has_value());
+}
+
+TEST(AppDownload, KadSourceIdentityRejectsTruncatedTagValues) {
+  const auto valid_ip = IPv4::from_dotted("127.0.0.1")->host();
+  auto entry = kad_source_entry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 4662, 4672, 123);
+  entry.tags.push_back(kad_int_tag(ed2k::kad::tag::source_ip, valid_ip));
+
+  entry.tags[0] = kad_int_tag(ed2k::kad::tag::source_type, 257);
+  EXPECT_FALSE(download::peer_identity_from_kad_source(entry).has_value());
+
+  entry.tags[0] = kad_int_tag(ed2k::kad::tag::source_type, 1);
+  entry.tags[1] = kad_int_tag(ed2k::kad::tag::source_port, 65537);
+  EXPECT_FALSE(download::peer_identity_from_kad_source(entry).has_value());
+
+  entry.tags[1] = kad_int_tag(ed2k::kad::tag::source_port, 4662);
+  entry.tags.back() = kad_int_tag(ed2k::kad::tag::source_ip, 0x1'7f00'0001ULL);
+  EXPECT_FALSE(download::peer_identity_from_kad_source(entry).has_value());
+}
+
+TEST(AppDownload, KadSourceIdentityRejectsUnspecifiedIp) {
+  auto entry = kad_source_entry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 4662, 4672, 123);
+  entry.tags.push_back(kad_int_tag(ed2k::kad::tag::source_ip, 0));
+  EXPECT_FALSE(download::peer_identity_from_kad_source(entry).has_value());
 }
 
 // Regression (Task-7 fix): a HighID-only download_link must NOT construct an
