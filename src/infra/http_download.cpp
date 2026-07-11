@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
-#include <fstream>
 #include <memory>
 #include <new>
 #include <optional>
@@ -29,6 +31,16 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
 #include <openssl/ssl.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "ed2k/util/error.hpp"
 #include "infra/tls_trust_store.hpp"
@@ -354,6 +366,113 @@ bool redirect_status(unsigned status) {
   return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
+std::filesystem::path unique_sibling_path(const std::filesystem::path& destination,
+                                          const std::filesystem::path& marker) {
+  static std::atomic<std::uint64_t> next_id{0};
+  const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto name = destination.filename();
+  name += marker;
+  name += std::to_string(timestamp);
+  name += ".";
+  name += std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
+  return destination.parent_path() / name;
+}
+
+void remove_best_effort(const std::filesystem::path& path) {
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+}
+
+tl::expected<void, std::error_code>
+replace_destination(const std::filesystem::path& temporary,
+                    const std::filesystem::path& destination) {
+#ifdef _WIN32
+  const DWORD attributes = GetFileAttributesW(destination.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    const DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+      return tl::unexpected(make_error_code(errc::io_error));
+    }
+    if (MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH)) {
+      return {};
+    }
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+  if (ReplaceFileW(destination.c_str(),
+                   temporary.c_str(),
+                   nullptr,
+                   REPLACEFILE_WRITE_THROUGH,
+                   nullptr,
+                   nullptr)) {
+    return {};
+  }
+  return tl::unexpected(make_error_code(errc::io_error));
+#else
+  std::error_code rename_error;
+  std::filesystem::rename(temporary, destination, rename_error);
+  if (!rename_error) {
+    return {};
+  }
+  return tl::unexpected(make_error_code(errc::io_error));
+#endif
+}
+
+tl::expected<std::filesystem::path, std::error_code>
+write_temporary_file(const std::filesystem::path& destination,
+                     const std::vector<std::byte>& body) {
+  constexpr std::size_t max_attempts = 100;
+  for (std::size_t attempt = 0; attempt < max_attempts; ++attempt) {
+    const auto temporary = unique_sibling_path(destination, ".tmp.");
+    std::FILE* stream = nullptr;
+#ifdef _WIN32
+    const auto open_error = _wfopen_s(&stream, temporary.c_str(), L"wbx");
+    if (open_error == EEXIST) {
+      continue;
+    }
+    if (open_error != 0 || stream == nullptr) {
+      return tl::unexpected(make_error_code(errc::io_error));
+    }
+#else
+    errno = 0;
+    stream = std::fopen(temporary.c_str(), "wbx");
+    if (stream == nullptr && errno == EEXIST) {
+      continue;
+    }
+    if (stream == nullptr) {
+      return tl::unexpected(make_error_code(errc::io_error));
+    }
+#endif
+
+    const bool write_ok =
+      body.empty() || std::fwrite(body.data(), 1, body.size(), stream) == body.size();
+    const bool close_ok = std::fclose(stream) == 0;
+    if (!write_ok || !close_ok) {
+      remove_best_effort(temporary);
+      return tl::unexpected(make_error_code(errc::io_error));
+    }
+    return temporary;
+  }
+  return tl::unexpected(make_error_code(errc::io_error));
+}
+
+tl::expected<void, std::error_code>
+write_and_replace(const std::filesystem::path& destination,
+                  const std::vector<std::byte>& body) {
+  auto temporary = write_temporary_file(destination, body);
+  if (!temporary) {
+    return tl::unexpected(temporary.error());
+  }
+  auto replaced = replace_destination(*temporary, destination);
+  if (!replaced) {
+    remove_best_effort(*temporary);
+    return tl::unexpected(replaced.error());
+  }
+  return {};
+}
+
 std::string host_header(const ParsedURL& url) {
   const bool ipv6 = url.host.find(':') != std::string::npos;
   return (ipv6 ? "[" + url.host + "]" : url.host) + ":" + std::to_string(url.port);
@@ -604,14 +723,9 @@ HTTPDownload::fetch(const std::string& url,
       if (!response->head.content_length) {
         co_return tl::unexpected(make_error_code(errc::server_protocol_error));
       }
-      std::ofstream out(destination, std::ios::binary | std::ios::trunc);
-      if (!out) {
-        co_return tl::unexpected(make_error_code(errc::io_error));
-      }
-      out.write(reinterpret_cast<const char*>(response->body.data()),
-                static_cast<std::streamsize>(response->body.size()));
-      if (!out) {
-        co_return tl::unexpected(make_error_code(errc::io_error));
+      auto written = write_and_replace(destination, response->body);
+      if (!written) {
+        co_return tl::unexpected(written.error());
       }
       co_return tl::expected<void, std::error_code>{};
     }

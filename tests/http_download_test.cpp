@@ -20,6 +20,16 @@
 #include <boost/asio/write.hpp>
 #include <gtest/gtest.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "ed2k/infra/http_download.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/util/error.hpp"
@@ -116,6 +126,26 @@ std::string read_text(const std::filesystem::path& path) {
   return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+void write_text(const std::filesystem::path& path, std::string_view text) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(out);
+  out.write(text.data(), static_cast<std::streamsize>(text.size()));
+  ASSERT_TRUE(out);
+}
+
+std::size_t sibling_artifact_count(const std::filesystem::path& destination) {
+  const auto temporary_prefix = destination.filename().string() + ".tmp.";
+  const auto backup_prefix = destination.filename().string() + ".bak.";
+  std::size_t count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(destination.parent_path())) {
+    const auto name = entry.path().filename().string();
+    if (name.starts_with(temporary_prefix) || name.starts_with(backup_prefix)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 asio::awaitable<std::string> read_request_target(tcp::socket& socket) {
   asio::streambuf buffer;
   auto [ec, n] = co_await asio::async_read_until(
@@ -182,6 +212,208 @@ TEST(HTTPDownload, FetchWritesResponseBodyToFile) {
   EXPECT_EQ(read_text(path), "hello");
   std::filesystem::remove(path);
 }
+
+TEST(HTTPDownload, PreservesExistingDestinationWhenBodyIsTruncated) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  server.serve([](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_FALSE((co_await read_request_target(socket)).empty());
+    const std::string response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_http_truncated_preserves_test.bin";
+  std::filesystem::remove(path);
+  write_text(path, "old-data");
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::connection_closed));
+    }
+  });
+
+  EXPECT_EQ(read_text(path), "old-data");
+  EXPECT_EQ(sibling_artifact_count(path), 0u);
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, PreservesExistingDestinationWhenTlsValidationFails) {
+  IoRuntime rt;
+  LocalTLSServer server(rt.context());
+  server.serve([](asio::ssl::stream<tcp::socket>&) -> asio::awaitable<void> {
+    co_return;
+  });
+
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_https_failure_preserves_test.bin";
+  std::filesystem::remove(path);
+  write_text(path, "old-data");
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "https://localhost:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::tls_error));
+    }
+  });
+
+  EXPECT_EQ(read_text(path), "old-data");
+  EXPECT_EQ(sibling_artifact_count(path), 0u);
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, PreservesExistingDestinationForNonSuccessResponse) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  server.serve([](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_FALSE((co_await read_request_target(socket)).empty());
+    const std::string response =
+      "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nerror";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_http_non_success_preserves_test.bin";
+  std::filesystem::remove(path);
+  write_text(path, "old-data");
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::server_protocol_error));
+    }
+  });
+
+  EXPECT_EQ(read_text(path), "old-data");
+  EXPECT_EQ(sibling_artifact_count(path), 0u);
+  std::filesystem::remove(path);
+}
+
+TEST(HTTPDownload, ReplacesExistingDestinationOnlyAfterCompleteSuccessfulBody) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_http_atomic_replace_test.bin";
+  const auto old_alias =
+    std::filesystem::temp_directory_path() / "ed2k_http_atomic_replace_old_alias.bin";
+  std::filesystem::remove(path);
+  std::filesystem::remove(old_alias);
+  write_text(path, "old-data");
+  std::error_code link_error;
+  std::filesystem::create_hard_link(path, old_alias, link_error);
+  ASSERT_FALSE(link_error) << link_error.message();
+
+  server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_FALSE((co_await read_request_target(socket)).empty());
+    const std::string first =
+      "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnew-";
+    co_await asio::async_write(
+      socket, asio::buffer(first), asio::as_tuple(asio::use_awaitable));
+    EXPECT_EQ(read_text(path), "old-data");
+    const std::string second = "data";
+    co_await asio::async_write(
+      socket, asio::buffer(second), asio::as_tuple(asio::use_awaitable));
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+  });
+
+  EXPECT_EQ(read_text(path), "new-data");
+  EXPECT_EQ(read_text(old_alias), "old-data");
+  EXPECT_EQ(sibling_artifact_count(path), 0u);
+  std::filesystem::remove(path);
+  std::filesystem::remove(old_alias);
+}
+
+TEST(HTTPDownload, RejectsDirectoryDestinationWithoutReplacingIt) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  server.serve([](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_FALSE((co_await read_request_target(socket)).empty());
+    const std::string response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnew-data";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_http_directory_destination_test";
+  std::filesystem::remove_all(path);
+  ASSERT_TRUE(std::filesystem::create_directory(path));
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::io_error));
+    }
+  });
+
+  EXPECT_TRUE(std::filesystem::is_directory(path));
+  EXPECT_EQ(sibling_artifact_count(path), 0u);
+  std::filesystem::remove_all(path);
+}
+
+#ifdef _WIN32
+TEST(HTTPDownload, PreservesExistingDestinationWhenAtomicReplaceFails) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  server.serve([](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_FALSE((co_await read_request_target(socket)).empty());
+    const std::string response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnew-data";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  const auto path =
+    std::filesystem::temp_directory_path() / "ed2k_http_replace_failure_test.bin";
+  std::filesystem::remove(path);
+  write_text(path, "old-data");
+  const HANDLE locked = CreateFileW(path.c_str(),
+                                    GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr,
+                                    OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL,
+                                    nullptr);
+  ASSERT_NE(locked, INVALID_HANDLE_VALUE);
+
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::io_error));
+    }
+  });
+
+  EXPECT_EQ(read_text(path), "old-data");
+  EXPECT_EQ(sibling_artifact_count(path), 0u);
+  EXPECT_TRUE(CloseHandle(locked));
+  std::filesystem::remove(path);
+}
+#endif
 
 TEST(HTTPDownload, FetchesHttpsWithTrustedTestCa) {
   IoRuntime rt;
