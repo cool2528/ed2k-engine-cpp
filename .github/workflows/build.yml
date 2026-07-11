@@ -32,8 +32,40 @@ jobs:
         include:
           - os: windows-2022
             preset: default
+            binary_dir: build/default
+            configuration: Debug
+            install_dir: build/stage-default
+            dependency_dir: build/default/vcpkg_installed/x64-windows
+            consumer_dir: build/consumer-default
+            consumer_configure_args: ""
+            consumer_exe: build/consumer-default/Debug/ed2k_consumer.exe
+          - os: windows-2022
+            preset: default-release
+            binary_dir: build/default-release
+            configuration: Release
+            install_dir: build/stage-default-release
+            dependency_dir: build/default-release/vcpkg_installed/x64-windows
+            consumer_dir: build/consumer-default-release
+            consumer_configure_args: ""
+            consumer_exe: build/consumer-default-release/Release/ed2k_consumer.exe
           - os: ubuntu-latest
             preset: linux
+            binary_dir: build/linux
+            configuration: Debug
+            install_dir: build/stage-linux
+            dependency_dir: build/linux/vcpkg_installed/x64-linux
+            consumer_dir: build/consumer-linux
+            consumer_configure_args: -DCMAKE_BUILD_TYPE=Debug
+            consumer_exe: build/consumer-linux/ed2k_consumer
+          - os: ubuntu-latest
+            preset: linux-release
+            binary_dir: build/linux-release
+            configuration: Release
+            install_dir: build/stage-linux-release
+            dependency_dir: build/linux-release/vcpkg_installed/x64-linux
+            consumer_dir: build/consumer-linux-release
+            consumer_configure_args: -DCMAKE_BUILD_TYPE=Release
+            consumer_exe: build/consumer-linux-release/ed2k_consumer
 
     steps:
       - uses: actions/checkout@v4
@@ -88,3 +120,16 @@ jobs:
 
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+      - name: Install
+        run: cmake --install ${{ matrix.binary_dir }} --config ${{ matrix.configuration }} --prefix "${{ github.workspace }}/${{ matrix.install_dir }}"
+
+      - name: Configure consumer
+        run: cmake -S tests/consumer -B ${{ matrix.consumer_dir }} -DCMAKE_PREFIX_PATH="${{ github.workspace }}/${{ matrix.install_dir }};${{ github.workspace }}/${{ matrix.dependency_dir }}" -DCMAKE_TOOLCHAIN_FILE="${{ runner.temp }}/vcpkg/scripts/buildsystems/vcpkg.cmake" ${{ matrix.consumer_configure_args }}
+
+      - name: Build consumer
+        run: cmake --build ${{ matrix.consumer_dir }} --config ${{ matrix.configuration }}
+
+      - name: Run consumer
+        shell: bash
+        run: ${{ matrix.consumer_exe }}
