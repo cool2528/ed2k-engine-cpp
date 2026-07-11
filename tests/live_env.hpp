@@ -9,6 +9,10 @@ inline bool live_enabled(){
   const char* v = std::getenv("ED2K_LIVE");
   return v && std::string(v) == "1";
 }
+inline bool live_obfuscation_enabled(){
+  const char* v = std::getenv("ED2K_LIVE_OBFUSCATION");
+  return live_enabled() && v && std::string(v) == "1";
+}
 inline std::optional<ed2k::app::ServerTarget> env_server(){
   const char* v = std::getenv("ED2K_SERVER");
   if(!v || !*v) return std::nullopt;
@@ -21,5 +25,6 @@ inline std::optional<ed2k::app::ServerTarget> env_server(){
   return t;
 }
 inline std::string env_link(){ const char* v = std::getenv("ED2K_LINK"); return v ? v : ""; }
+inline std::string env_source(){ const char* v = std::getenv("ED2K_SOURCE"); return v ? v : ""; }
 inline std::string env_expect_md4(){ const char* v = std::getenv("ED2K_EXPECT_MD4"); return v ? v : ""; }
 }
