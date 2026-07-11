@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <filesystem>
@@ -33,6 +34,7 @@
 #include "ed2k/infra/http_download.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/util/error.hpp"
+#include "infra/http_download_internal.hpp"
 #include "infra/tls_trust_store.hpp"
 #include "mock_peer.hpp"
 
@@ -134,17 +136,38 @@ void write_text(const std::filesystem::path& path, std::string_view text) {
 }
 
 std::size_t sibling_artifact_count(const std::filesystem::path& destination) {
-  const auto temporary_prefix = destination.filename().string() + ".tmp.";
-  const auto backup_prefix = destination.filename().string() + ".bak.";
   std::size_t count = 0;
   for (const auto& entry : std::filesystem::directory_iterator(destination.parent_path())) {
     const auto name = entry.path().filename().string();
-    if (name.starts_with(temporary_prefix) || name.starts_with(backup_prefix)) {
+    if (name.starts_with(".ed2k-http-") &&
+        (name.ends_with(".tmp") || name.ends_with(".bak"))) {
       ++count;
     }
   }
   return count;
 }
+
+class ScopedTestDirectory {
+ public:
+  ScopedTestDirectory() {
+    static std::atomic<std::uint64_t> next_id{0};
+    path_ = std::filesystem::temp_directory_path() /
+      ("ed2k_http_test_" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+       std::to_string(next_id.fetch_add(1, std::memory_order_relaxed)));
+    std::filesystem::create_directory(path_);
+  }
+
+  ~ScopedTestDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+
+  std::filesystem::path path(std::string_view name) const { return path_ / name; }
+
+ private:
+  std::filesystem::path path_;
+};
 
 asio::awaitable<std::string> read_request_target(tcp::socket& socket) {
   asio::streambuf buffer;
@@ -305,16 +328,15 @@ TEST(HTTPDownload, PreservesExistingDestinationForNonSuccessResponse) {
 TEST(HTTPDownload, ReplacesExistingDestinationOnlyAfterCompleteSuccessfulBody) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());
-  const auto path =
-    std::filesystem::temp_directory_path() / "ed2k_http_atomic_replace_test.bin";
-  const auto old_alias =
-    std::filesystem::temp_directory_path() / "ed2k_http_atomic_replace_old_alias.bin";
-  std::filesystem::remove(path);
-  std::filesystem::remove(old_alias);
+  ScopedTestDirectory directory;
+  const auto path = directory.path("destination.bin");
+  const auto old_alias = directory.path("old-alias.bin");
   write_text(path, "old-data");
   std::error_code link_error;
   std::filesystem::create_hard_link(path, old_alias, link_error);
-  ASSERT_FALSE(link_error) << link_error.message();
+  if (link_error) {
+    GTEST_SKIP() << "hard links unavailable: " << link_error.message();
+  }
 
   server.serve([&](tcp::socket socket) -> asio::awaitable<void> {
     EXPECT_FALSE((co_await read_request_target(socket)).empty());
@@ -338,8 +360,6 @@ TEST(HTTPDownload, ReplacesExistingDestinationOnlyAfterCompleteSuccessfulBody) {
   EXPECT_EQ(read_text(path), "new-data");
   EXPECT_EQ(read_text(old_alias), "old-data");
   EXPECT_EQ(sibling_artifact_count(path), 0u);
-  std::filesystem::remove(path);
-  std::filesystem::remove(old_alias);
 }
 
 TEST(HTTPDownload, RejectsDirectoryDestinationWithoutReplacingIt) {
@@ -373,7 +393,288 @@ TEST(HTTPDownload, RejectsDirectoryDestinationWithoutReplacingIt) {
   std::filesystem::remove_all(path);
 }
 
+TEST(HTTPDownload, ReportsIoErrorWhenDestinationParentIsMissing) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  server.serve([](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_FALSE((co_await read_request_target(socket)).empty());
+    const std::string response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnew-data";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  ScopedTestDirectory directory;
+  const auto missing_parent = directory.path("missing");
+  const auto path = missing_parent / "destination.bin";
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_FALSE(r.has_value());
+    if (!r) {
+      EXPECT_EQ(r.error(), make_error_code(errc::io_error));
+    }
+  });
+
+  EXPECT_FALSE(std::filesystem::exists(missing_parent));
+}
+
 #ifdef _WIN32
+TEST(HTTPDownload, WritesUnicodeDestinationAtomically) {
+  IoRuntime rt;
+  ed2k::test::MockPeer server(rt.context());
+  server.serve([](tcp::socket socket) -> asio::awaitable<void> {
+    EXPECT_FALSE((co_await read_request_target(socket)).empty());
+    const std::string response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnew-data";
+    co_await asio::async_write(
+      socket, asio::buffer(response), asio::as_tuple(asio::use_awaitable));
+  });
+
+  ScopedTestDirectory directory;
+  const auto path = directory.path("") / std::filesystem::path(L"\u4e0b\u8f7d.bin");
+  write_text(path, "old-data");
+  run_coro(rt, [&]() -> asio::awaitable<void> {
+    HTTPDownload http(rt.executor());
+    auto r = co_await http.fetch(
+      "http://127.0.0.1:" + std::to_string(server.port()) + "/server.met", path, 2s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+  });
+
+  EXPECT_EQ(read_text(path), "new-data");
+  EXPECT_EQ(sibling_artifact_count(path), 0u);
+}
+
+ed2k::infra::detail::WindowsNativeFileOps simulated_replace_ops(
+  std::uint32_t replace_error,
+  bool* move_called = nullptr,
+  bool allow_restore = true) {
+  return {
+    [replace_error](const std::filesystem::path& destination,
+                    const std::filesystem::path& temporary,
+                    const std::filesystem::path& backup) {
+      if (replace_error == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
+        std::filesystem::rename(destination, backup);
+      }
+      return false;
+    },
+    [move_called, allow_restore](const std::filesystem::path& from,
+                                 const std::filesystem::path& to) {
+      if (move_called) {
+        *move_called = true;
+      }
+      if (!allow_restore) {
+        return false;
+      }
+      std::error_code error;
+      std::filesystem::rename(from, to, error);
+      return !error;
+    },
+    [](const std::filesystem::path& path) {
+      std::error_code error;
+      const bool removed = std::filesystem::remove(path, error);
+      return removed && !error;
+    },
+    [replace_error] { return replace_error; },
+  };
+}
+
+void expect_original_names_failure_reconciled(std::uint32_t replace_error) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  const auto backup = directory.path("backup.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary, destination, backup, simulated_replace_ops(replace_error));
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(read_text(destination), "old-data");
+  EXPECT_FALSE(std::filesystem::exists(temporary));
+  EXPECT_FALSE(std::filesystem::exists(backup));
+}
+
+TEST(HTTPDownload, ReconcilesUnableToRemoveReplacedState) {
+  expect_original_names_failure_reconciled(ERROR_UNABLE_TO_REMOVE_REPLACED);
+}
+
+TEST(HTTPDownload, ReconcilesUnableToMoveReplacementState) {
+  expect_original_names_failure_reconciled(ERROR_UNABLE_TO_MOVE_REPLACEMENT);
+}
+
+TEST(HTTPDownload, RejectsEmptyBackupBeforeNativeReplacement) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+  bool replace_called = false;
+  auto ops = simulated_replace_ops(ERROR_UNABLE_TO_MOVE_REPLACEMENT);
+  ops.replace_file = [&replace_called](const std::filesystem::path&,
+                                      const std::filesystem::path&,
+                                      const std::filesystem::path&) {
+    replace_called = true;
+    return false;
+  };
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary, destination, {}, ops);
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_FALSE(replace_called);
+  EXPECT_EQ(read_text(destination), "old-data");
+  EXPECT_EQ(read_text(temporary), "new-data");
+}
+
+TEST(HTTPDownload, PreservesUnexpectedBackupOnNativeNameCollision) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  const auto backup = directory.path("backup.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+  write_text(backup, "unrelated-data");
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary, destination, backup, simulated_replace_ops(ERROR_ALREADY_EXISTS));
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(read_text(destination), "old-data");
+  EXPECT_FALSE(std::filesystem::exists(temporary));
+  EXPECT_EQ(read_text(backup), "unrelated-data");
+}
+
+TEST(HTTPDownload, RestoresBackupAfterUnableToMoveReplacement2) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  const auto backup = directory.path("backup.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+  bool move_called = false;
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary,
+    destination,
+    backup,
+    simulated_replace_ops(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, &move_called));
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_TRUE(move_called);
+  EXPECT_EQ(read_text(destination), "old-data");
+  EXPECT_FALSE(std::filesystem::exists(temporary));
+  EXPECT_FALSE(std::filesystem::exists(backup));
+}
+
+TEST(HTTPDownload, PreservesBothFilesWhenBackupRestoreFails) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  const auto backup = directory.path("backup.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+  bool move_called = false;
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary,
+    destination,
+    backup,
+    simulated_replace_ops(
+      ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, &move_called, false));
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_TRUE(move_called);
+  EXPECT_FALSE(std::filesystem::exists(destination));
+  EXPECT_EQ(read_text(temporary), "new-data");
+  EXPECT_EQ(read_text(backup), "old-data");
+}
+
+TEST(HTTPDownload, RemovesBackupAfterCompletedNativeReplacement) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  const auto backup = directory.path("backup.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+  auto ops = simulated_replace_ops(0);
+  bool flush_called = false;
+  ops.replace_file = [](const std::filesystem::path& destination,
+                        const std::filesystem::path& temporary,
+                        const std::filesystem::path& backup) {
+    std::filesystem::rename(destination, backup);
+    std::filesystem::rename(temporary, destination);
+    return true;
+  };
+  ops.flush_file = [&flush_called](const std::filesystem::path&) {
+    flush_called = true;
+    return true;
+  };
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary, destination, backup, ops);
+
+  EXPECT_TRUE(result.has_value()) << (result ? "" : result.error().message());
+  EXPECT_TRUE(flush_called);
+  EXPECT_EQ(read_text(destination), "new-data");
+  EXPECT_FALSE(std::filesystem::exists(temporary));
+  EXPECT_FALSE(std::filesystem::exists(backup));
+}
+
+TEST(HTTPDownload, PreservesBackupWhenInstalledDestinationFlushFails) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  const auto backup = directory.path("backup.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+  auto ops = simulated_replace_ops(0);
+  ops.replace_file = [](const std::filesystem::path& destination,
+                        const std::filesystem::path& temporary,
+                        const std::filesystem::path& backup) {
+    std::filesystem::rename(destination, backup);
+    std::filesystem::rename(temporary, destination);
+    return true;
+  };
+  ops.flush_file = [](const std::filesystem::path&) { return false; };
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary, destination, backup, ops);
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(read_text(destination), "new-data");
+  EXPECT_EQ(read_text(backup), "old-data");
+  EXPECT_FALSE(std::filesystem::exists(temporary));
+}
+
+TEST(HTTPDownload, ReportsBackupCleanupFailureAfterCompletedReplacement) {
+  ScopedTestDirectory directory;
+  const auto destination = directory.path("destination.bin");
+  const auto temporary = directory.path("temporary.bin");
+  const auto backup = directory.path("backup.bin");
+  write_text(destination, "old-data");
+  write_text(temporary, "new-data");
+  auto ops = simulated_replace_ops(0);
+  ops.replace_file = [](const std::filesystem::path& destination,
+                        const std::filesystem::path& temporary,
+                        const std::filesystem::path& backup) {
+    std::filesystem::rename(destination, backup);
+    std::filesystem::rename(temporary, destination);
+    return true;
+  };
+  ops.remove_file = [](const std::filesystem::path&) { return false; };
+
+  const auto result = ed2k::infra::detail::replace_existing_file_windows(
+    temporary, destination, backup, ops);
+
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(read_text(destination), "new-data");
+  EXPECT_EQ(read_text(backup), "old-data");
+  EXPECT_FALSE(std::filesystem::exists(temporary));
+}
+
 TEST(HTTPDownload, PreservesExistingDestinationWhenAtomicReplaceFails) {
   IoRuntime rt;
   ed2k::test::MockPeer server(rt.context());

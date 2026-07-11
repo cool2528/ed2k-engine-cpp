@@ -40,14 +40,63 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include "ed2k/util/error.hpp"
+#include "infra/http_download_internal.hpp"
 #include "infra/tls_trust_store.hpp"
 
 namespace ed2k::infra {
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
+
+#ifdef _WIN32
+namespace detail {
+
+tl::expected<void, std::error_code>
+replace_existing_file_windows(const std::filesystem::path& temporary,
+                              const std::filesystem::path& destination,
+                              const std::filesystem::path& backup,
+                              const WindowsNativeFileOps& ops) {
+  if (backup.empty()) {
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+  if (ops.replace_file(destination, temporary, backup)) {
+    if (!ops.flush_file(destination)) {
+      return tl::unexpected(make_error_code(errc::io_error));
+    }
+    if (!ops.remove_file(backup)) {
+      return tl::unexpected(make_error_code(errc::io_error));
+    }
+    return {};
+  }
+
+  const auto error = ops.last_error();
+  if (error == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
+    if (ops.move_file(backup, destination)) {
+      ops.remove_file(temporary);
+    }
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+
+  if (error == ERROR_UNABLE_TO_REMOVE_REPLACED ||
+      error == ERROR_UNABLE_TO_MOVE_REPLACEMENT) {
+    ops.remove_file(temporary);
+    return tl::unexpected(make_error_code(errc::io_error));
+  }
+
+  // Microsoft documents that all other failures retain both original names
+  // and do not create the backup, so only the replacement temp is disposable.
+  ops.remove_file(temporary);
+  return tl::unexpected(make_error_code(errc::io_error));
+}
+
+} // namespace detail
+#endif
 
 namespace {
 
@@ -367,14 +416,14 @@ bool redirect_status(unsigned status) {
 }
 
 std::filesystem::path unique_sibling_path(const std::filesystem::path& destination,
-                                          const std::filesystem::path& marker) {
+                                          const std::filesystem::path& suffix) {
   static std::atomic<std::uint64_t> next_id{0};
   const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
-  auto name = destination.filename();
-  name += marker;
+  std::filesystem::path name = ".ed2k-http-";
   name += std::to_string(timestamp);
   name += ".";
   name += std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
+  name += suffix;
   return destination.parent_path() / name;
 }
 
@@ -382,6 +431,56 @@ void remove_best_effort(const std::filesystem::path& path) {
   std::error_code ignored;
   std::filesystem::remove(path, ignored);
 }
+
+#ifdef _WIN32
+detail::WindowsNativeFileOps windows_native_file_ops() {
+  return {
+    [](const std::filesystem::path& destination,
+       const std::filesystem::path& temporary,
+       const std::filesystem::path& backup) {
+      return ReplaceFileW(destination.c_str(),
+                          temporary.c_str(),
+                          backup.empty() ? nullptr : backup.c_str(),
+                          0,
+                          nullptr,
+                          nullptr) != 0;
+    },
+    [](const std::filesystem::path& from, const std::filesystem::path& to) {
+      return MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+    },
+    [](const std::filesystem::path& path) { return DeleteFileW(path.c_str()) != 0; },
+    [] { return static_cast<std::uint32_t>(GetLastError()); },
+    [](const std::filesystem::path& path) {
+      const HANDLE handle = CreateFileW(path.c_str(),
+                                        GENERIC_WRITE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr,
+                                        OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL,
+                                        nullptr);
+      if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+      }
+      const bool flushed = FlushFileBuffers(handle) != 0;
+      const bool closed = CloseHandle(handle) != 0;
+      return flushed && closed;
+    },
+  };
+}
+#else
+void sync_parent_directory_best_effort(const std::filesystem::path& destination) {
+  const auto parent = destination.parent_path().empty()
+    ? std::filesystem::path(".")
+    : destination.parent_path();
+  const int descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+  if (descriptor < 0) {
+    return;
+  }
+  while (::fsync(descriptor) != 0 && errno == EINTR) {
+  }
+  ::close(descriptor);
+}
+#endif
 
 tl::expected<void, std::error_code>
 replace_destination(const std::filesystem::path& temporary,
@@ -391,31 +490,30 @@ replace_destination(const std::filesystem::path& temporary,
   if (attributes == INVALID_FILE_ATTRIBUTES) {
     const DWORD error = GetLastError();
     if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+      remove_best_effort(temporary);
       return tl::unexpected(make_error_code(errc::io_error));
     }
     if (MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH)) {
       return {};
     }
+    remove_best_effort(temporary);
     return tl::unexpected(make_error_code(errc::io_error));
   }
   if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    remove_best_effort(temporary);
     return tl::unexpected(make_error_code(errc::io_error));
   }
-  if (ReplaceFileW(destination.c_str(),
-                   temporary.c_str(),
-                   nullptr,
-                   REPLACEFILE_WRITE_THROUGH,
-                   nullptr,
-                   nullptr)) {
-    return {};
-  }
-  return tl::unexpected(make_error_code(errc::io_error));
+  const auto backup = unique_sibling_path(destination, ".bak");
+  return detail::replace_existing_file_windows(
+    temporary, destination, backup, windows_native_file_ops());
 #else
   std::error_code rename_error;
   std::filesystem::rename(temporary, destination, rename_error);
   if (!rename_error) {
+    sync_parent_directory_best_effort(destination);
     return {};
   }
+  remove_best_effort(temporary);
   return tl::unexpected(make_error_code(errc::io_error));
 #endif
 }
@@ -425,7 +523,7 @@ write_temporary_file(const std::filesystem::path& destination,
                      const std::vector<std::byte>& body) {
   constexpr std::size_t max_attempts = 100;
   for (std::size_t attempt = 0; attempt < max_attempts; ++attempt) {
-    const auto temporary = unique_sibling_path(destination, ".tmp.");
+    const auto temporary = unique_sibling_path(destination, ".tmp");
     std::FILE* stream = nullptr;
 #ifdef _WIN32
     const auto open_error = _wfopen_s(&stream, temporary.c_str(), L"wbx");
@@ -448,8 +546,21 @@ write_temporary_file(const std::filesystem::path& destination,
 
     const bool write_ok =
       body.empty() || std::fwrite(body.data(), 1, body.size(), stream) == body.size();
+    const bool flush_ok = write_ok && std::fflush(stream) == 0;
+#ifdef _WIN32
+    const bool sync_ok = flush_ok && _commit(_fileno(stream)) == 0;
+#else
+    bool sync_ok = flush_ok;
+    if (sync_ok) {
+      int sync_result = 0;
+      do {
+        sync_result = ::fsync(fileno(stream));
+      } while (sync_result != 0 && errno == EINTR);
+      sync_ok = sync_result == 0;
+    }
+#endif
     const bool close_ok = std::fclose(stream) == 0;
-    if (!write_ok || !close_ok) {
+    if (!write_ok || !flush_ok || !sync_ok || !close_ok) {
       remove_best_effort(temporary);
       return tl::unexpected(make_error_code(errc::io_error));
     }
@@ -467,7 +578,6 @@ write_and_replace(const std::filesystem::path& destination,
   }
   auto replaced = replace_destination(*temporary, destination);
   if (!replaced) {
-    remove_best_effort(*temporary);
     return tl::unexpected(replaced.error());
   }
   return {};
