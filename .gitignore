@@ -7,6 +7,7 @@ vcpkg_installed/
 
 # live-test / debug scratch (never tracked)
 .tmp_*
+/.tmp_live_amule_obfuscation/
 amule_*.cpp
 login.out
 server.met
