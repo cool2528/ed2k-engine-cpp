@@ -7,8 +7,9 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
 ### Changed
 - The install tree now exposes a versioned CMake package with the `ed2k::core` target and
-  dependency discovery for independent C++20 consumers; required Windows/Ubuntu Debug/Release CI
-  gates configure, build, test, install, and configure/build/run that consumer.
+  dependency discovery for independent C++20 consumers; the push/pull-request Windows/Ubuntu
+  Debug/Release CI matrix configures, builds, tests, installs, and configures/builds/runs that
+  consumer. Live tests remain opt-in and non-blocking.
 - `update-serverlist` now accepts HTTP and HTTPS, strictly verifies certificate chains and
   hostnames without an insecure bypass, follows at most five redirects under one overall
   deadline, rejects HTTPS-to-HTTP downgrade redirects, and atomically replaces the destination

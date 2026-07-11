@@ -26,9 +26,9 @@ consumer with `<install-prefix>` in `CMAKE_PREFIX_PATH`. The exported package do
 dependencies: `spdlog`, `tl-expected`, Zlib, OpenSSL, Boost.Asio, and Threads must also be
 discoverable through a vcpkg/toolchain setup or dependency prefixes.
 
-Package CI is required on Windows and Ubuntu, in Debug and Release. Each job performs configure,
-build, tests, install, and independent consumer configure/build/run. Live tests remain opt-in and
-are not required for these gates.
+Push and pull-request CI runs on Windows and Ubuntu, in Debug and Release. Each job performs
+configure, build, tests, install, and independent consumer configure/build/run. Live tests remain
+opt-in and do not block this CI matrix.
 
 ## `ed2k/net` — runtime & transport
 

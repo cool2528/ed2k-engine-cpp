@@ -91,9 +91,9 @@ cmake --build path/to/app/build
 Threads 也必须可被发现，通常可以使用同一个 vcpkg 工具链，或在
 `CMAKE_PREFIX_PATH` 中添加其他前缀。
 
-必需的 CI 门禁覆盖 Windows 和 Ubuntu 上的 Debug 与 Release。每个矩阵项都必须
+Push 和拉取请求 CI 覆盖 Windows 和 Ubuntu 上的 Debug 与 Release。每个矩阵项都会
 完成配置、构建、测试、安装，随后针对已安装包完成独立消费者的配置、构建与运行。
-实时测试仍为选择性启用，不属于必需的 CI 门禁。
+实时测试仍为选择性启用，不会阻塞该 CI 矩阵。
 
 ## CLI — `ed2k-tool`
 

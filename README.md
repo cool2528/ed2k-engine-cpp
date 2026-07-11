@@ -92,9 +92,9 @@ The exported package does not bundle its dependencies. `spdlog`, `tl-expected`, 
 Boost.Asio, and Threads must also be discoverable, typically through the same vcpkg toolchain or
 through additional entries in `CMAKE_PREFIX_PATH`.
 
-Required CI gates cover Windows and Ubuntu in both Debug and Release. Every matrix entry must
-configure, build, run tests, install, then configure, build, and run an independent consumer
-against the installed package. Live tests remain opt-in and are not required CI gates.
+Push and pull-request CI covers Windows and Ubuntu in both Debug and Release. Every matrix entry
+configures, builds, runs tests, installs, then configures, builds, and runs an independent
+consumer against the installed package. Live tests remain opt-in and do not block this CI matrix.
 
 ## CLI — `ed2k-tool`
 

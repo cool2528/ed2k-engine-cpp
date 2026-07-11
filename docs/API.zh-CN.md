@@ -26,9 +26,9 @@ target_link_libraries(app PRIVATE ed2k::core)
 `spdlog`、`tl-expected`、Zlib、OpenSSL、Boost.Asio 和 Threads 也必须能够通过
 vcpkg/工具链设置或依赖前缀被发现。
 
-包的必需 CI 门禁覆盖 Windows 和 Ubuntu 上的 Debug 与 Release。每个作业都会执行
+Push 和拉取请求 CI 会在 Windows 和 Ubuntu 上运行 Debug 与 Release。每个作业都会执行
 配置、构建、测试、安装，以及独立消费者的配置/构建/运行。实时测试仍为选择性启用，
-不是这些门禁的必需项。
+不会阻塞该 CI 矩阵。
 
 ## `ed2k/net` — 运行时与传输
 
