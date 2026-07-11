@@ -2,8 +2,8 @@
 
 [简体中文](USAGE.zh-CN.md)
 
-`ed2k-tool` is the command-line front-end for the ed2kengine library. All network commands use
-a 15s default per-operation timeout and auto-rotate through the servers in `server.met`.
+`ed2k-tool` is the command-line front-end for the ed2kengine library. Server-backed commands may
+rotate through entries in `server.met`; timeout behavior is command-specific.
 
 ## `hash <file> [--aich] [--red]`
 
@@ -27,9 +27,13 @@ Parse a `server.met` file and print the server table (IP, port, max users, name)
 Download a server list from an HTTP or HTTPS URL to `dest`. HTTPS verifies the certificate chain
 and URL hostname, with no option to disable verification. Redirects are limited to five hops and
 share one overall 15-second deadline with connection, TLS handshake, and response transfer.
+HTTP-to-HTTPS redirects are allowed, while HTTPS-to-HTTP downgrade redirects are rejected.
 
-The destination is replaced atomically only after the complete response has been written and
-durably synchronized; failures do not publish a partial body.
+Every successful 2xx response, including `206`, must provide `Content-Length`; chunked and
+connection-close-delimited bodies are unsupported. The destination is replaced atomically only
+after the complete declared response body has been written and file data flushed. Parent-directory
+crash durability is best-effort where directory fsync is unsupported; failures do not publish a
+partial body.
 
 ```bash
 ed2k-tool update-serverlist https://example.org/server.met server.met

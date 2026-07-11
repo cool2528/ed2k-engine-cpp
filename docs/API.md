@@ -30,8 +30,8 @@ class IoRuntime {
 ```cpp
 enum class HashVariant { Blue, Red };
 struct HashResult { FileHash file_hash; std::vector<PartHash> part_hashes; };
-HashResult hash_bytes(std::span<const std::byte>, HashVariant = HashVariant::Blue);
-tl::expected<HashResult, std::error_code> hash_file(const std::filesystem::path&, HashVariant = HashVariant::Blue);
+HashResult hash_bytes(std::span<const std::byte>, HashVariant = HashVariant::Red);
+tl::expected<HashResult, std::error_code> hash_file(const std::filesystem::path&, HashVariant = HashVariant::Red);
 tl::expected<AICHHash, std::error_code> aich_hash_file(const std::filesystem::path&);  // two-level Merkle root
 ```
 - `aich_hash_bytes` (in `aich_hasher.hpp`) builds the two-level per-part Merkle tree matching
@@ -191,8 +191,14 @@ class HTTPDownload {
 
 `fetch` accepts HTTP and HTTPS, verifies HTTPS certificate chains and hostnames, and exposes no
 insecure verification bypass. It follows at most five redirects using one overall deadline for
-all network and TLS operations. A successful response is written to a temporary file, durably
-synchronized, and atomically installed at `destination`; failures do not publish a partial body.
+all network and TLS operations. HTTP-to-HTTPS redirects are allowed; HTTPS-to-HTTP downgrades are
+rejected.
+
+Any 2xx status, including `206 Partial Content`, is accepted only when it includes a valid
+`Content-Length`. Chunked and connection-close-delimited bodies are unsupported. The complete
+declared response body is written to a temporary file and flushed before atomic installation at
+`destination`; parent-directory crash durability is best-effort on platforms where directory
+fsync is unsupported. Failures do not publish a partial body.
 
 ## `ed2k/share` — sharing, upload, credits
 

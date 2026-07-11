@@ -31,8 +31,9 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | Server UDP completeness / MuleInfo / compressed upload / aMule `.part.met` | ✅ |
 | Linux / CI | ✅ |
 
-Mock loopback tests: **444 pass, 9 skip** (live-gated only); live paths include server, Kad,
-download, upload, and cross-client resume validation. Version: `2.2.0`.
+Latest full Windows suite: **504/504 accounted for** (483 pass + 21 expected environment/live/CLI
+skips). Live paths include server, Kad, download, upload, and cross-client resume validation.
+Version: `2.2.0`.
 
 ## Build
 
@@ -108,8 +109,11 @@ ed2k-tool kad-find-sources nodes.dat "ed2k://|file|ubuntu.iso|...|/"
 
 `update-serverlist` accepts HTTP and HTTPS URLs. HTTPS always verifies the certificate chain and
 requested hostname; there is no insecure verification bypass. The command follows at most five
-redirects under one overall deadline, then atomically replaces the destination only after the
-complete response has been written and durably synchronized.
+redirects under one overall deadline. HTTP-to-HTTPS redirects are allowed; HTTPS-to-HTTP
+downgrades are rejected. Successful 2xx responses, including `206`, require `Content-Length`;
+chunked and connection-close-delimited bodies are unsupported. The destination is replaced
+atomically only after the complete declared response body is written and file data is flushed.
+Parent-directory crash durability is best-effort where directory fsync is unsupported.
 
 `download` without `--server` falls back to an internal fallback server list. Downloaded files
 are written via a sparse `PartFile` with per-part MD4 verification and `.part.met` resume —

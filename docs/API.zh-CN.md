@@ -30,8 +30,8 @@ class IoRuntime {
 ```cpp
 enum class HashVariant { Blue, Red };
 struct HashResult { FileHash file_hash; std::vector<PartHash> part_hashes; };
-HashResult hash_bytes(std::span<const std::byte>, HashVariant = HashVariant::Blue);
-tl::expected<HashResult, std::error_code> hash_file(const std::filesystem::path&, HashVariant = HashVariant::Blue);
+HashResult hash_bytes(std::span<const std::byte>, HashVariant = HashVariant::Red);
+tl::expected<HashResult, std::error_code> hash_file(const std::filesystem::path&, HashVariant = HashVariant::Red);
 tl::expected<AICHHash, std::error_code> aich_hash_file(const std::filesystem::path&);  // 两级 Merkle 根
 ```
 - `aich_hash_bytes`（位于 `aich_hasher.hpp`）构建与 aMule `SHAHashSet` 匹配、按分块组织的
@@ -191,8 +191,12 @@ class HTTPDownload {
 
 `fetch` 接受 HTTP 和 HTTPS，验证 HTTPS 证书链和主机名，且不提供不安全的
 验证绕过方式。它在同一个总体截止时间内最多跟随五次重定向，该截止时间覆盖
-所有网络和 TLS 操作。成功响应会先写入临时文件、持久同步，再以原子方式安装到
-`destination`；失败时不会公布不完整的响应体。
+所有网络和 TLS 操作。允许 HTTP 重定向到 HTTPS，但拒绝 HTTPS 降级重定向到 HTTP。
+
+任何 2xx 状态（包括 `206 Partial Content`）只有在包含有效 `Content-Length` 时才会被接受。
+不支持 chunked 和以连接关闭为结束标志的响应体。完整的已声明响应体会先写入临时文件并刷盘，
+再以原子方式安装到 `destination`；在不支持目录 fsync 的平台上，父目录的崩溃持久性
+仅为尽力保证。失败时不会公布不完整的响应体。
 
 ## `ed2k/share` — 共享、上传与积分
 

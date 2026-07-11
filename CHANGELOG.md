@@ -8,7 +8,9 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 ### Changed
 - `update-serverlist` now accepts HTTP and HTTPS, strictly verifies certificate chains and
   hostnames without an insecure bypass, follows at most five redirects under one overall
-  deadline, and atomically/durably replaces the destination only after a complete download.
+  deadline, rejects HTTPS-to-HTTP downgrade redirects, and atomically replaces the destination
+  only after the complete `Content-Length`-declared 2xx response body is written and file data is
+  flushed. Parent-directory crash durability is best-effort where directory fsync is unsupported.
 
 ## [2.2.0] — 2026-07-06
 
