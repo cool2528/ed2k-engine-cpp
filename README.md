@@ -57,6 +57,45 @@ ctest --preset linux              # run tests (live skip without ED2K_LIVE)
 # Artifacts: build/linux/ed2k-tool, ed2k_tests
 ```
 
+### Install and use from another CMake project
+
+Configure, build, and install ed2k to a prefix:
+
+```bash
+cmake --preset linux
+cmake --build --preset linux
+cmake --install build/linux --prefix "$PWD/build/stage"
+```
+
+An independent C++20 consumer can then use the installed package:
+
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(app LANGUAGES CXX)
+
+find_package(ed2k 2.2 CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_compile_features(app PRIVATE cxx_std_20)
+target_link_libraries(app PRIVATE ed2k::core)
+```
+
+Configure the consumer with the install prefix discoverable, for example:
+
+```bash
+cmake -S path/to/app -B path/to/app/build \
+  -DCMAKE_PREFIX_PATH="$PWD/build/stage"
+cmake --build path/to/app/build
+```
+
+The exported package does not bundle its dependencies. `spdlog`, `tl-expected`, Zlib, OpenSSL,
+Boost.Asio, and Threads must also be discoverable, typically through the same vcpkg toolchain or
+through additional entries in `CMAKE_PREFIX_PATH`.
+
+Required CI gates cover Windows and Ubuntu in both Debug and Release. Every matrix entry must
+configure, build, run tests, install, then configure, build, and run an independent consumer
+against the installed package. Live tests remain opt-in and are not required CI gates.
+
 ## CLI — `ed2k-tool`
 
 ```

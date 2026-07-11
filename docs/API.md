@@ -6,6 +6,30 @@ Public surface lives under `include/ed2k/`. All network APIs are Boost.Asio coro
 (`co_await`-able, `awaitable<T>`); the engine runs on a single `io_context` / single network
 thread (see README → Architecture). Error handling uses `tl::expected<T, std::error_code>`.
 
+## Consuming the installed CMake package
+
+Consumers require C++20 and link the exported `ed2k::core` target:
+
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(app LANGUAGES CXX)
+
+find_package(ed2k 2.2 CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_compile_features(app PRIVATE cxx_std_20)
+target_link_libraries(app PRIVATE ed2k::core)
+```
+
+After installing ed2k with `cmake --install <build-dir> --prefix <install-prefix>`, configure the
+consumer with `<install-prefix>` in `CMAKE_PREFIX_PATH`. The exported package does not bundle its
+dependencies: `spdlog`, `tl-expected`, Zlib, OpenSSL, Boost.Asio, and Threads must also be
+discoverable through a vcpkg/toolchain setup or dependency prefixes.
+
+Package CI is required on Windows and Ubuntu, in Debug and Release. Each job performs configure,
+build, tests, install, and independent consumer configure/build/run. Live tests remain opt-in and
+are not required for these gates.
+
 ## `ed2k/net` — runtime & transport
 
 ```cpp

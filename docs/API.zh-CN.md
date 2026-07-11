@@ -6,6 +6,30 @@
 （可使用 `co_await`，返回 `awaitable<T>`）；引擎运行在单个 `io_context` / 单个网络
 线程上（参见 README → 架构）。错误处理使用 `tl::expected<T, std::error_code>`。
 
+## 使用已安装的 CMake 包
+
+消费者需要 C++20，并链接导出的 `ed2k::core` 目标：
+
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(app LANGUAGES CXX)
+
+find_package(ed2k 2.2 CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_compile_features(app PRIVATE cxx_std_20)
+target_link_libraries(app PRIVATE ed2k::core)
+```
+
+使用 `cmake --install <build-dir> --prefix <install-prefix>` 安装 ed2k 后，请在配置消费者
+项目时将 `<install-prefix>` 加入 `CMAKE_PREFIX_PATH`。导出包不会捆绑其依赖：
+`spdlog`、`tl-expected`、Zlib、OpenSSL、Boost.Asio 和 Threads 也必须能够通过
+vcpkg/工具链设置或依赖前缀被发现。
+
+包的必需 CI 门禁覆盖 Windows 和 Ubuntu 上的 Debug 与 Release。每个作业都会执行
+配置、构建、测试、安装，以及独立消费者的配置/构建/运行。实时测试仍为选择性启用，
+不是这些门禁的必需项。
+
 ## `ed2k/net` — 运行时与传输
 
 ```cpp

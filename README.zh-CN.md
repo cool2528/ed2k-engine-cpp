@@ -56,6 +56,45 @@ ctest --preset linux              # 运行测试（未设置 ED2K_LIVE 时跳过
 # 构建产物：build/linux/ed2k-tool、ed2k_tests
 ```
 
+### 安装并供其他 CMake 项目使用
+
+先配置、构建 ed2k，并将其安装到指定前缀：
+
+```bash
+cmake --preset linux
+cmake --build --preset linux
+cmake --install build/linux --prefix "$PWD/build/stage"
+```
+
+独立的 C++20 消费者项目随后可以使用已安装的包：
+
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(app LANGUAGES CXX)
+
+find_package(ed2k 2.2 CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_compile_features(app PRIVATE cxx_std_20)
+target_link_libraries(app PRIVATE ed2k::core)
+```
+
+配置消费者项目时，需确保能找到该安装前缀，例如：
+
+```bash
+cmake -S path/to/app -B path/to/app/build \
+  -DCMAKE_PREFIX_PATH="$PWD/build/stage"
+cmake --build path/to/app/build
+```
+
+导出包不会捆绑其依赖。`spdlog`、`tl-expected`、Zlib、OpenSSL、Boost.Asio 和
+Threads 也必须可被发现，通常可以使用同一个 vcpkg 工具链，或在
+`CMAKE_PREFIX_PATH` 中添加其他前缀。
+
+必需的 CI 门禁覆盖 Windows 和 Ubuntu 上的 Debug 与 Release。每个矩阵项都必须
+完成配置、构建、测试、安装，随后针对已安装包完成独立消费者的配置、构建与运行。
+实时测试仍为选择性启用，不属于必需的 CI 门禁。
+
 ## CLI — `ed2k-tool`
 
 ```
