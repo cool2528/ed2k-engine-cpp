@@ -12,8 +12,12 @@ find_package(OpenSSL REQUIRED)
 find_package(boost_asio CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 add_library(ed2k_core)
+add_library(ed2k::core ALIAS ed2k_core)
+set_target_properties(ed2k_core PROPERTIES EXPORT_NAME core)
+target_compile_features(ed2k_core PUBLIC cxx_std_20)
 target_include_directories(ed2k_core
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -94,6 +98,16 @@ target_link_libraries(ed2k-tool PRIVATE ed2k_core)
 
 # --- 安装/打包 (R0-5) ---
 # 交付形态: 可嵌入静态库 ed2k_core + CLI ed2k-tool + 公共头 include/ed2k/
+set(ED2K_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/ed2k")
+configure_package_config_file(
+  cmake/ed2kConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/ed2kConfig.cmake
+  INSTALL_DESTINATION ${ED2K_INSTALL_CMAKEDIR})
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/ed2kConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion)
+
 install(TARGETS ed2k_core ed2k-tool
   EXPORT ed2kTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -106,7 +120,11 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ed2k
 install(EXPORT ed2kTargets
   FILE ed2kTargets.cmake
   NAMESPACE ed2k::
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ed2k)
+  DESTINATION ${ED2K_INSTALL_CMAKEDIR})
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/ed2kConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/ed2kConfigVersion.cmake
+  DESTINATION ${ED2K_INSTALL_CMAKEDIR})
 
 if(ED2K_BUILD_TESTS)
   enable_testing()

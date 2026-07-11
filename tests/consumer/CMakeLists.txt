@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(ed2k_consumer LANGUAGES CXX)
 
-find_package(ed2k CONFIG REQUIRED)
+find_package(ed2k 2.2 CONFIG REQUIRED)
 
 add_executable(ed2k_consumer main.cpp)
 target_compile_features(ed2k_consumer PRIVATE cxx_std_20)
