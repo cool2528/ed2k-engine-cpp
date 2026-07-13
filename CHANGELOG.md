@@ -6,6 +6,9 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 ## Unreleased
 
 ### Changed
+- The managed aMule upload harness now orders startup as daemon readiness, upload-listener
+  readiness, then `amulecmd Add` source-link injection. Windows port preflight uses a local bind
+  probe instead of the potentially blocking `Get-NetTCPConnection` cmdlet.
 - The install tree now exposes a versioned CMake package with the `ed2k::core` target and
   dependency discovery for independent C++20 consumers; the push/pull-request Windows/Ubuntu
   Debug/Release CI matrix configures, builds, tests, installs, and configures/builds/runs that
@@ -15,6 +18,15 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
   deadline, rejects HTTPS-to-HTTP downgrade redirects, and atomically replaces the destination
   only after the complete `Content-Length`-declared 2xx response body is written and file data is
   flushed. Parent-directory crash durability is best-effort where directory fsync is unsupported.
+
+### Tests
+- 2026-07-12 local cross-platform acceptance: Windows Debug/Release each 534 total, 519 pass +
+  15 live skip, 0 fail; Linux Debug/Release each 523 total, 508 pass + 15 live skip, 0 fail.
+  Install and independent consumer smokes passed in all four configurations.
+- Managed aMule 2.3.3 required obfuscation passed 5/5. Optional obfuscation passed 4/4, while its
+  real upload evidence remains failed: the EC `Add` command was accepted but aMule retained zero
+  sources and never connected. The bounded public-server probe also found no reachable endpoint
+  in five attempts; neither failure is represented as successful live evidence.
 
 ## [2.2.0] — 2026-07-06
 

@@ -30,6 +30,10 @@ Push and pull-request CI runs on Windows and Ubuntu, in Debug and Release. Each 
 configure, build, tests, install, and independent consumer configure/build/run. Live tests remain
 opt-in and do not block this CI matrix.
 
+The 2026-07-12 local package acceptance repeated those four build/test/install/consumer paths:
+Windows Debug/Release were 519 pass + 15 live skip out of 534, and Linux Debug/Release were
+508 pass + 15 live skip out of 523, with all consumer executables returning success.
+
 ## `ed2k/net` — runtime & transport
 
 ```cpp

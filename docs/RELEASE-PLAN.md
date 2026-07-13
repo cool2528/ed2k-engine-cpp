@@ -9,7 +9,7 @@
 > - 新增/变更阶段范围，先在【9. 变更日志】记录再改正文。
 > - 本文档与 `docs/superpowers/specs|plans/` 的关系：那些是**单阶段**的设计/实现计划（已冻结的历史快照）；本文是**跨阶段、滚动更新**的总进度表。
 >
-> **最近更新**：2026-07-06 — v2.2.0 已发布：版本元数据同步到 `2.2.0`，Windows/WSL full gates 均 453 total、444 pass + 9 live skip、0 fail，CI run `28765725134` 双平台绿；已推送 `main`，打 annotated tag `v2.2.0` 并创建 GitHub Release。
+> **最近更新**：2026-07-12 — Task 6/7 收口：Windows Debug/Release 各 534 total、519 pass + 15 live skip；Linux Debug/Release 各 523 total、508 pass + 15 live skip；四组 install/consumer smoke 全绿。aMule required 5/5 绿；optional obfuscation 4/4 绿但 aMule EC Add 后仍为 0 source，上传 live gate 明确未通过。公网 probe 在 5 个有界端点尝试后无可达服务器。
 
 ---
 
@@ -49,7 +49,7 @@
 | **P1 地基** | L0：crypto/core/codec/hash/link/metfile/util + CLI hash/serverlist/parse | 纯本地单测全覆盖 | ✅ 已完成 | `215f37f` 起；`md4/sha1/ed2k_hasher/aich_hasher/server_met/known_part_met/tag/byte_io/link` 全套测试 |
 | **P2 网络核** | L1：Asio 协程运行时、TCP 分帧收发、超时/取消、zlib inflate | 与 mock 回环测试 | ✅ 已完成 | `f303c7d` 设计；`net/{runtime,framing,connection,packet,inflate,udp_*}` |
 | **P3 服务器协议** | L2：TCP 登录/HighID-LowID/搜索/取源/回调 + UDP 全局搜索/取源 | 首次上线连服务器搜文件拿源（mock） | ✅ 已完成 | P3a `d1e8c37` + P3b `57c9ced`；`server/{connection,messages,search_query,udp_*}` |
-| **P4 下载引擎** | L3：C2C 握手、hashset 交换、块下载、part-MD4 校验、AICH 恢复、多源调度、断点续传 | ⭐ 首次端到端下载完整文件（MVP） | 🚧 部分完成 | 见 §3 |
+| **P4 下载引擎** | L3：C2C 握手、hashset 交换、块下载、part-MD4 校验、AICH 恢复、多源调度、断点续传 | ⭐ 首次端到端下载完整文件（MVP） | ✅ 完成 | P4a/P4b/P4c 全部完成；真实 aMule 下载与跨客户端续传已有 live 证据 |
 | **P5 上传/分享/信用** | L4：共享索引(known.met/known2.met)、OP_OFFERFILES 发布、上传会话、上传队列+限速、ClientCredits、SourceExchange v2、评论/评分 | 有来有往的节点 | ✅ 完成 | M1/S1 ✅；M2/S2-S4 ✅；M3/S5-S7 ✅；M4/S8 ✅；P5-8 live ✅ |
 | **P6 KAD** | L5：Kad2 路由表(k-bucket)、bootstrap(nodes.dat)、Kad2 UDP、搜索/取源/发布、buddies、notes | 无服务器找源下载 | ✅ 完成 | P6-7 live ✅；spec/plan 已起草 |
 | **P7 混淆加密** | L6：MD5/RC4 自带、TCP/UDP/服务器混淆、握手协商+fallback | 兼容开启 obfuscation 的网络 | ✅ 完成 | P7-1..P7-5 ✅ |
@@ -69,18 +69,18 @@
 
 ---
 
-## 3. 当前状态快照（2026-07-06）
+## 3. 当前状态快照（2026-07-12）
 
 ### 3.1 构建 & 测试
 
 ```
-cmake --build build/default --config Debug --target ed2k_tests ed2k-tool -- /m  → 成功
-ctest --test-dir build/default -C Debug -j8 --output-on-failure                 → 453 total, 444 pass + 9 live skip, 0 fail
-wsl -u root -- bash -lc 'cd /mnt/d/workspace/ed2k-engine-cpp && cmake --build --preset linux && ctest --preset linux'
-                                                                              → 453 total, 444 pass + 9 live skip, 0 fail
+Windows Debug   → 534 total, 519 pass + 15 live skip, 0 fail; install/consumer 绿
+Windows Release → 534 total, 519 pass + 15 live skip, 0 fail; install/consumer 绿
+Linux Debug     → 523 total, 508 pass + 15 live skip, 0 fail; install/consumer 绿
+Linux Release   → 523 total, 508 pass + 15 live skip, 0 fail; install/consumer 绿
 ```
 
-> 默认 mock 回环全绿；9 个 live-gated 测试覆盖真实服务器、Kad、下载、上传/SX2 与跨客户端 `.part.met` handoff。live 证据详见 §9 P5-8、P6-7、P9-7 与 R0-1 记录。公网 HighID 源会过滤云 IP，重复验证以本地 aMule 2.3.3 peer 为可靠源。
+> 默认 mock 回环全绿；15 个 live-gated 测试默认 skip。2026-07-12 managed aMule required 模式 5/5 通过。optional 模式的混淆断言 4/4 通过，但上传进程等待 120 秒超时；`amulecmd Add` 返回成功后 aMule 仍报告 `Total sources: 0`，因此 Task 7 的 optional upload hard gate 仍为 ⛔。公网 probe 的 server-list 获取失败且 5 个静态 fallback 均不可达，作为有界环境证据记录，不冒充成功。
 
 ### 3.2 已实现能力清单
 

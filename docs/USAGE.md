@@ -169,3 +169,16 @@ ed2k-tool download "ed2k://|file|ubuntu.iso|...|/" --out:ubuntu.iso --server:ser
 - `ED2K_KAD_NODES=PATH` — live-test Kad bootstrap seed file for `LiveKad.*`.
 - `ED2K_UPLOAD_FILE=PATH` and optional `ED2K_UPLOAD_PORT=n` — live upload-session harness: the test
   listens and waits for a real peer to request the file.
+
+The managed local aMule harness is run from PowerShell:
+
+```powershell
+./scripts/live/setup-amule-obfuscation.ps1
+./scripts/live/run-amule-obfuscation.ps1 -Mode required -TestExe build/default/Debug/ed2k_tests.exe
+./scripts/live/run-amule-obfuscation.ps1 -Mode optional -TestExe build/linux/ed2k_tests
+```
+
+It uses an isolated aMule home and enforces `daemon ready -> listener ready -> amulecmd Add`.
+Required mode is green as of 2026-07-12. Optional obfuscation assertions are green, but the
+separate aMule-initiated upload assertion is still a failed live gate because aMule 2.3.3 accepts
+the EC Add command without retaining the supplied source; inspect the retained optional logs.

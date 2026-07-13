@@ -31,8 +31,9 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | Server UDP completeness / MuleInfo / compressed upload / aMule `.part.met` | ✅ |
 | Linux / CI | ✅ |
 
-Latest full Windows suite: **504/504 accounted for** (483 pass + 21 expected environment/live/CLI
-skips). Live paths include server, Kad, download, upload, and cross-client resume validation.
+Latest local acceptance (2026-07-12): Windows Debug and Release each account for **534/534**
+(519 pass + 15 live-gated skips); Linux Debug and Release each account for **523/523**
+(508 pass + 15 live-gated skips). All four install and independent consumer smokes pass.
 Version: `2.2.0`.
 
 ## Build
@@ -210,12 +211,24 @@ ED2K_LIVE=1 ED2K_SERVER=ip:port ED2K_LINK="ed2k://|file|...|/" \
 ED2K_LIVE=1 ED2K_LINK="ed2k://|file|...|/" ED2K_SOURCE=ip:port \
   ED2K_EXPECT_MD4=<hex> ./build/default/Debug/ed2k_tests.exe \
     --gtest_filter=LiveDownload.LocalPeerCompletes
+
+# Managed local aMule 2.3.3 obfuscation harness
+./scripts/live/setup-amule-obfuscation.ps1
+./scripts/live/run-amule-obfuscation.ps1 -Mode required -TestExe build/default/Debug/ed2k_tests.exe
+./scripts/live/run-amule-obfuscation.ps1 -Mode optional -TestExe build/linux/ed2k_tests
 ```
 
 **Live validation ✅**: server login/search/source lookup, Kad bootstrap/search, SX2 upload,
 local-peer download, and bidirectional aMule `.part.met` handoff have been validated against
 real infrastructure or a local aMule 2.3.3 peer. Public HighID peers often filter cloud IPs, so
 a local aMule instance remains the reliable peer source for repeatable live tests.
+
+The managed harness now enforces `daemon ready -> upload listener ready -> amulecmd Add source
+link`. The 2026-07-12 required mode passed all 5 focused tests. Optional obfuscation itself passed
+4/4, but the upload evidence remains an explicit failed gate: aMule 2.3.3 accepted the EC `Add`
+command yet retained `Total sources: 0` and never opened the upload connection. The logs are kept
+under `.tmp_live_amule_obfuscation/optional/logs/`; this result is not reported as a green upload
+interop run.
 
 ## Project layout
 
