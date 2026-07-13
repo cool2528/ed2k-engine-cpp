@@ -50,8 +50,14 @@ function Read-EnvFile([string]$Path) {
 }
 
 function Test-TcpPortFree([int]$Port) {
-    $listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
-    if ($listener) { return $false }
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, $Port)
+    try {
+        $listener.Start()
+    } catch [Net.Sockets.SocketException] {
+        return $false
+    } finally {
+        $listener.Stop()
+    }
     $probe = Invoke-WslText "! ss -ltnH | awk '{print `$4}' | grep -Eq '(^|:)$Port`$'" -AllowFailure
     return $probe.ExitCode -eq 0
 }

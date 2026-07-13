@@ -19,5 +19,10 @@ if (-not ($daemonReady -lt $listenerReady -and $listenerReady -lt $addLink)) {
 if ($source -match '\$daemonLinkArgument|amuled[^\r\n]*\$uploadLink') {
     throw 'source link must not be passed on the amuled command line'
 }
-
+if ($source -match 'Get-NetTCPConnection') {
+    throw 'TCP port preflight must not depend on the potentially blocking Get-NetTCPConnection cmdlet'
+}
+if ($source -notmatch 'TcpListener.*IPAddress.*Any') {
+    throw 'TCP port preflight must use a bounded local bind probe'
+}
 Write-Output 'aMule harness ordering test passed'
