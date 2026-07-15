@@ -88,8 +88,8 @@ Set-Content -LiteralPath (Join-Path $stateRoot 'upload.link') -Value $upload.Lin
 
 $template = Get-Content -LiteralPath $templatePath -Raw
 $modes = @(
-    @{ Name = 'required'; Tcp = 24662; Udp = 24672; Ec = 24712; Upload = 24862; Required = 1 },
-    @{ Name = 'optional'; Tcp = 25662; Udp = 25672; Ec = 25712; Upload = 25862; Required = 0 }
+    @{ Name = 'required'; Tcp = 24662; Udp = 24672; Ec = 24712; Upload = 24862; Stub = 24962; Required = 1 },
+    @{ Name = 'optional'; Tcp = 25662; Udp = 25672; Ec = 25712; Upload = 25862; Stub = 25962; Required = 0 }
 )
 $identity = [byte[]](0x14, 0x4d, 0x75, 0x6c, 0x65, 0x2d, 0x0e, 0x62, 0x66,
                      0x75, 0x73, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e)
@@ -117,7 +117,7 @@ foreach ($mode in $modes) {
 
     @(
         "MODE=$($mode.Name)", "TCP_PORT=$($mode.Tcp)", "UDP_PORT=$($mode.Udp)",
-        "EC_PORT=$($mode.Ec)", "UPLOAD_PORT=$($mode.Upload)"
+        "EC_PORT=$($mode.Ec)", "UPLOAD_PORT=$($mode.Upload)", "STUB_PORT=$($mode.Stub)"
     ) | Set-Content -LiteralPath (Join-Path $modeRoot 'ports.env')
 }
 

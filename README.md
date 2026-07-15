@@ -31,9 +31,11 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | Server UDP completeness / MuleInfo / compressed upload / aMule `.part.met` | ✅ |
 | Linux / CI | ✅ |
 
-Latest local acceptance (2026-07-12): Windows Debug and Release each account for **534/534**
-(519 pass + 15 live-gated skips); Linux Debug and Release each account for **523/523**
-(508 pass + 15 live-gated skips). All four install and independent consumer smokes pass.
+Latest local acceptance (2026-07-15): Windows Debug **535/535** (519 pass + 16 live-gated
+skips); Linux Debug **524/524** (508 pass + 16 live-gated skips); install and independent
+consumer smokes green in all four Debug/Release configurations (2026-07-12). The managed
+aMule 2.3.3 live harness passes both modes, including real upload evidence: aMule downloads
+the complete fixture from the engine's upload session.
 Version: `2.2.0`.
 
 ## Build

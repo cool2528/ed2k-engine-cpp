@@ -2,16 +2,31 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
+#include <boost/asio/signal_set.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/write.hpp>
+#include "ed2k/codec/byte_io.hpp"
 #include "ed2k/hash/aich_hasher.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
 #include "ed2k/link/ed2k_link.hpp"
+#include "ed2k/net/framing.hpp"
+#include "ed2k/net/packet.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/peer/inbound_listener.hpp"
+#include "ed2k/server/opcodes.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/share/upload_session.hpp"
 #include "ed2k/share/upload_throttler.hpp"
@@ -170,4 +185,57 @@ TEST(LiveUpload, AcceptsLocalPeerUploadSession){
     EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
     co_return;
   });
+}
+
+// harness 工具而非断言测试：aMule 仅在 theApp->IsConnected()（已连 eD2k 服务器或 Kad）时才对下载源
+// 调用 AskForDownload（aMule 2.3.3 PartFile.cpp Process 的 DS_NONE 分支门控），隔离 harness 里注入的
+// 上传源因此永远不被连接。本 stub 应答 LOGINREQUEST→IDCHANGE(HighID) 并保持连接，翻转该门控；
+// 其余帧（OFFERFILES/GETSOURCES 等）静默忽略。生命周期由 harness 以 SIGTERM 结束。
+TEST(LiveServerStub, ServesAmuleLoginUntilTerminated){
+  const char* port_s = std::getenv("ED2K_STUB_PORT");
+  if(!port_s || !*port_s) GTEST_SKIP() << "set ED2K_STUB_PORT to serve the local eD2k login stub";
+  const auto listen_port = static_cast<std::uint16_t>(std::stoi(port_s));
+  using tcp = asio::ip::tcp;
+
+  asio::io_context ctx;
+  tcp::acceptor acceptor(ctx, tcp::endpoint(asio::ip::address_v4::any(), listen_port));
+  asio::signal_set signals(ctx, SIGINT, SIGTERM);
+  signals.async_wait([&](const boost::system::error_code&, int){ ctx.stop(); });
+  asio::steady_timer bound(ctx, std::chrono::minutes(15));
+  bound.async_wait([&](const boost::system::error_code& e){ if(!e) ctx.stop(); });
+  std::printf("  ED2K_STUB_LISTEN=%u\n", acceptor.local_endpoint().port());
+  std::fflush(stdout);
+
+  asio::co_spawn(ctx, [&]() -> asio::awaitable<void>{
+    for(;;){
+      auto [ec, sock] = co_await acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      asio::co_spawn(ctx, [s = std::move(sock)]() mutable -> asio::awaitable<void>{
+        for(;;){
+          std::array<std::byte,5> hdr;
+          auto [e1, n1] = co_await asio::async_read(s, asio::buffer(hdr), asio::as_tuple(asio::use_awaitable));
+          (void)n1; if(e1) co_return;
+          auto h = net::parse_header(hdr);
+          if(!h || h->size == 0) co_return;
+          std::vector<std::byte> body(h->size);
+          auto [e2, n2] = co_await asio::async_read(s, asio::buffer(body), asio::as_tuple(asio::use_awaitable));
+          (void)n2; if(e2) co_return;
+          if(std::to_integer<std::uint8_t>(body[0]) != server::op::LOGINREQUEST) continue;
+          // HighID = 客户端自身 IPv4 的 aMule LE 序（首段在低字节）；回 [id:u32][tcpflags:u32=0]
+          const std::uint32_t v4 = s.remote_endpoint().address().to_v4().to_uint();
+          const std::uint32_t id = ((v4 & 0x000000FFu) << 24) | ((v4 & 0x0000FF00u) << 8) |
+                                   ((v4 & 0x00FF0000u) >> 8)  | ((v4 & 0xFF000000u) >> 24);
+          codec::ByteWriter w; w.u32(id); w.u32(0);
+          net::Packet p; p.protocol = net::proto::eDonkey; p.opcode = server::op::IDCHANGE;
+          auto payload = w.take();
+          p.payload.assign(payload.begin(), payload.end());
+          auto frame = net::encode_frame(p);
+          auto [e3, n3] = co_await asio::async_write(s, asio::buffer(frame.data(), frame.size()),
+                                                     asio::as_tuple(asio::use_awaitable));
+          (void)n3; if(e3) co_return;
+        }
+      }, asio::detached);
+    }
+  }, asio::detached);
+  ctx.run();
 }

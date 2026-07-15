@@ -18,6 +18,8 @@ $daemonPid = $null
 $wslProcess = $null
 $uploadProcess = $null
 $uploadPid = $null
+$stubProcess = $null
+$stubPid = $null
 $succeeded = $false
 $testInWsl = $false
 $linuxConfig = $null
@@ -68,7 +70,7 @@ function Test-UdpPortFree([int]$Port) {
 }
 
 function Invoke-AmuleCmd([string]$Command, [switch]$AllowFailure) {
-    $cmd = "/usr/bin/amulecmd -h 127.0.0.1 -p $ecPort -P $(Bash-Quote $ecPassword) -c $(Bash-Quote $Command)"
+    $cmd = "LC_ALL=C /usr/bin/amulecmd -h 127.0.0.1 -p $ecPort -P $(Bash-Quote $ecPassword) -c $(Bash-Quote $Command)"
     $result = Invoke-WslText $cmd -AllowFailure:$AllowFailure
     Add-Content -LiteralPath (Join-Path $logsDir 'amulecmd.log') -Value "> $Command`n$($result.Text)"
     return $result
@@ -110,7 +112,9 @@ $tcpPort = [int]$ports.TCP_PORT
 $udpPort = [int]$ports.UDP_PORT
 $ecPort = [int]$ports.EC_PORT
 $uploadPort = [int]$ports.UPLOAD_PORT
-foreach ($port in @($tcpPort, $ecPort, $uploadPort)) {
+if (-not $ports.STUB_PORT) { Fail-Setup 'ports.env lacks STUB_PORT (stale generated state).' }
+$stubPort = [int]$ports.STUB_PORT
+foreach ($port in @($tcpPort, $ecPort, $uploadPort, $stubPort)) {
     if (-not (Test-TcpPortFree $port)) { throw "TCP port $port is already in use; refusing to disturb an existing service." }
 }
 if (-not (Test-UdpPortFree $udpPort)) { throw "UDP port $udpPort is already in use; refusing to disturb an existing service." }
@@ -138,13 +142,52 @@ if ($Mode -eq 'optional') {
 
 try {
   $linuxConfig = Convert-ToWslPath $configDir
-  $peerIp = (Invoke-WslText "hostname -I | awk '{print `$1}'").Text
-  if ($peerIp -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Could not determine the WSL peer address: '$peerIp'" }
+  # eth0's global address is the only one both amuled and the upload listener (both inside
+  # WSL) can reach; the first field of the hostname address list is unstable and has picked
+  # the Windows-side vEthernet gateway, which silently strands aMule's injected upload source.
+  $peerIp = (Invoke-WslText "ip -4 -o addr show dev eth0 scope global | head -n1 | awk '{print `$4}' | cut -d/ -f1").Text
+  if ($peerIp -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "Could not determine the WSL eth0 address: '$peerIp'" }
   $uploadLink = $null
   if ($Mode -eq 'optional') {
       $uploadLink = (Get-Content -LiteralPath (Join-Path $stateRoot 'upload.link') -Raw).Trim()
       $uploadLink += "|sources,$peerIp`:$uploadPort|/"
   }
+  if ($Mode -eq 'optional') {
+      # aMule only asks download sources for a connection while theApp->IsConnected() is true
+      # (aMule 2.3.3 PartFile.cpp), so serve a minimal local eD2k login stub for it to join.
+      $stubOut = Join-Path $logsDir 'server-stub.stdout.log'
+      $stubErr = Join-Path $logsDir 'server-stub.stderr.log'
+      $stubLauncherPath = Join-Path $logsDir 'launch-server-stub.sh'
+      $linuxStubPidFile = Convert-ToWslPath (Join-Path $logsDir 'server-stub.pid')
+      $stubLauncher = @(
+          '#!/bin/bash',
+          "echo `$`$ > $(Bash-Quote $linuxStubPidFile)",
+          "export ED2K_STUB_PORT=$(Bash-Quote ([string]$stubPort))",
+          "exec $(Bash-Quote $linuxTestExe) --gtest_filter=LiveServerStub.ServesAmuleLoginUntilTerminated"
+      ) -join "`n"
+      Set-Content -LiteralPath $stubLauncherPath -Value ($stubLauncher + "`n") -NoNewline
+      $linuxStubLauncher = Convert-ToWslPath $stubLauncherPath
+      $stubProcess = Start-Process -FilePath 'wsl.exe' -ArgumentList @('-e', 'bash', $linuxStubLauncher) `
+          -WindowStyle Hidden -PassThru -RedirectStandardOutput $stubOut -RedirectStandardError $stubErr
+      $stubPidPath = Join-Path $logsDir 'server-stub.pid'
+      $stubPidDeadline = [DateTime]::UtcNow.AddSeconds(10)
+      while (-not (Test-Path -LiteralPath $stubPidPath) -and [DateTime]::UtcNow -lt $stubPidDeadline) {
+          Start-Sleep -Milliseconds 100
+      }
+      if (-not (Test-Path -LiteralPath $stubPidPath)) { throw 'The eD2k login stub did not publish its Linux PID within 10 seconds.' }
+      $stubPid = [int](Get-Content -LiteralPath $stubPidPath -Raw).Trim()
+      $stubReady = $false
+      $stubReadyDeadline = [DateTime]::UtcNow.AddSeconds(15)
+      while ([DateTime]::UtcNow -lt $stubReadyDeadline) {
+          if ($stubProcess.HasExited) { throw 'The eD2k login stub exited before its listener became ready.' }
+          $probe = Invoke-WslText "ss -ltnH | awk '{print `$4}' | grep -Eq '(^|:)$stubPort`$'" -AllowFailure
+          if ($probe.ExitCode -eq 0) { $stubReady = $true; break }
+          Start-Sleep -Milliseconds 100
+      }
+      if (-not $stubReady) { throw "eD2k login stub readiness timed out after 15 seconds on port $stubPort." }
+      Write-Host "eD2k login stub ready on port $stubPort."
+  }
+
   $linuxPidFile = Convert-ToWslPath (Join-Path $logsDir 'amuled.pid')
   $launcherPath = Join-Path $logsDir 'launch-amuled.sh'
   $launcher = @(
@@ -234,11 +277,49 @@ try {
         }
         Write-Host "LiveUpload listener ready on port $uploadPort."
 
+        $serverAdd = Invoke-AmuleCmd "Add ed2k://|server|$peerIp|$stubPort|/" -AllowFailure
+        if ($serverAdd.ExitCode -ne 0) {
+            throw "amulecmd could not add the eD2k login stub server: $($serverAdd.Text)"
+        }
+        $serverConnect = Invoke-AmuleCmd "Connect $peerIp`:$stubPort" -AllowFailure
+        if ($serverConnect.ExitCode -ne 0) {
+            throw "amulecmd could not request the stub server connection: $($serverConnect.Text)"
+        }
+        $ed2kConnected = $false
+        $connectDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ([DateTime]::UtcNow -lt $connectDeadline) {
+            $status = Invoke-AmuleCmd 'status' -AllowFailure
+            if ($status.ExitCode -eq 0 -and $status.Text -match 'eD2k:\s*Connected') { $ed2kConnected = $true; break }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ed2kConnected) {
+            throw "aMule did not reach the connected eD2k state against the stub server $peerIp`:$stubPort within 20 seconds."
+        }
+        Write-Host 'aMule connected to the local eD2k login stub.'
+
         $addResult = Invoke-AmuleCmd ('Add ' + $uploadLink) -AllowFailure
         if ($addResult.ExitCode -ne 0) {
             throw "amulecmd Add failed after listener readiness: $($addResult.Text)"
         }
         Write-Host 'aMule source link injected through amulecmd Add.'
+
+        # `Add` succeeding only means the link parsed; verify aMule actually registered the
+        # injected source instead of letting the upload evidence burn its full timeout.
+        $sourceVisible = $false
+        $sourceDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while ([DateTime]::UtcNow -lt $sourceDeadline) {
+            $status = Invoke-AmuleCmd 'status' -AllowFailure
+            if ($status.ExitCode -eq 0 -and $status.Text -match 'Total sources:\s*(\d+)' -and [int]$matches[1] -gt 0) {
+                $sourceVisible = $true
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $sourceVisible) {
+            Invoke-AmuleCmd 'show dl' -AllowFailure | Out-Null
+            throw "aMule did not register the injected upload source $peerIp`:$uploadPort within 30 seconds; see amulecmd.log."
+        }
+        Write-Host "aMule registered the upload source $peerIp`:$uploadPort."
     }
 
     $fixtureLink = (Get-Content -LiteralPath (Join-Path $stateRoot 'fixture.link') -Raw).Trim()
@@ -332,6 +413,28 @@ try {
         }
     }
     if ($uploadProcess -and -not $uploadProcess.HasExited) { $uploadProcess.WaitForExit(5000) | Out-Null }
-    Remove-Item Env:ED2K_UPLOAD_FILE, Env:ED2K_UPLOAD_PORT -ErrorAction SilentlyContinue
+    if ($stubPid) {
+        $stubAlive = Invoke-WslText "kill -0 $stubPid 2>/dev/null" -AllowFailure
+        if ($stubAlive.ExitCode -eq 0) {
+            $stubIdentity = Invoke-WslText "tr '\0' ' ' </proc/$stubPid/cmdline 2>/dev/null" -AllowFailure
+            if ($stubIdentity.ExitCode -eq 0 -and $stubIdentity.Text -match 'ed2k_tests' -and
+                $stubIdentity.Text -match 'LiveServerStub.ServesAmuleLoginUntilTerminated') {
+                Invoke-WslText "kill -TERM $stubPid" -AllowFailure | Out-Null
+                $stubStopDeadline = [DateTime]::UtcNow.AddSeconds(5)
+                do {
+                    $stubAlive = Invoke-WslText "kill -0 $stubPid 2>/dev/null" -AllowFailure
+                    if ($stubAlive.ExitCode -ne 0) { break }
+                    Start-Sleep -Milliseconds 100
+                } while ([DateTime]::UtcNow -lt $stubStopDeadline)
+                if ($stubAlive.ExitCode -eq 0) { Write-Warning "Login stub PID $stubPid did not exit after SIGTERM." }
+            } else {
+                Write-Warning "PID $stubPid no longer identifies this harness's login stub; it was not signalled."
+            }
+        }
+    }
+    if ($stubProcess -and -not $stubProcess.HasExited) { $stubProcess.WaitForExit(5000) | Out-Null }
+    try { Remove-Item Env:ED2K_UPLOAD_FILE, Env:ED2K_UPLOAD_PORT -ErrorAction Stop } catch {}
     if (-not $succeeded) { Write-Warning "Harness failed; logs retained at $logsDir" }
 }
+# Expected-failure WSL probes leave a stale nonzero $LASTEXITCODE; report success explicitly.
+exit 0

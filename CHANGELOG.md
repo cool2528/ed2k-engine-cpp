@@ -5,6 +5,19 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
 ## Unreleased
 
+### Fixed
+- The managed aMule optional-mode upload live gate now passes. Two root causes were fixed:
+  the harness derived the upload-source address from the first `hostname -I` field, which can
+  resolve to the Windows-side vEthernet gateway that is unreachable from inside WSL (now derived
+  deterministically from the WSL eth0 global address); and aMule 2.3.3 only asks download sources
+  for a connection while `theApp->IsConnected()` is true (`PartFile.cpp`), so a fully isolated
+  aMule registered the injected source but never connected. The harness now serves a minimal
+  local eD2k login stub (`LiveServerStub.ServesAmuleLoginUntilTerminated`, LOGINREQUEST →
+  HighID IDCHANGE), joins aMule to it via `amulecmd` before source injection, verifies the
+  registered source count after `Add`, keeps aMule offline with `Ed2kServersUrl=disabled`
+  (blocking the empty-server-list startup download of a public server.met), pins `amulecmd`
+  to `LC_ALL=C`, and exits 0 explicitly on success.
+
 ### Changed
 - The managed aMule upload harness now orders startup as daemon readiness, upload-listener
   readiness, then `amulecmd Add` source-link injection. Windows port preflight uses a local bind
@@ -20,13 +33,19 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
   flushed. Parent-directory crash durability is best-effort where directory fsync is unsupported.
 
 ### Tests
+- 2026-07-15: managed aMule 2.3.3 optional mode fully green twice — 4/4 obfuscation assertions
+  plus real upload evidence: aMule joined the local login stub, connected to the injected source,
+  and downloaded the complete 19,456,000-byte fixture through the engine upload session in 54s
+  (zero public-network access confirmed on the second run). Required mode re-verified 5/5 with
+  exit 0. Windows ctest 535 total, 519 pass + 16 live skip, 0 fail; WSL Linux ctest 524 total,
+  508 pass + 16 live skip, 0 fail.
 - 2026-07-12 local cross-platform acceptance: Windows Debug/Release each 534 total, 519 pass +
   15 live skip, 0 fail; Linux Debug/Release each 523 total, 508 pass + 15 live skip, 0 fail.
   Install and independent consumer smokes passed in all four configurations.
-- Managed aMule 2.3.3 required obfuscation passed 5/5. Optional obfuscation passed 4/4, while its
-  real upload evidence remains failed: the EC `Add` command was accepted but aMule retained zero
-  sources and never connected. The bounded public-server probe also found no reachable endpoint
-  in five attempts; neither failure is represented as successful live evidence.
+- Managed aMule 2.3.3 required obfuscation passed 5/5 on 2026-07-12. Optional-mode upload
+  evidence failed at that time (EC `Add` accepted, zero sources) — root-caused and fixed on
+  2026-07-15, see Fixed. The bounded public-server probe found no reachable endpoint in five
+  attempts; that result stands and is not represented as successful live evidence.
 
 ## [2.2.0] — 2026-07-06
 
