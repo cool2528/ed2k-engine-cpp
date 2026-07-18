@@ -7,7 +7,15 @@
     "openssl",
     "spdlog",
     "tl-expected",
-    "boost-asio",
-    { "name": "gtest", "version>=": "1.14.0" }
-  ]
+    "boost-asio"
+  ],
+  "default-features": [ "tests" ],
+  "features": {
+    "tests": {
+      "description": "Build unit tests",
+      "dependencies": [
+        { "name": "gtest", "version>=": "1.14.0" }
+      ]
+    }
+  }
 }

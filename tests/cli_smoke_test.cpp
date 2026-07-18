@@ -156,10 +156,14 @@ std::vector<std::byte> tcp_server_list_payload(std::initializer_list<std::pair<s
 }
 } // namespace
 
-TEST(CliLog, LoggerAvailable){
-  auto& lg = ed2k::log();
-  lg.info("cli smoke");
-  SUCCEED();
+TEST(CliLog, LogHandlerReceivesMessages){
+  bool called = false;
+  ed2k::set_log_handler([&](ed2k::log_level, std::string_view msg){
+    if (msg.find("cli smoke") != std::string_view::npos) called = true;
+  });
+  ed2k::log_message(ed2k::log_level::info, "cli smoke");
+  EXPECT_TRUE(called);
+  ed2k::set_log_handler(nullptr);
 }
 
 TEST(CliKad, BootstrapAcceptsNodesDatFile) {

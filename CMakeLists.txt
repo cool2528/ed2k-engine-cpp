@@ -13,17 +13,31 @@ find_package(boost_asio CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(GenerateExportHeader)
+
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/ed2k/version.hpp.in
+  ${CMAKE_CURRENT_BINARY_DIR}/include/ed2k/version.hpp
+  @ONLY)
 
 add_library(ed2k_core)
 add_library(ed2k::core ALIAS ed2k_core)
 set_target_properties(ed2k_core PROPERTIES EXPORT_NAME core)
+generate_export_header(ed2k_core
+  BASE_NAME ED2K
+  EXPORT_FILE_NAME ${CMAKE_CURRENT_BINARY_DIR}/include/ed2k/export.hpp
+  STATIC_DEFINE ED2K_STATIC_DEFINE)
+if(NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(ed2k_core PUBLIC ED2K_STATIC_DEFINE)
+endif()
 target_compile_features(ed2k_core PUBLIC cxx_std_20)
 target_include_directories(ed2k_core
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(ed2k_core PUBLIC spdlog::spdlog tl::expected Boost::asio Threads::Threads)
+target_link_libraries(ed2k_core PUBLIC tl::expected Boost::asio Threads::Threads spdlog::spdlog)
 target_link_libraries(ed2k_core PRIVATE ZLIB::ZLIB OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
   target_link_libraries(ed2k_core PRIVATE crypt32)
@@ -116,7 +130,12 @@ install(TARGETS ed2k_core ed2k-tool
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ed2k
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING PATTERN "*.hpp")
+  FILES_MATCHING PATTERN "*.hpp"
+  PATTERN "version.hpp.in" EXCLUDE)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/include/ed2k/version.hpp
+  ${CMAKE_CURRENT_BINARY_DIR}/include/ed2k/export.hpp
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ed2k)
 install(EXPORT ed2kTargets
   FILE ed2kTargets.cmake
   NAMESPACE ed2k::
@@ -125,6 +144,9 @@ install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/ed2kConfig.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/ed2kConfigVersion.cmake
   DESTINATION ${ED2K_INSTALL_CMAKEDIR})
+configure_file(cmake/ed2k.pc.in ${CMAKE_CURRENT_BINARY_DIR}/ed2k.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ed2k.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 if(ED2K_BUILD_TESTS)
   enable_testing()

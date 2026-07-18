@@ -11,7 +11,7 @@ struct Packet {
   std::vector<std::byte> payload;
   auto operator<=>(const Packet&) const = default;
 };
-// 8 MiB：block-level download 每个块 ≤ 180 KiB，远小于 8 MiB，保持 DoS 防护
-// P4a 临时提升到 16 MiB 容纳 whole-part download；P4b block-level 恢复原值
+// 8 MiB: block-level download blocks are <= 180 KiB each, well under 8 MiB; keeps DoS protection
+// P4a temporarily raised to 16 MiB for whole-part download; P4b block-level restored the original value
 constexpr std::size_t MAX_PACKET_SIZE = 8u * 1024 * 1024;   // 8 MiB
 }

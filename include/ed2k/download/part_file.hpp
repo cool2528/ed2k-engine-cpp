@@ -11,7 +11,7 @@
 #include "ed2k/core/hash.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/util/error.hpp"
-#include "ed2k/hash/aich_hasher.hpp"   // AICH_BLOCK_SIZE / PART_SIZE 单一定义源
+#include "ed2k/hash/aich_hasher.hpp"   // AICH_BLOCK_SIZE / PART_SIZE single source of truth
 namespace ed2k::download {
 class PartFile {
  public:
@@ -25,9 +25,9 @@ class PartFile {
   bool open_for_write() const noexcept;
   std::vector<std::uint32_t> missing_parts_peer_has(const std::vector<bool>& peer_parts) const;
   tl::expected<void,std::error_code> write_block(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data);
-  // P4c-3 M3: 异步写盘。状态(block_done_/part_filled_/part_done_) 仅在网络线程变更;
-  // f_ 写/readback + MD4 经 disk_ex 卸载 (单 disk 线程串行 f_, 无竞态)。
-  // disk_ex == 网络线程 ex 时退化为 post(net) 同步等效 (测试默认路径)。
+  // P4c-3 M3: async disk write. State (block_done_/part_filled_/part_done_) is only mutated on the
+  // network thread; f_ write/readback + MD4 are offloaded via disk_ex (single disk thread serializes f_, no races).
+  // When disk_ex == network thread ex, degrades to post(net) synchronous equivalent (default test path).
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     write_block_async(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data,
                       boost::asio::any_io_executor disk_ex);

@@ -57,10 +57,11 @@ class C2CConnection {
     handshake(const HelloInfo& mine, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<C2CHandshakeResult,std::error_code>>
     handshake_with_mule_info(const HelloInfo& mine, const MuleInfo& mule_info, std::chrono::milliseconds timeout);
-  // acceptor 模式握手:对端(TCP 主动方,如 LowID 回调里拨入 InboundListener 的源)
-  // 先发 HELLO,我方解码后回 HELLOANSWER。HELLO 与 HELLOANSWER 线格式相同
-  // (aMule ProcessHelloPacket 同一例程处理二者),故复用 decode_hello_answer/
-  // encode_hello,仅由调用方在 net::Packet 上设置 op::HELLO/op::HELLOANSWER。
+  // Acceptor-mode handshake: the remote peer (TCP active side, e.g. a source dialing into
+  // InboundListener during LowID callback) sends HELLO first; we decode it and reply with
+  // HELLOANSWER. HELLO and HELLOANSWER share the same wire format (aMule ProcessHelloPacket
+  // handles both), so we reuse decode_hello_answer/encode_hello; the caller sets op::HELLO
+  // or op::HELLOANSWER on the net::Packet.
   boost::asio::awaitable<tl::expected<HelloInfo,std::error_code>>
     handshake_acceptor(const HelloInfo& mine, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<C2CHandshakeResult,std::error_code>>
@@ -79,15 +80,15 @@ class C2CConnection {
     request_blocks(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
     request_blocks_i64(const FileHash&, std::array<std::uint64_t,3> starts, std::array<std::uint64_t,3> ends, std::chrono::milliseconds timeout);
-  // AICH master hash 交换 (OP_AICHFILEHASHREQ 0x9E -> OP_AICHFILEHASHANS 0x9D, 均 OP_EMULEPROT)
+  // AICH master hash exchange (OP_AICHFILEHASHREQ 0x9E -> OP_AICHFILEHASHANS 0x9D, both OP_EMULEPROT)
   boost::asio::awaitable<tl::expected<AICHHash,std::error_code>>
     request_aich_master_hash(const FileHash&, std::chrono::milliseconds timeout);
-  // SourceExchange v2 (OP_REQUESTSOURCES2 0x83 -> OP_ANSWERSOURCES2 0x84, 均 OP_EMULEPROT)
+  // SourceExchange v2 (OP_REQUESTSOURCES2 0x83 -> OP_ANSWERSOURCES2 0x84, both OP_EMULEPROT)
   boost::asio::awaitable<tl::expected<SourceExchangeAnswer,std::error_code>>
     request_sources2(const FileHash&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     send_file_desc(std::uint8_t rating, std::string_view comment);
-  // AICH part 恢复数据 (OP_AICHREQUEST 0x9B -> OP_AICHANSWER 0x9C, 均 OP_EMULEPROT)
+  // AICH part recovery data (OP_AICHREQUEST 0x9B -> OP_AICHANSWER 0x9C, both OP_EMULEPROT)
   boost::asio::awaitable<tl::expected<AICHRecoveryData,std::error_code>>
     request_aich_proof(const FileHash&, const AICHHash& master, std::uint16_t part_index, std::chrono::milliseconds timeout);
   void close() noexcept;

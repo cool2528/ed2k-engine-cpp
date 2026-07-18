@@ -1,13 +1,19 @@
 #include "ed2k/util/log.hpp"
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <memory>
+#include <mutex>
 namespace ed2k {
-spdlog::logger& log(){
-  static std::shared_ptr<spdlog::logger> lg = []{
-    auto l = spdlog::stderr_color_mt("ed2k");
-    l->set_level(spdlog::level::info);
-    return l;
-  }();
-  return *lg;
+namespace {
+  log_handler g_handler;
+  std::mutex g_handler_mutex;
 }
+
+void set_log_handler(log_handler handler) {
+  std::lock_guard lk(g_handler_mutex);
+  g_handler = std::move(handler);
+}
+
+void log_message(log_level level, std::string_view message) {
+  std::lock_guard lk(g_handler_mutex);
+  if (g_handler) g_handler(level, message);
+}
+
 }

@@ -46,9 +46,10 @@ class Download {
   std::uint8_t ip_filter_level_ = 127;
 };
 
-// R1-3 S2: Builder 构造 + 注入引用替换裸指针。server/listener 用 optional<reference_wrapper>
-// 表达「可选、非空即有效、非拥有引用」（替代裸指针的可空/可悬空）。disk_executor 经 Builder
-// 注入（替代 set_disk_executor 时序耦合）。旧构造保留 [[deprecated]] 渐进迁移。
+// R1-3 S2: Builder construction + injected references replace raw pointers. server/listener use
+// optional<reference_wrapper> to express "optional, non-null-means-valid, non-owning reference"
+// (replacing nullable/dangling raw pointers). disk_executor is injected via Builder (replacing
+// set_disk_executor temporal coupling). Old constructor kept [[deprecated]] for gradual migration.
 class MultiSourceDownload {
  public:
   class Builder {

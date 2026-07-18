@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: ed2k
+Description: Modern C++20 eDonkey2000/eMule protocol engine
+Version: @PROJECT_VERSION@
+Requires:
+Libs: -L${libdir} -led2k_core
+Cflags: -I${includedir} -std=c++20

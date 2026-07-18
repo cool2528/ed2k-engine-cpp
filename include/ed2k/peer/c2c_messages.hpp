@@ -61,13 +61,13 @@ struct MuleInfo {
   bool supports_preview() const { return (features & 0x80u) != 0; }
 };
 
-// C→C 编码：返回 payload（opcode 由调用方设入 net::Packet）
-// aMule 线格式(BYTE-COMPARE 锁定自 BaseClient.cpp SendHelloPacket/SendHelloAnswer/SendHelloTypePacket):
+// C2C encoding: returns payload (caller sets opcode on net::Packet)
+// aMule wire format (BYTE-COMPARE locked from BaseClient.cpp SendHelloPacket/SendHelloAnswer/SendHelloTypePacket):
 //   - OP_HELLO     payload = [0x10 hashsize][hash:16][client_id:4][port:2][tagcount:4][tags][server_ip:4 BE][server_port:2]
-//   - OP_HELLOANSWER payload = [hash:16][client_id:4][port:2][tagcount:4][tags][server_ip:4 BE][server_port:2]   (无 0x10 前导)
-// 即 HELLO 比 HELLOANSWER 多一个 0x10 前导字节；二者 body 末尾均含 server_ip+server_port(0/0 若未连服务器)。
-// 发 OP_HELLO 用 encode_hello_packet；发 OP_HELLOANSWER 用 encode_hello。解码同理(decode_hello / decode_hello_answer)。
-std::vector<std::byte> encode_hello(const HelloInfo&);          // HELLOANSWER body(无 0x10 前导)/HELLO body
+//   - OP_HELLOANSWER payload = [hash:16][client_id:4][port:2][tagcount:4][tags][server_ip:4 BE][server_port:2]   (no 0x10 prefix)
+// HELLO has one extra 0x10 prefix byte compared to HELLOANSWER; both bodies end with server_ip+server_port (0/0 if not connected).
+// Send OP_HELLO via encode_hello_packet; send OP_HELLOANSWER via encode_hello. Decode likewise (decode_hello / decode_hello_answer).
+std::vector<std::byte> encode_hello(const HelloInfo&);          // HELLOANSWER body (no 0x10 prefix) / HELLO body
 std::vector<std::byte> encode_hello_packet(const HelloInfo&);   // OP_HELLO payload = [0x10] + encode_hello(h)
 std::vector<std::byte> encode_mule_info(const MuleInfo&);
 std::vector<std::byte> encode_set_req_file(const FileHash&);
@@ -89,7 +89,7 @@ std::vector<std::byte> encode_compressed_part(const FileHash&, std::uint64_t sta
 std::vector<std::byte> encode_end_of_download(const FileHash&);
 std::vector<std::byte> encode_cancel_transfer();
 
-// S→C 结构
+// S2C structures
 struct FileStatus { FileHash hash; std::vector<bool> parts; };
 struct FileNameAnswer { FileHash hash; std::string name; };
 struct Block { FileHash hash; std::uint64_t start=0, end=0; std::vector<std::byte> data; };
@@ -113,8 +113,8 @@ struct CompressedPartSegment {
   std::vector<std::byte> data;
 };
 
-tl::expected<HelloInfo,std::error_code>          decode_hello(std::span<const std::byte>);        // OP_HELLO(校验并跳过 0x10 前导)
-tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>); // OP_HELLOANSWER(无前导)
+tl::expected<HelloInfo,std::error_code>          decode_hello(std::span<const std::byte>);        // OP_HELLO (validates and skips 0x10 prefix)
+tl::expected<HelloInfo,std::error_code>          decode_hello_answer(std::span<const std::byte>); // OP_HELLOANSWER (no prefix)
 tl::expected<MuleInfo,std::error_code>           decode_mule_info(std::span<const std::byte>);
 tl::expected<FileStatus,std::error_code>         decode_file_status(std::span<const std::byte>);
 tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(const FileHash& expected, std::span<const std::byte>);
@@ -140,26 +140,26 @@ tl::expected<PreviewAnswer, std::error_code> decode_preview_answer(std::span<con
 std::vector<std::byte> encode_chat_message(std::string_view text);
 tl::expected<std::string, std::error_code> decode_chat_message(std::span<const std::byte>);
 
-// AICH (aMule SHAHashSet) — 两级 Merkle 树恢复数据。详见 aich_checker.hpp / 设计 spec §5。
-// 四个 opcode 均在 OP_EMULEPROT(0xC5) 下，非 eDonkey(0xE3)。
+// AICH (aMule SHAHashSet) -- two-level Merkle tree recovery data. See aich_checker.hpp / design spec section 5.
+// All four opcodes are under OP_EMULEPROT(0xC5), not eDonkey(0xE3).
 struct AICHProofHash {
-  std::uint32_t identifier;                 // 16-bit 标识符高位补零到 32-bit (aMule ReCalculateHash 路径)
+  std::uint32_t identifier;                 // 16-bit identifier zero-extended to 32-bit (aMule ReCalculateHash path)
   std::array<std::byte, 20> hash;
 };
 struct AICHRecoveryData {
-  std::vector<AICHProofHash> hashes;        // V2 recovery data: 16-bit + 32-bit 标识符 hash 列表
+  std::vector<AICHProofHash> hashes;        // V2 recovery data: list of 16-bit + 32-bit identifier hashes
 };
 
-// OP_AICHFILEHASHREQ(0x9E) -> OP_AICHFILEHASHANS(0x9D): 交换文件 AICH master hash (根)
+// OP_AICHFILEHASHREQ(0x9E) -> OP_AICHFILEHASHANS(0x9D): exchange file AICH master hash (root)
 std::vector<std::byte> encode_aich_file_hash_req(const FileHash&);
 std::vector<std::byte> encode_aich_file_hash_ans(const FileHash&, const AICHHash& master);
 tl::expected<AICHHash, std::error_code> decode_aich_file_hash_ans(std::span<const std::byte>);
 std::vector<std::byte> encode_aich_answer(const FileHash&, const AICHHash& master, std::uint16_t part_index,
                                           std::span<const AICHProofHash> proof);
 
-// OP_AICHREQUEST(0x9B) -> OP_AICHANSWER(0x9C): 请求/返回某 part 的 V2 恢复数据
-//   请求帧 = file_hash(16) + part_index(u16) + master_hash(20) = 38B (aMule SendAICHRequest 顺序)
-//   应答帧 = file_hash(16) + part_index(u16) + master_hash(20) + V2 recovery data
+// OP_AICHREQUEST(0x9B) -> OP_AICHANSWER(0x9C): request/return V2 recovery data for a part
+//   Request frame = file_hash(16) + part_index(u16) + master_hash(20) = 38B (aMule SendAICHRequest order)
+//   Answer frame = file_hash(16) + part_index(u16) + master_hash(20) + V2 recovery data
 std::vector<std::byte> encode_aich_request(const FileHash&, const AICHHash& master, std::uint16_t part_index);
 tl::expected<AICHRecoveryData, std::error_code> decode_aich_answer(std::span<const std::byte>);
 

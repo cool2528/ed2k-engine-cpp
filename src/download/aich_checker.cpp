@@ -1,4 +1,5 @@
 #include "ed2k/download/aich_checker.hpp"
+#include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/crypto/sha1.hpp"
 #include <optional>
 #include <unordered_map>

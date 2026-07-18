@@ -6,32 +6,32 @@
 #include <tuple>
 #include <utility>
 #include "ed2k/core/hash.hpp"
-#include "ed2k/hash/aich_hasher.hpp"   // AICH_BLOCK_SIZE / PART_SIZE 单一定义源
-#include "ed2k/download/part_file.hpp"
+#include "ed2k/hash/aich_hasher.hpp"   // AICH_BLOCK_SIZE / PART_SIZE
+namespace ed2k::download { class PartFile; }
 namespace ed2k::download {
 
-// AICH 块基 = ed2k::AICH_BLOCK_SIZE（aich_hasher.hpp）；顶层 part 基 = ed2k::PART_SIZE。
-// per-part 块模型：块绝不跨 part 边界，每 part ceil(part_size/AICH_BLOCK_SIZE) 块
-// （满 part = 53 块，末块 143360B）。与 aMule SHAHashSet 两级树 per-part 叶序一致。
+// AICH block base = ed2k::AICH_BLOCK_SIZE (aich_hasher.hpp); top-level part base = ed2k::PART_SIZE.
+// Per-part block model: blocks never cross part boundaries, each part has ceil(part_size/AICH_BLOCK_SIZE) blocks
+// (full part = 53 blocks, last block 143360B). Consistent with aMule SHAHashSet two-level tree per-part leaf order.
 
 class BlockAllocator {
  public:
   BlockAllocator(std::uint64_t size, const std::vector<PartHash>& part_hashes,
                  const std::optional<AICHHash>& root_hash);
-  // 从 PartFile 已有块状态恢复:只把未完成块入 pending 队列
+  // Restore from PartFile's existing block state: only enqueue incomplete blocks into pending queue
   BlockAllocator(std::uint64_t size, const std::vector<PartHash>& part_hashes,
                  const std::optional<AICHHash>& root_hash, const PartFile& pf);
 
   // Mark a per-part block done; returns true if the whole file is now complete
   bool mark_block_done(std::size_t part, std::size_t block_in_part);
 
-  // Get next missing block -> (part, block_in_part, start_byte, end_byte)。
-  // 块绝不跨 part：end = min(start+AICH_BLOCK_SIZE, part_end, size)。
+  // Get next missing block -> (part, block_in_part, start_byte, end_byte).
+  // Blocks never cross parts: end = min(start+AICH_BLOCK_SIZE, part_end, size).
   std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>> next_block();
 
-  // raccoon 多源: 取下一个对端「有该 part」的块。扫描 pending_ 队列(最多一轮 initial 个),
-  // 跳过 has_part[part]==false 的块(重入队尾), 返回首个可服务块(出队); 全轮无可服务块
-  // → nullopt(该源贡献耗尽)。单网络线程访问 → 无锁(与 next_block 同)。
+  // Multi-source: get next block where the peer has the part. Scans pending_ queue (at most one full pass),
+  // skips blocks where has_part[part]==false (re-enqueued to tail), returns first serviceable block (dequeued);
+  // if no serviceable block in full pass -> nullopt (source exhausted). Single network thread access -> no lock (same as next_block).
   std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>>
     next_block_for_parts(const std::vector<bool>& has_part);
 
@@ -41,14 +41,14 @@ class BlockAllocator {
   // Count of missing blocks (for progress)
   std::size_t missing_count() const;
 
-  // 坏块重入 pending 队列尾部(损坏恢复:同 peer 重试 N 次后换源,见 T6)
+  // Re-enqueue bad block to pending queue tail (corruption recovery: retry N times with same peer then switch source, see T6)
   void requeue_block(std::size_t part, std::size_t block_in_part);
 
  private:
   std::uint64_t size_;
   std::vector<PartHash> part_hashes_;
   std::optional<AICHHash> root_hash_;
-  std::vector<std::vector<bool>> done_;      // done_[part][block_in_part]; 块不跨 part
+  std::vector<std::vector<bool>> done_;      // done_[part][block_in_part]; blocks never cross parts
   std::queue<std::pair<std::size_t,std::size_t>> pending_;  // (part, block_in_part)
 
   std::size_t num_parts() const {
@@ -63,8 +63,8 @@ class BlockAllocator {
     return static_cast<std::size_t>((part_size(part) + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
   }
 
-  void init_done();       // 按 size_/num_parts 初始化 done_(全 false, per-part)
-  void enqueue_missing(); // 把 done_ 中 false 的块入 pending_(part-major 序)
+  void init_done();       // Initialize done_ from size_/num_parts (all false, per-part)
+  void enqueue_missing(); // Enqueue blocks marked false in done_ into pending_ (part-major order)
 };
 
 }

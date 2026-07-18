@@ -9,8 +9,8 @@
 namespace ed2k::server {
 
 struct Keyword      { std::string text; };
-struct TypeIs       { FileType type = FileType::Any; };          // FT_FILETYPE 字符串元
-struct ExtensionIs  { std::string ext; };                        // FT_FILEFORMAT 字符串元
+struct TypeIs       { FileType type = FileType::Any; };          // FT_FILETYPE string meta
+struct ExtensionIs  { std::string ext; };                        // FT_FILEFORMAT string meta
 struct SizeAtLeast  { std::uint64_t bytes = 0; };                // FT_FILESIZE, GREATER
 struct SizeAtMost   { std::uint64_t bytes = 0; };                // FT_FILESIZE, LESS
 struct AvailAtLeast { std::uint32_t sources = 0; };              // FT_SOURCES, GREATER

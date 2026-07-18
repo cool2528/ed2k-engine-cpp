@@ -26,5 +26,5 @@ constexpr std::uint32_t LARGEFILES      = 0x00000100;
 constexpr std::uint32_t UDPOBFUSCATION  = 0x00000200;
 constexpr std::uint32_t TCPOBFUSCATION  = 0x00000400;
 }
-constexpr std::uint16_t INV_SERV_DESC_LEN = 0xF0FF;   // SERVER_DESC_RES 新格式判定值
+constexpr std::uint16_t INV_SERV_DESC_LEN = 0xF0FF;   // SERVER_DESC_RES new-format discriminator value
 }

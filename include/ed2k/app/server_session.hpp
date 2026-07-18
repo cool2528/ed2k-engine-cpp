@@ -62,15 +62,16 @@ struct DownloadOpts {
   std::optional<ed2k::UserHash> local_user_hash;
 };
 // Keep sources whose id is a HighID (!low_id(), i.e. id >= 0x1000000).
-// 保留定义供 CLI/测试复用; download_link 本身(M3)不再调用——LowID 源留给回调路径。
+// Definition kept for CLI/test reuse; download_link itself (M3) no longer calls this -- LowID sources go through the callback path.
 std::vector<ed2k::server::SourceEndpoint>
   filter_high_id(const std::vector<ed2k::server::SourceEndpoint>& sources);
-// login_with_rotation -> get_sources(link.hash,link.size) -> (保留全部源, 不 filter)
-// -> 仅当存在 LowID 源时构造 InboundListener(ex,opts.client_port) (Fix M3: 避免对
-//    HighID-only 下载无条件 bind, 防止端口占用时 ctor 抛 system_error 回归 HighID 路径)
-//    + MultiSourceDownload(aich=nullopt, part-MD4 路径, server_conn=&lg->conn,
-//    listener= has_low_id?&listener:nullptr).run(total_timeout, 3)。
-// M3: HighID 源走 peer_worker 直连, LowID 源走 callback_request+listener.accept 回调。
+// login_with_rotation -> get_sources(link.hash,link.size) -> (keep all sources, no filter)
+// -> construct InboundListener(ex,opts.client_port) only when LowID sources exist (Fix M3: avoid
+//    unconditional bind for HighID-only downloads, preventing system_error from port conflicts
+//    regressing the HighID path)
+//    + MultiSourceDownload(aich=nullopt, part-MD4 path, server_conn=&lg->conn,
+//    listener= has_low_id?&listener:nullptr).run(total_timeout, 3).
+// M3: HighID sources use peer_worker direct connect; LowID sources use callback_request+listener.accept callback.
 boost::asio::awaitable<tl::expected<void, std::error_code>>
   download_link(boost::asio::any_io_executor ex,
                 const ed2k::Ed2kFileLink& link,

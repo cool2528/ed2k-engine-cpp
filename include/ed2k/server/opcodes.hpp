@@ -3,7 +3,7 @@
 #include <string_view>
 namespace ed2k::server {
 
-// opcode（对照 aMule Client2Server/TCP.h OP_ClientToServerTCP 锁定）
+// Opcodes (cross-referenced with aMule Client2Server/TCP.h OP_ClientToServerTCP, byte-level locked)
 namespace op {
 constexpr std::uint8_t LOGINREQUEST     = 0x01;
 constexpr std::uint8_t REJECT            = 0x05;
@@ -20,10 +20,10 @@ constexpr std::uint8_t SERVERMESSAGE     = 0x38;
 constexpr std::uint8_t IDCHANGE          = 0x40;
 constexpr std::uint8_t SERVERIDENT       = 0x41;
 constexpr std::uint8_t FOUNDSOURCES      = 0x42;
-constexpr std::uint8_t NONE              = 0xFF;   // pump_until 哨兵：无目标 opcode
+constexpr std::uint8_t NONE              = 0xFF;   // pump_until sentinel: no target opcode
 }
 
-// tag-ID（对照 aMule ClientTags.h / FileTags.h / ServerTags.h 锁定）
+// Tag IDs (cross-referenced with aMule ClientTags.h / FileTags.h / ServerTags.h, byte-level locked)
 namespace tag {
 constexpr std::uint8_t CT_NAME          = 0x01;
 constexpr std::uint8_t CT_PORT          = 0x0F;
@@ -39,7 +39,7 @@ constexpr std::uint8_t ST_SERVERNAME    = 0x01;
 constexpr std::uint8_t ST_DESCRIPTION   = 0x0B;
 }
 
-// CT_SERVER_FLAGS 能力位（对照 aMule SRVCAP_*；与 IDCHANGE flags 同套位值）
+// CT_SERVER_FLAGS capability bits (cross-ref aMule SRVCAP_*; same bit values as IDCHANGE flags)
 namespace srvflag {
 constexpr std::uint32_t ZLIB       = 0x0001;
 constexpr std::uint32_t NEWTAGS    = 0x0008;
@@ -47,7 +47,7 @@ constexpr std::uint32_t UNICODE    = 0x0010;
 constexpr std::uint32_t LARGEFILES = 0x0100;
 }
 
-// 数值元比较符（对照 aMule ED2K_SEARCH_OP_*）
+// Numeric meta comparison operators (cross-ref aMule ED2K_SEARCH_OP_*)
 namespace searchop {
 constexpr std::uint8_t EQUAL         = 0;
 constexpr std::uint8_t GREATER       = 1;
@@ -57,7 +57,7 @@ constexpr std::uint8_t LESS_EQUAL    = 4;
 constexpr std::uint8_t NOTEQUAL      = 5;
 }
 
-// 文件类型（对照 eMule ED2KFTSTR_*）
+// File types (cross-ref eMule ED2KFTSTR_*)
 enum class FileType { Any, Audio, Video, Image, Program, Document, Archive, CdImage };
 inline std::string_view filetype_string(FileType t){
   switch(t){

@@ -19,9 +19,9 @@ class IoRuntime {
   IoRuntime& operator=(IoRuntime&&) = delete;
 
   boost::asio::any_io_executor executor();
-  // P4c-3 M3/R1-3 S3: disk/hash 卸载线程池(单线程 inherently 串行化 f_ 访问, 无需 strand)。
-  // 改成 >1 前必须给 PartFile::f_ 加 strand 或其它串行化保护。
-  // 网络线程 co_await post(disk_executor()) 期间挂起, 不阻塞其他 worker 的 socket I/O。
+  // P4c-3 M3/R1-3 S3: disk/hash offload thread pool (single-threaded, inherently serializes f_ access; no strand needed).
+  // Must add a strand or other serialization guard on PartFile::f_ before increasing to >1 thread.
+  // Network thread suspends during co_await post(disk_executor()), not blocking other workers' socket I/O.
   boost::asio::any_io_executor disk_executor();
   boost::asio::io_context& context();
   void run();

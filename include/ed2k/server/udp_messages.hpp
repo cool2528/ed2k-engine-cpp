@@ -12,14 +12,14 @@
 #include "ed2k/server/messages.hpp"      // P3a: SearchResultItem, SourceEndpoint, FoundSources
 namespace ed2k::server {
 
-// C→S 编码：返回 payload（opcode 由调用方设入 net::Packet）
+// C2S encoding: returns payload (caller sets opcode on net::Packet)
 std::vector<std::byte> encode_glob_search_req(const SearchExpr&);                       // = serialize_search
 std::vector<std::byte> encode_get_sources_req(const FileHash&, std::uint64_t size);      // hash16 + u64 size
 std::vector<std::byte> encode_server_status_req(std::uint32_t challenge);               // u32
 std::vector<std::byte> encode_server_list_req(IPv4 ip, std::uint16_t port);             // u32 ip + u16 port
 std::vector<std::byte> encode_server_desc_req(std::uint32_t challenge);                 // u32
 
-// S→C 结构（Task 3 decode 填充）
+// S2C structures (populated by Task 3 decode)
 struct UdpSearchResult { std::vector<SearchResultItem> items; };
 struct ServerStat {
   std::uint32_t challenge=0, users=0, files=0;
@@ -29,7 +29,7 @@ struct ServerStat {
 };
 struct ServerDesc { std::string name, description; };
 
-// S→C 解码
+// S2C decode
 tl::expected<UdpSearchResult,std::error_code> decode_glob_search_res(std::span<const std::byte>);
 tl::expected<std::vector<FoundSources>,std::error_code> decode_glob_found_sources(std::span<const std::byte>);
 tl::expected<ServerStat,std::error_code> decode_server_stat(std::span<const std::byte>, std::uint32_t challenge);

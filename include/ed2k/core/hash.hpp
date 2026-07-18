@@ -33,7 +33,7 @@ class AICHHash {
 
 struct IPv4 {
  private:
-  std::uint32_t value_ = 0; // 主机序（a 在高位，a<<24|b<<16|c<<8|d，与 asio::address_v4 一致）
+  std::uint32_t value_ = 0; // Host byte order (a in high byte, a<<24|b<<16|c<<8|d, matches asio::address_v4)
  public:
   [[nodiscard]] static constexpr IPv4 from_host(std::uint32_t v) noexcept { IPv4 ip; ip.value_ = v; return ip; }
   [[nodiscard]] constexpr std::uint32_t host() const noexcept { return value_; }

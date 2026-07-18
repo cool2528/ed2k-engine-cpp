@@ -91,9 +91,68 @@ cmake -S path/to/app -B path/to/app/build \
 cmake --build path/to/app/build
 ```
 
-The exported package does not bundle its dependencies. `spdlog`, `tl-expected`, Zlib, OpenSSL,
+The exported package does not bundle its dependencies. `tl-expected`, Zlib, OpenSSL,
 Boost.Asio, and Threads must also be discoverable, typically through the same vcpkg toolchain or
 through additional entries in `CMAKE_PREFIX_PATH`.
+
+### Quick-start examples
+
+**Hash a file** (no network, no Boost.Asio):
+
+```cpp
+#include <ed2k/hash.hpp>          // umbrella: core/hash + ed2k_hasher + aich_hasher
+#include <ed2k/link/ed2k_link.hpp>
+#include <iostream>
+
+int main() {
+  // Hash raw bytes
+  const char data[] = "hello ed2k";
+  auto hash = ed2k::hash_bytes({reinterpret_cast<const std::byte*>(data), 10});
+  std::cout << "MD4: " << hash.to_hex() << "\n";
+
+  // Parse an ed2k:// link
+  auto link = ed2k::link::parse_link(
+      "ed2k://|file|example.bin|1024|31D6CFE0D16AE931B73C59D7E0C089C0|/");
+  if (link) {
+    auto& f = std::get<ed2k::link::Ed2kFileLink>(*link);
+    std::cout << "File: " << f.name << ", size: " << f.size << "\n";
+  }
+}
+```
+
+**Connect to a server and search** (requires Boost.Asio coroutines):
+
+```cpp
+#include <ed2k/net/runtime.hpp>
+#include <ed2k/server/connection.hpp>
+#include <ed2k/metfile/server_met.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <iostream>
+
+boost::asio::awaitable<void> run(boost::asio::any_io_executor ex) {
+  using namespace ed2k;
+  server::ServerConnection srv(ex);
+  auto id = co_await srv.connect_and_login(
+      {.ip = IPv4::from_dotted("1.2.3.4").value(), .port = 4661},
+      std::chrono::seconds(10));
+  if (!id) co_return;
+
+  auto results = co_await srv.search(
+      server::SearchExpr::keyword("ubuntu"),
+      std::chrono::seconds(15));
+  if (results)
+    for (auto& r : *results)
+      std::cout << r.name << " (" << r.size << " bytes)\n";
+}
+
+int main() {
+  net::IoRuntime rt;
+  boost::asio::co_spawn(rt.io().get_executor(), run(rt.io().get_executor()),
+                         boost::asio::detached);
+  rt.io().run();
+}
+```
 
 Push and pull-request CI covers Windows and Ubuntu in both Debug and Release. Every matrix entry
 configures, builds, runs tests, installs, then configures, builds, and runs an independent
