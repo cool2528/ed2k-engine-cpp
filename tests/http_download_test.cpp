@@ -140,7 +140,10 @@ void write_text(const std::filesystem::path& path, std::string_view text) {
 std::size_t sibling_artifact_count(const std::filesystem::path& destination) {
   std::size_t count = 0;
   for (const auto& entry : std::filesystem::directory_iterator(destination.parent_path())) {
-    const auto name = entry.path().filename().string();
+    // u8string() never throws: path::string() converts through the active code
+    // page on Windows and fails on names it cannot map (e.g. CJK on CP1252 CI).
+    const auto u8name = entry.path().filename().u8string();
+    const std::string name(u8name.begin(), u8name.end());
     if (name.starts_with(".ed2k-http-") &&
         (name.ends_with(".tmp") || name.ends_with(".bak"))) {
       ++count;
