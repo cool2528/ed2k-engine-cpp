@@ -9,4 +9,20 @@ find_dependency(Threads)
 find_dependency(OpenSSL)
 
 include("${CMAKE_CURRENT_LIST_DIR}/ed2kTargets.cmake")
+
+# The install tree may carry only one configuration (e.g. Debug). Multi-config
+# generators generate all configurations for the consumer and fail at generate
+# time on imported targets that lack a location for a configuration; map any
+# missing configuration to the ones that were installed.
+get_target_property(_ed2k_configs ed2k::core IMPORTED_CONFIGURATIONS)
+if(_ed2k_configs)
+  foreach(_ed2k_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    if(NOT "${_ed2k_cfg}" IN_LIST _ed2k_configs)
+      set_target_properties(ed2k::core PROPERTIES
+        MAP_IMPORTED_CONFIG_${_ed2k_cfg} "${_ed2k_configs}")
+    endif()
+  endforeach()
+endif()
+unset(_ed2k_configs)
+
 check_required_components(ed2k)

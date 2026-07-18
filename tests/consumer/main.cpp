@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <variant>
 
 int main() {
   int fail = 0;
@@ -19,14 +20,20 @@ int main() {
 
   // 3. Hash a small buffer
   const char data[] = "hello ed2k";
-  auto hash = ed2k::hash_bytes(
+  auto hashed = ed2k::hash_bytes(
       {reinterpret_cast<const std::byte*>(data), std::strlen(data)});
-  if (hash.is_zero()) { std::puts("FAIL: hash is zero"); ++fail; }
+  if (hashed.file_hash.to_hex().size() != 32) {
+    std::puts("FAIL: unexpected hash length");
+    ++fail;
+  }
 
   // 4. Parse an ed2k link
-  auto link = ed2k::link::parse_link(
+  auto link = ed2k::parse_link(
       "ed2k://|file|test.bin|1024|31D6CFE0D16AE931B73C59D7E0C089C0|/");
-  if (!link) { std::puts("FAIL: link parse failed"); ++fail; }
+  if (!link || !std::holds_alternative<ed2k::Ed2kFileLink>(*link)) {
+    std::puts("FAIL: link parse failed");
+    ++fail;
+  }
 
   // 5. Error code category is registered
   std::error_code ec = ed2k::errc::timed_out;
