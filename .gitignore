@@ -5,6 +5,9 @@ vcpkg_installed/
 .cache/
 /Testing/
 
+# internal design docs (never pushed)
+docs/superpowers/
+
 # live-test / debug scratch (never tracked)
 .tmp_*
 /.tmp_live_amule_obfuscation/
