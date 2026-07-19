@@ -139,8 +139,13 @@ class ED2K_EXPORT Session {
 
   // 分享与上传: 重新扫描 dirs 下全部文件并(重新)启动入站上传监听; dirs 为空则停止分享、释放
   // listener。哈希扫描经磁盘线程执行, 不阻塞网络线程。已连接服务器时会尝试发布分享列表给服务器
-  // (失败仅记日志, 不影响本方法返回值)。与下载侧的 LowID 回调 listener 互斥: 分享启用期间
-  // add_download 内部不会再自行 bind cfg.tcp_port, LowID 源被优雅跳过(见 Global Constraints)。
+  // (失败仅记日志, 不影响本方法返回值)。与下载侧的 LowID 回调 listener 双向互斥, 共用同一个
+  // cfg.tcp_port: 分享启用期间下载内部不会再自行 bind cfg.tcp_port(LowID 源被优雅跳过); 反过来,
+  // 若调用本方法时 cfg.tcp_port 正被一个下载中的 LowID listener 占用, 本方法仍会正常完成扫描/
+  // 发布, 但不会启动入站上传 listener(仅记一条 warn 日志, 返回值仍为成功)——这是当前
+  // (Phase 0)的已知限制: 二者不能在同一时刻共用监听, 占用方结束后需再次调用本方法才能重试
+  // 启动分享 listener(见 Global Constraints 与 src/session/session.cpp 内
+  // Impl::download_listener_count 的详细注释)。
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     set_shared_dirs(std::vector<std::filesystem::path> dirs);
   std::vector<SharedFileInfo> shared_files() const;

@@ -98,10 +98,20 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // 分享的文件库(哈希扫描结果); set_shared_dirs 每次调用整体重建, 不做增量。
   share::KnownFileDB db;
   std::vector<std::filesystem::path> shared_dirs;
-  // 入站上传连接监听; sharing_active=true 时非空。与下载侧的 LowID 回调 listener 互斥
-  // 共用同一个 cfg.tcp_port——两者不会同时 bind(见 run_task 内的门控)。
+  // 入站上传连接监听; sharing_active=true 时非空。与下载侧的 LowID 回调 listener 双向互斥
+  // 共用同一个 cfg.tcp_port(见 run_task 内的正向门控 + 下面 download_listener_count 的反向门控)。
   std::optional<peer::InboundListener> share_listener;
   bool sharing_active = false;
+  // 下载侧当前存活的 LowID InboundListener 数量: run_task 自己 bind cfg.tcp_port 成功时递增,
+  // 该协程收尾(唯一退出点, 见 run_task 末尾)时递减。用计数而非布尔是因为多个 LowID 下载任务
+  // 理论上可并发存在(各自独立的 InboundListener 实例, 靠 SO_REUSEADDR 共存, 见下方说明)。
+  // 这是双向互斥门控的反向一半: set_shared_dirs 据此判断 cfg.tcp_port 当前是否已被下载侧
+  // listener 占用——InboundListener 构造时设置了 SO_REUSEADDR, 若不做这层门控, 在 Windows 上
+  // 对同一端口的第二次 bind 会"成功"而不是失败, 导致两个 acceptor 同时监听同一端口, OS 在两条
+  // accept 路径间随机路由入站连接, 彻底破坏"下载 listener 与分享 listener 互斥"这条不变量
+  // (2026-07 复审发现并修复; Phase 0 采用保守降级: 检测到冲突时分享的目录扫描/服务器发布仍然
+  // 正常完成, 只是本轮不启动入站上传 listener, 见 set_shared_dirs 内的门控分支)。
+  int download_listener_count = 0;
   // set_shared_dirs 挂起(逐目录 disk hop)期间, 若又有一次更晚的调用抢先完成, 用代次让本次
   // 恢复后的写回安静作废, 避免两次并发调用互相覆盖 db/shared_dirs(与 server_generation 同构)。
   std::uint32_t share_generation = 0;
@@ -310,12 +320,18 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     // LowID 源回调需要 listener; bind 失败(端口占用)时保持为空, worker 守卫优雅跳过 LowID。
     // 分享启用时 cfg.tcp_port 已被 share_listener 独占监听(见 Impl::share_listener), 这里不再
     // 重复 bind 同一端口(Global Constraints: 下载 listener 与分享 listener 互斥), LowID 源同样
-    // 优雅跳过。
+    // 优雅跳过。emplace 成功后递增 download_listener_count, 供 set_shared_dirs 做反向门控
+    // (见 Impl::download_listener_count 注释); 本协程只有下面唯一一个退出点(第 359 行的
+    // "self = weak.lock(); if(!self) co_return;" 之后一路直通 on_task_coroutine_exit), 在那里
+    // 对称地递减——若 self 已为空(Impl 已析构)则该 Impl 上的计数不再有意义, 无需处理。
     bool has_low_id = std::any_of(gs->sources.begin(), gs->sources.end(),
                                   [](const server::SourceEndpoint& s){ return s.low_id(); });
     std::optional<peer::InboundListener> listener;
     if(has_low_id && !self->sharing_active){
-      try { listener.emplace(ex, self->cfg.tcp_port); }
+      try {
+        listener.emplace(ex, self->cfg.tcp_port);
+        ++self->download_listener_count;
+      }
       catch(const std::exception&) { /* 端口被占 — LowID 源跳过 */ }
     }
 
@@ -360,6 +376,9 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
         self->set_state(*t, TaskState::failed, r.error());
       }
     }
+    // 对称递减 download_listener_count(与上面 emplace 成功时的递增配对); listener 是否持有值
+    // 精确对应"本协程是否曾经递增过", 覆盖成功/失败/取消全部三种结局(唯一退出点, 见上方注释)。
+    if(listener) --self->download_listener_count;
     self->on_task_coroutine_exit(id);
     co_return;
   }
@@ -828,6 +847,20 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
     self->sharing_active = false;
     if(self->share_listener) self->share_listener->close();
     self->share_listener.reset();
+  } else if(!self->share_listener && self->download_listener_count > 0){
+    // 反向门控(双向互斥的另一半): cfg.tcp_port 当前正被下载侧的 LowID InboundListener 占用
+    // (见 Impl::download_listener_count 注释)。InboundListener 构造设置了 SO_REUSEADDR, 若在
+    // 这里无条件 emplace, 在 Windows 上第二次 bind 会"成功"而不是失败, 形成两个 acceptor 同时
+    // 监听同一端口, 破坏互斥保证——因此宁可保守降级: 本轮扫描/发布仍然正常完成(对调用方而言
+    // set_shared_dirs 依旧返回成功), 只是不启动入站上传 listener, sharing_active 保持 false。
+    // Phase 0 已知限制: 下载 LowID 与分享的入站上传不能在同一时刻共用监听——占用下载listener
+    // 的任务全部结束后, 需要调用方再次调用 set_shared_dirs 才能重新尝试启动分享 listener,
+    // 本方法自身不会自动重试。
+    spdlog::warn("Session::set_shared_dirs: tcp_port {} is currently held by {} active "
+                 "download LowID listener(s); scan/publish still applied, but the inbound "
+                 "upload listener was NOT started this round (call set_shared_dirs again "
+                 "once the download(s) finish).",
+                 self->cfg.tcp_port, self->download_listener_count);
   } else if(!self->share_listener){
     try {
       self->share_listener.emplace(net_ex, self->cfg.tcp_port);
