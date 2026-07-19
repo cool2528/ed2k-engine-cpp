@@ -23,6 +23,7 @@
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/server/opcodes.hpp"
 #include "ed2k/server/messages.hpp"
+#include "ed2k/server/search_query.hpp"
 #include "ed2k/session/session.hpp"
 #include "ed2k/util/error.hpp"
 #include "mock_server.hpp"
@@ -208,5 +209,65 @@ TEST(SessionServer, IdentUpdatesServerAddress){
   EXPECT_EQ(last.ip, ident_ip);            // 修复前: 停留在 target_ip, 不会被 ident 覆盖
   EXPECT_EQ(last.port, ident_port);
   EXPECT_EQ(last.name, ident_name);
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// search() 前置条件: 必须已 connect_server, 否则直接返回 errc::connect_failed, 不发任何请求。
+TEST(SessionSearch, NotConnectedReturnsError){
+  IoRuntime rt;
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_search_noconn_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir;
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto r = co_await session.search("foo", {});
+    EXPECT_FALSE(r.has_value());
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::connect_failed));
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// connect_server 成功后 search() 转发 SEARCHREQUEST 并解析 mock 应答的 SEARCHRESULT;
+// SEARCHRESULT 载荷构造逐字复用 tests/server_connection_test.cpp 中 ServerConnection.SearchRoundTrip
+// 用例的写法(count=1 + hash16 + client_id + port + tag_count), 额外补一个 FT_FILESIZE tag 以便断言 size。
+TEST(SessionSearch, ReturnsFilteredResults){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+    (void)co_await read_frame(s);   // SEARCHREQUEST
+    { codec::ByteWriter w; w.u32(1);
+      auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+      w.hash16(h); w.u32(0xDDCCBBAAu); w.u16(0x1234u); w.u32(2);
+      w.u8(0x82); w.u8(ed2k::server::tag::FT_FILENAME); w.string16("plain");
+      w.u8(0x83); w.u8(ed2k::server::tag::FT_FILESIZE); w.u32(123456u);
+      co_await send_pkt(s, ed2k::server::op::SEARCHRESULT, w.take());
+    }
+    co_await keep_alive(s);
+    co_return;
+  });
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_search_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 3000ms;
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto lr = co_await session.connect_server(
+      ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()});
+    EXPECT_TRUE(lr.has_value()) << (lr? "" : lr.error().message());
+    if(!lr) co_return;                    // 协程体内禁用 ASSERT_*; 失败时守卫式提前返回
+    ed2k::session::SearchFilters filters;
+    filters.min_size = 100;               // 触发 SizeAtLeast 组合分支
+    auto r = co_await session.search("foo", filters);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    EXPECT_EQ(r->size(), 1u);
+    if(r->size()!=1u) co_return;
+    EXPECT_EQ((*r)[0].name, "plain");
+    EXPECT_EQ((*r)[0].size, 123456u);
+    co_return;
+  });
   std::filesystem::remove_all(tmp_dir);
 }

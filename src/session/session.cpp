@@ -549,4 +549,18 @@ Session::update_server_met(const std::string& url){
   co_return added;
 }
 
+asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+Session::search(const std::string& keyword, const SearchFilters& filters){
+  if(!impl_->login) co_return tl::unexpected(make_error_code(errc::connect_failed));
+  // 按 filters 逐项用 operator& 组合进 SearchExpr; 只在非默认值时才追加对应子表达式。
+  server::SearchExpr expr = server::Keyword{keyword};
+  if(filters.type != server::FileType::Any)
+    expr = std::move(expr) & server::SearchExpr(server::TypeIs{filters.type});
+  if(filters.min_size > 0)
+    expr = std::move(expr) & server::SearchExpr(server::SizeAtLeast{filters.min_size});
+  if(filters.min_avail > 0)
+    expr = std::move(expr) & server::SearchExpr(server::AvailAtLeast{filters.min_avail});
+  co_return co_await impl_->login->conn.search(expr, impl_->cfg.per_server_timeout);
+}
+
 }

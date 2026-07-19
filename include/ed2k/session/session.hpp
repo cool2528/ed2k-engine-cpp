@@ -61,6 +61,13 @@ struct ServerStateEvent {                // 服务器连接状态变化事件
 };
 using SessionEvent = std::variant<TaskStateEvent, ServerStateEvent>;
 
+// search() 过滤条件: 类型/最小大小/最少源数, 均为 0/Any 表示不限, 按需组合进 SearchExpr。
+struct SearchFilters {
+  server::FileType type = server::FileType::Any;
+  std::uint64_t min_size = 0;   // 字节; 0 = 不限
+  std::uint32_t min_avail = 0;  // 最少源数; 0 = 不限
+};
+
 // GUI 友好的任务管理门面: 任务注册表 + 下载编排协程 + 并发调度 + 1s 速度采样 + 状态事件。
 // 契约: 所有公共方法必须在网络线程(rt.executor())上调用; 内部状态无 mutex/condition_variable。
 class ED2K_EXPORT Session {
@@ -91,6 +98,10 @@ class ED2K_EXPORT Session {
   // 从 url 下载 server.met, 按 (ip,port) 去重合并进当前列表并落盘, 返回新增条数。
   boost::asio::awaitable<tl::expected<std::size_t, std::error_code>>
     update_server_met(const std::string& url);
+
+  // 搜索: 关键词 + 类型/大小/源数过滤。需已 connect_server, 否则返回 errc::connect_failed。
+  boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+    search(const std::string& keyword, const SearchFilters& filters);
  private:
   struct Impl;
   std::shared_ptr<Impl> impl_;   // 协程持 weak_ptr, Session 销毁后挂起协程安全退化
