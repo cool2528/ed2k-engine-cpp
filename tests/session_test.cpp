@@ -322,3 +322,57 @@ TEST(Session, PauseResumeCancelLifecycle){
   });
   std::filesystem::remove_all(tmp_dir);
 }
+
+// 回归: cancel(remove_files=true) 在下载进行中(协程仍在途, 文件句柄未释放)直接调用时,
+// 不能走"立即删除"(Windows 上文件被打开会因 ERROR_SHARING_VIOLATION 静默失败并泄漏),
+// 必须走 pending_remove 延迟删除, 待 run_task 协程真正退出(句柄释放)后再删。
+// (对比 PauseResumeCancelLifecycle: 那里的 cancel 发生在 completed 之后, 走的是立即删除
+//  分支, 未覆盖此延迟删除路径。)
+TEST(Session, CancelDownloadingRemovesFilesAfterCoroutineExits){
+  auto mf = make_mock_file(0x99, 0xAA);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer_slow(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_login_and_one_source(std::move(s), mf, peer.port()); co_return; });
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_cancel_inflight_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 3000ms;
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session(rt, cfg);
+  Ed2kFileLink link; link.name="q.bin"; link.size=PART*2; link.hash=mf.fhash;
+  auto out = tmp_dir / "q.bin";
+  auto met = std::filesystem::path(out.string() + ".part.met");
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto id = session.add_download(link, tmp_dir);
+    asio::steady_timer timer(rt.context());
+    // 等到 downloading 且已有进度(此时协程仍在途, 文件句柄仍打开)
+    for(int i=0;i<600;++i){
+      auto s = session.query(id);
+      if(s && s->state == TaskState::downloading && s->bytes_done > 0) break;
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::downloading);
+    EXPECT_GT(snap->bytes_done, 0u);
+    bool cancelled_ok = session.cancel(id, true);
+    EXPECT_TRUE(cancelled_ok);
+    if(!cancelled_ok) co_return;
+    EXPECT_FALSE(session.query(id).has_value());   // 任务立即从注册表移除
+    // 轮询等待协程真正退出(句柄释放)后文件被删除
+    for(int i=0;i<150 && (std::filesystem::exists(out) || std::filesystem::exists(met));++i){
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    EXPECT_FALSE(std::filesystem::exists(out));
+    EXPECT_FALSE(std::filesystem::exists(met));
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
