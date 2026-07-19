@@ -6,8 +6,10 @@
 #include <fstream>
 #include <map>
 #include <unordered_set>
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <spdlog/spdlog.h>
@@ -18,10 +20,15 @@
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/server/connection.hpp"
+#include "ed2k/share/client_credits.hpp"
+#include "ed2k/share/known_file.hpp"
+#include "ed2k/share/upload_queue.hpp"
+#include "ed2k/share/upload_session.hpp"
 #include "ed2k/util/error.hpp"
 
 namespace ed2k::session {
 namespace asio = boost::asio;
+using tcp = asio::ip::tcp;
 
 namespace {
 // 读整个文件到内存; 不存在/失败返回空(login_with_rotation 空 met 时走内建 fallback 服务器)
@@ -87,6 +94,22 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // 目前仅由 Impl::kad_run 作为唯一读者维护(路由表/可被网络发现/nodes.dat 持久化); 下载侧的
   // Kad 增源(find_sources)刻意未接入 run_task 的 Builder, 见 run_task 内注释。
   std::unique_ptr<kad::KadNetwork> kad;
+
+  // 分享的文件库(哈希扫描结果); set_shared_dirs 每次调用整体重建, 不做增量。
+  share::KnownFileDB db;
+  std::vector<std::filesystem::path> shared_dirs;
+  // 入站上传连接监听; sharing_active=true 时非空。与下载侧的 LowID 回调 listener 互斥
+  // 共用同一个 cfg.tcp_port——两者不会同时 bind(见 run_task 内的门控)。
+  std::optional<peer::InboundListener> share_listener;
+  bool sharing_active = false;
+  // set_shared_dirs 挂起(逐目录 disk hop)期间, 若又有一次更晚的调用抢先完成, 用代次让本次
+  // 恢复后的写回安静作废, 避免两次并发调用互相覆盖 db/shared_dirs(与 server_generation 同构)。
+  std::uint32_t share_generation = 0;
+  // 默认最大同时上传连接数; 项目当前无独立配置项, 沿用 eMule 传统默认值。
+  static constexpr std::size_t default_upload_slots = 10;
+  share::ClientCredits credits;
+  share::UploadQueue upload_queue{default_upload_slots, &credits};
+  std::size_t active_uploads = 0;
 
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
     : rt(rt_arg), cfg(std::move(cfg_arg)) {
@@ -206,6 +229,15 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     p.user_hash = effective_user_hash();
     return p;
   }
+  // 入站上传会话用来向对端自报身份的 HelloInfo。port 优先取 share_listener 实际绑定端口
+  // (cfg.tcp_port==0 时由系统分配, 与 cfg.tcp_port 不同), 未启用分享时退化为 cfg.tcp_port。
+  peer::HelloInfo hello_info() const {
+    peer::HelloInfo h;
+    h.user_hash = effective_user_hash();
+    h.nickname = cfg.nickname;
+    h.port = share_listener ? share_listener->local_port() : cfg.tcp_port;
+    return h;
+  }
   // 启动排队任务直到并发上限
   void pump(){
     if(shutting_down) return;
@@ -275,11 +307,14 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       self->on_task_coroutine_exit(id); co_return;
     }
 
-    // LowID 源回调需要 listener; bind 失败(端口占用)时保持为空, worker 守卫优雅跳过 LowID
+    // LowID 源回调需要 listener; bind 失败(端口占用)时保持为空, worker 守卫优雅跳过 LowID。
+    // 分享启用时 cfg.tcp_port 已被 share_listener 独占监听(见 Impl::share_listener), 这里不再
+    // 重复 bind 同一端口(Global Constraints: 下载 listener 与分享 listener 互斥), LowID 源同样
+    // 优雅跳过。
     bool has_low_id = std::any_of(gs->sources.begin(), gs->sources.end(),
                                   [](const server::SourceEndpoint& s){ return s.low_id(); });
     std::optional<peer::InboundListener> listener;
-    if(has_low_id){
+    if(has_low_id && !self->sharing_active){
       try { listener.emplace(ex, self->cfg.tcp_port); }
       catch(const std::exception&) { /* 端口被占 — LowID 源跳过 */ }
     }
@@ -384,6 +419,40 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     }
   }
 
+  // 入站上传 accept 循环(weak_ptr 模式, 与 run_task/kad_run 同构)。accept 用 1s 超时借以轮询
+  // shutting_down/sharing_active(与 kad_run 的 serve_once 常驻循环同款设计), 不需要额外的取消
+  // 信号。acceptor 全程只有本协程一个读者独占 accept; 每接到一个连接就各自 co_spawn 一个独立的
+  // run_upload 协程, 各自持有互不相同的 socket——不存在多协程并发读同一 socket 的问题。
+  static asio::awaitable<void> accept_loop(std::weak_ptr<Impl> weak){
+    for(;;){
+      auto self = weak.lock();
+      if(!self || self->shutting_down || !self->sharing_active || !self->share_listener) co_return;
+      auto accepted = co_await self->share_listener->accept(std::chrono::seconds(1));
+      self = weak.lock();
+      if(!self || self->shutting_down || !self->sharing_active || !self->share_listener) co_return;
+      if(!accepted) continue;   // 超时或连接类错误: 继续下一轮轮询(借此重新检查停止条件)
+      asio::co_spawn(self->rt.context(), Impl::run_upload(weak, std::move(*accepted)), asio::detached);
+    }
+  }
+
+  // 单个入站上传会话(weak_ptr 模式)。UploadSession 内部持有本连接独占的 socket, 与 accept_loop
+  // 的 acceptor 是完全不同的 IO 对象, 生命周期互不影响, 不存在共享 socket 并发读的问题。
+  // self 在 co_await session.run(...) 期间保持存活(持有额外 shared_ptr 引用, 与 kad_run 同款),
+  // 保证 self->db/upload_queue/credits(UploadSession 以引用/指针持有)在本协程收尾前不被析构。
+  static asio::awaitable<void> run_upload(std::weak_ptr<Impl> weak, tcp::socket socket){
+    auto self = weak.lock();
+    if(!self || self->shutting_down) co_return;
+    ++self->active_uploads;
+    {
+      share::UploadSession session(std::move(socket), self->db, self->hello_info(),
+                                   self->rt.disk_executor(), &self->upload_queue, nullptr, &self->credits);
+      (void)co_await session.run(std::chrono::seconds(60));
+    }
+    self = weak.lock();
+    if(self) --self->active_uploads;
+    co_return;
+  }
+
   TaskSnapshot snapshot(const TaskEntry& t) const {
     TaskSnapshot s;
     s.id = t.id; s.name = t.link.name; s.hash = t.link.hash;
@@ -426,6 +495,9 @@ void Session::shutdown() noexcept {
     impl_->kad->close();
     impl_->persist_nodes_dat();
   }
+  // 同理主动关闭分享 listener, 促使 accept_loop 挂起的 accept() 尽快因 acceptor 已关闭而返回
+  // 错误唤醒退出, 不必等到 1s 轮询超时才发现 shutting_down。
+  if(impl_->share_listener) impl_->share_listener->close();
 }
 
 std::uint64_t Session::add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir){
@@ -714,6 +786,97 @@ Session::search(const std::string& keyword, const SearchFilters& filters){
 Session::KadStatus Session::kad_status() const {
   return KadStatus{impl_->kad != nullptr,
                     impl_->kad ? impl_->kad->routing_table().size() : std::size_t{0}};
+}
+
+asio::awaitable<tl::expected<void, std::error_code>>
+Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
+  // weak_ptr 驱动: 本方法跨越多次 co_await(逐目录 disk hop + 可能的 publish_files), 与
+  // connect_server/search 同构——co_await 之后必须重新 weak.lock() 才能安全访问 Impl。
+  auto weak = impl_->weak_from_this();
+  auto self = weak.lock();
+  if(!self || self->shutting_down) co_return tl::unexpected(make_error_code(errc::cancelled));
+  // I1 同款抢占保护: 挂起期间若又有一次更晚的 set_shared_dirs() 调用抢先完成, 本次恢复后发现
+  // 代次已不匹配即放弃写回, 避免两次并发调用互相覆盖 db/shared_dirs 产生撕裂状态。
+  const auto gen = ++self->share_generation;
+  const bool dirs_empty = dirs.empty();
+  auto disk_ex = self->rt.disk_executor();
+  auto net_ex = self->rt.executor();
+
+  // 整体重建: KnownFileDB::scan_dir 是增量 upsert, 若直接复用旧 db 会残留"已从 dirs 移除的
+  // 目录"里的旧文件条目; 用一个全新的临时 db 逐目录扫描, 完成后整体替换 self->db。
+  share::KnownFileDB new_db;
+  for(const auto& dir : dirs){
+    // 哈希扫描是重 CPU/IO 操作, 卸载到 disk_executor 执行(单线程磁盘池, 不占网络线程),
+    // 完成后 hop 回网络线程再继续(模式同 part_file.cpp 的 disk hop 注释)。
+    co_await asio::post(disk_ex, asio::bind_executor(disk_ex, asio::use_awaitable));
+    auto r = new_db.scan_dir(dir);
+    co_await asio::post(net_ex, asio::bind_executor(net_ex, asio::use_awaitable));
+    self = weak.lock();
+    if(!self || self->shutting_down) co_return tl::unexpected(make_error_code(errc::cancelled));
+    if(self->share_generation != gen) co_return tl::unexpected(make_error_code(errc::cancelled));
+    if(!r){
+      // 单个目录扫描失败(不存在/IO 错误)不致命, 记日志后跳过, 继续扫描其余目录。
+      spdlog::warn("Session::set_shared_dirs: scan_dir({}) failed: {}", dir.string(), r.error().message());
+    }
+  }
+
+  self->db = std::move(new_db);
+  self->shared_dirs = std::move(dirs);
+
+  if(dirs_empty){
+    // 空列表 = 停止分享: 关 accept 循环(靠 sharing_active 置 false 令其下一轮退出)+ 释放 listener。
+    self->sharing_active = false;
+    if(self->share_listener) self->share_listener->close();
+    self->share_listener.reset();
+  } else if(!self->share_listener){
+    try {
+      self->share_listener.emplace(net_ex, self->cfg.tcp_port);
+    } catch(const std::exception& e){
+      spdlog::warn("Session::set_shared_dirs: listener bind on port {} failed: {}",
+                   self->cfg.tcp_port, e.what());
+      co_return tl::unexpected(make_error_code(errc::connect_failed));
+    }
+    self->sharing_active = true;
+    asio::co_spawn(self->rt.context(), Impl::accept_loop(weak), asio::detached);
+  }
+  // else: listener 已在运行, 本次调用只重新扫描, 不重启监听。
+
+  if(self->login){
+    // 发布分享列表给服务器; 只发不收(publish_files 内部只 send, 不 recv), 不违反服务器连接
+    // 单读者约束, 也不会与其它前台请求(search/get_sources)争抢读取。失败仅记日志不报错。
+    auto pr = co_await self->login->conn.publish_files(self->db.files());
+    self = weak.lock();
+    if(!self || self->shutting_down) co_return tl::unexpected(make_error_code(errc::cancelled));
+    if(self->share_generation != gen) co_return tl::unexpected(make_error_code(errc::cancelled));
+    if(!pr) spdlog::warn("Session::set_shared_dirs: publish_files failed: {}", pr.error().message());
+  }
+  co_return tl::expected<void, std::error_code>{};
+}
+
+std::vector<SharedFileInfo> Session::shared_files() const {
+  std::vector<SharedFileInfo> out;
+  out.reserve(impl_->db.files().size());
+  // uploaded 近似值: credits 只按对端(UserHash)记账, 不区分具体文件, 这里用会话内全部对端
+  // 上传字节数的汇总近似代表每个文件(见 SharedFileInfo::uploaded 注释)。
+  std::uint64_t total_uploaded = 0;
+  for(const auto& record : impl_->credits.records()) total_uploaded += record.uploaded;
+  for(const auto& f : impl_->db.files()){
+    SharedFileInfo info;
+    info.name = f.name;
+    info.path = f.path;
+    info.size = f.size;
+    info.hash = f.hash;
+    info.uploaded = total_uploaded;
+    out.push_back(std::move(info));
+  }
+  return out;
+}
+
+UploadStats Session::upload_stats() const {
+  UploadStats stats;
+  stats.active_sessions = impl_->active_uploads;
+  for(const auto& record : impl_->credits.records()) stats.total_uploaded += record.uploaded;
+  return stats;
 }
 
 }

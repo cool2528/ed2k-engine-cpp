@@ -75,6 +75,24 @@ struct SearchFilters {
   std::uint32_t min_avail = 0;  // 最少源数; 0 = 不限
 };
 
+// 分享的文件信息(UI 展示用), 对应 share::KnownFileDB 中的一条记录。
+struct SharedFileInfo {
+  std::string name;
+  std::filesystem::path path;
+  std::uint64_t size = 0;
+  FileHash hash;
+  // 本会话累计上传字节数的近似值: share::ClientCredits 只按对端(UserHash)记账, 不区分具体
+  // 文件, 因此这里用会话内全部上传字节的汇总近似代表——只分享单个文件时是精确值, 同时分享
+  // 多个文件时无法精确拆分到每个文件。
+  std::uint64_t uploaded = 0;
+};
+
+// 上传统计快照(UI 展示用)。
+struct UploadStats {
+  std::size_t active_sessions = 0;   // 当前在途的入站上传会话数
+  std::uint64_t total_uploaded = 0;  // 本会话累计上传字节数(全部对端汇总)
+};
+
 // GUI 友好的任务管理门面: 任务注册表 + 下载编排协程 + 并发调度 + 1s 速度采样 + 状态事件。
 // 契约: 所有公共方法必须在网络线程(rt.executor())上调用; 内部状态无 mutex/condition_variable。
 class ED2K_EXPORT Session {
@@ -118,6 +136,15 @@ class ED2K_EXPORT Session {
   // 当前联系人数。cfg.enable_kad=false 时恒为 {false, 0}。
   struct KadStatus { bool running = false; std::size_t contacts = 0; };
   KadStatus kad_status() const;
+
+  // 分享与上传: 重新扫描 dirs 下全部文件并(重新)启动入站上传监听; dirs 为空则停止分享、释放
+  // listener。哈希扫描经磁盘线程执行, 不阻塞网络线程。已连接服务器时会尝试发布分享列表给服务器
+  // (失败仅记日志, 不影响本方法返回值)。与下载侧的 LowID 回调 listener 互斥: 分享启用期间
+  // add_download 内部不会再自行 bind cfg.tcp_port, LowID 源被优雅跳过(见 Global Constraints)。
+  boost::asio::awaitable<tl::expected<void, std::error_code>>
+    set_shared_dirs(std::vector<std::filesystem::path> dirs);
+  std::vector<SharedFileInfo> shared_files() const;
+  UploadStats upload_stats() const;
  private:
   struct Impl;
   std::shared_ptr<Impl> impl_;   // 协程持 weak_ptr, Session 销毁后挂起协程安全退化
