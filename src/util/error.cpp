@@ -27,6 +27,7 @@ struct Ed2kCategory : std::error_category {
       case errc::upload_queued: return "upload queued";
       case errc::block_corrupt: return "block corrupt";
       case errc::ip_filtered: return "ip filtered";
+      case errc::cancelled: return "operation cancelled";
     }
     return "unknown ed2k error";
   }

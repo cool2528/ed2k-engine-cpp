@@ -41,3 +41,10 @@ TEST(Error, LegacyNumericCodesRemainStable) {
   EXPECT_EQ(static_cast<int>(ed2k::errc::ip_filtered), 20);
   EXPECT_EQ(static_cast<int>(ed2k::errc::tls_error), 21);
 }
+
+TEST(Error, CancelledHasMessage){
+  auto ec = ed2k::make_error_code(ed2k::errc::cancelled);
+  EXPECT_TRUE(ec);
+  EXPECT_FALSE(ec.message().empty());
+  EXPECT_NE(ec.message(), "unknown");
+}
