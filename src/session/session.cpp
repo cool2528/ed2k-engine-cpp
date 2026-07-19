@@ -1,5 +1,6 @@
 #include "ed2k/session/session.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -9,6 +10,7 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <spdlog/spdlog.h>
 #include "ed2k/download/download.hpp"
 #include "ed2k/infra/http_download.hpp"
 #include "ed2k/metfile/server_met.hpp"
@@ -29,6 +31,9 @@ std::vector<std::byte> read_file_bytes(const std::filesystem::path& p){
   std::memcpy(out.data(), buf.data(), buf.size());
   return out;
 }
+// persist_server_met 临时文件名的进程内自增序号(M1: 避免同目录多 Session 实例并发落盘时
+// 固定文件名互相覆盖; 结合 tcp_port 进一步降低跨进程碰撞概率)。
+std::atomic<std::uint64_t> g_persist_seq{0};
 }
 
 struct TaskEntry {
@@ -87,13 +92,25 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     server_met_bytes = bytes;
     std::error_code ec;
     std::filesystem::create_directories(cfg.data_dir, ec);
-    auto tmp_path = cfg.data_dir / "server.met.tmp";
+    // M1: 临时文件名带 tcp_port + 进程内自增序号, 避免同目录多 Session 实例(或同实例并发调用)
+    // 固定文件名 "server.met.tmp" 互相覆盖导致的写坏/丢数据。
+    const auto seq = g_persist_seq.fetch_add(1, std::memory_order_relaxed);
+    auto tmp_path = cfg.data_dir /
+      ("server.met." + std::to_string(cfg.tcp_port) + "." + std::to_string(seq) + ".tmp");
     auto final_path = cfg.data_dir / "server.met";
     std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
-    if(!f) return;                          // 打不开临时文件: 内存态已更新, 放弃本次落盘
+    if(!f){
+      // M2: 落盘失败不再静默; 内存态(server_met_bytes/servers)已更新, 仅本次持久化放弃。
+      spdlog::warn("Session::persist_server_met: failed to open temp file {}", tmp_path.string());
+      return;
+    }
     f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     f.close();
     std::filesystem::rename(tmp_path, final_path, ec);   // 原子替换
+    if(ec){
+      spdlog::warn("Session::persist_server_met: rename {} -> {} failed: {}",
+                   tmp_path.string(), final_path.string(), ec.message());
+    }
   }
 
   // 断开当前服务器连接: 幂等(未连接时 no-op)。递增 server_generation 使在途的 receive_loop
@@ -122,6 +139,11 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       if(!self || self->shutting_down) co_return;
       if(self->server_generation != gen) co_return;   // 本轮连接已被替换/主动断开, 结果作废
       if(!r){
+        // C1 修复: eD2k 不是心跳协议, 登录后服务器常年长时间静默(仅登录时发一次 STATUS/IDENT)
+        // 是完全正常的现象。receive_events 在 per_server_timeout 窗口内无推送会返回 timed_out,
+        // 这不代表连接已断——必须继续下一轮监听, 只有真实的连接错误(如 connection_closed)
+        // 才判定为断线。
+        if(r.error() == make_error_code(errc::timed_out)) continue;
         self->disconnect_server_internal();            // 连接异常断开: 收尾并 emit disconnected
         co_return;
       }
@@ -304,9 +326,15 @@ Session::Session(net::IoRuntime& rt, SessionConfig cfg)
 Session::~Session(){ shutdown(); }
 
 void Session::shutdown() noexcept {
-  if(!impl_ || impl_->shutting_down) return;
+  if(!impl_ || impl_->shutting_down) return;   // 幂等: shutting_down 已 true 时不重复处理
   impl_->shutting_down = true;
   for(auto& [id, t] : impl_->tasks) if(t.stop) *t.stop = true;
+  // I2: 主动关闭服务器 socket, 促使挂起在 receive_events 里的 receive_loop 尽快以错误唤醒返回,
+  // 不必等到 per_server_timeout 超时 Impl 才被释放。这里只调用 close()(而非完整的
+  // disconnect_server_internal()): shutdown() 是 noexcept 且在析构路径上被调用, 不适合在此处
+  // emit 事件(调用用户 handler 可能抛出); receive_loop 醒来后会先看到 shutting_down==true 直接
+  // 退出, 不会重复处理该连接。
+  if(impl_->login) impl_->login->conn.close();
 }
 
 std::uint64_t Session::add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir){
@@ -394,27 +422,40 @@ void Session::set_event_handler(std::function<void(const SessionEvent&)> handler
 
 asio::awaitable<tl::expected<server::LoginResult, std::error_code>>
 Session::connect_server(std::optional<app::ServerTarget> target){
-  impl_->disconnect_server_internal();      // 先清掉旧连接(幂等), 保证只有一个在途 receive_loop
+  impl_->disconnect_server_internal();      // 先清掉旧连接(幂等), 保证只有一个存活连接
+  // I1: 在挂起(co_await login_with_rotation)之前就占用本次连接尝试的代次。若挂起期间又有
+  // 一次更晚的 connect_server()/disconnect_server() 调用抢先执行, 它会继续推进
+  // server_generation; 本次恢复后发现代次已不匹配, 即可判定"被抢先", 从而丢弃自己刚建立的
+  // 连接而不覆盖 impl_->login, 避免两次并发 connect_server 都各自 std::move 进 login 导致
+  // 静默丢弃前一个连接、绕过"先 close 再 reset"的次序。
+  const auto gen = ++impl_->server_generation;
   auto ex = impl_->rt.executor();
   auto lg = co_await app::login_with_rotation(ex, impl_->server_met_bytes,
                                               target ? target : impl_->cfg.server_override,
                                               impl_->login_params(), impl_->cfg.per_server_timeout);
+  if(impl_->server_generation != gen){
+    // 本次尝试已被更晚的调用抢先: 关闭刚建立的连接(若登录成功), 不写入 login, 直接返回。
+    if(lg) lg->conn.close();
+    co_return tl::unexpected(make_error_code(errc::cancelled));
+  }
   if(!lg) co_return tl::unexpected(lg.error());
   auto result = lg->result;                 // 先取值, 避免 move 之后再读悬空成员
   impl_->login = std::move(*lg);
-  ++impl_->server_generation;
-  const auto gen = impl_->server_generation;
 
   impl_->server_state = ServerStateEvent{};
   impl_->server_state.connected = true;
   impl_->server_state.high_id = result.high_id;
+  // C2: 这里的 ip/port 只是"请求连接的目标"占位值——login_with_rotation 内部会在该目标失败时
+  // 故障转移到 server.met/内建 fallback 里的其它服务器, 实际连上的可能是另一个地址。真正权威
+  // 的地址以下面 on_event 收到的 ServerIdentEvent(服务器自报的 ip/port/name)为准并会覆盖。
   if(target){ impl_->server_state.ip = target->ip; impl_->server_state.port = target->port; }
   else if(impl_->cfg.server_override){
     impl_->server_state.ip = impl_->cfg.server_override->ip;
     impl_->server_state.port = impl_->cfg.server_override->port;
   }
 
-  // ServerStatusEvent(users/files) 与 ServerIdentEvent(name) 合并进 server_state 并转发为 SessionEvent。
+  // ServerStatusEvent(users/files) 与 ServerIdentEvent(name+ip+port, 服务器自报的真实身份)
+  // 合并进 server_state 并转发为 SessionEvent。
   impl_->server_sub = impl_->login->conn.on_event(
     [weak = impl_->weak_from_this()](const server::ServerEvent& ev){
       auto self = weak.lock();
@@ -425,6 +466,8 @@ Session::connect_server(std::optional<app::ServerTarget> target){
         self->emit(self->server_state);
       } else if(auto* ident = std::get_if<server::ServerIdentEvent>(&ev)){
         self->server_state.name = ident->name;
+        self->server_state.ip = ident->ip;      // C2: 用服务器自报地址覆盖占位的 target/override
+        self->server_state.port = ident->port;
         self->emit(self->server_state);
       }
     });
