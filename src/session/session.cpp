@@ -41,10 +41,6 @@ struct TaskEntry {
   std::size_t known_sources = 0;
   std::shared_ptr<bool> stop;        // 本代运行的停止标志
   std::uint32_t generation = 0;      // resume 递增; 旧代协程回写作废
-  // run_task 协程是否仍在途(pump() spawn 时置 true, on_task_coroutine_exit 时置 false)。
-  // paused 态只是同步改了 state, 旧协程可能仍卡在 co_await 里未退出、PartFile 句柄未释放,
-  // 因此不能用"可见状态"(queued/connecting/downloading)判断是否需要延迟删文件, 必须用此标志。
-  bool coroutine_inflight = false;
 };
 
 struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
@@ -59,6 +55,10 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // cancel(remove_files=true) 在任务运行中被调用时, 文件此刻仍被 PartFile 打开(Windows 删除会失败);
   // 删除动作先记录到此处, 待协程退出(句柄已释放)后由 on_task_coroutine_exit 执行。键 = 任务 id。
   std::map<std::uint64_t, std::vector<std::filesystem::path>> pending_remove;
+  // 按任务 id 统计在途 run_task 协程数, 跨代累计(不放 TaskEntry: cancel() erase 任务后仍需保留计数)。
+  // pause→resume 竞态下同一 id 可能有新旧两代协程并存(旧代挂起未醒, 新代已 pump 启动),
+  // 用布尔标记无法表达"多个在途"这一状态, 必须用计数; 只有归零(最后一个持句柄的协程退出)才安全删文件。
+  std::map<std::uint64_t, int> inflight;
 
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
     : rt(rt_arg), cfg(std::move(cfg_arg)) {
@@ -94,7 +94,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       if(t.state != TaskState::queued) continue;
       ++active;
       t.stop = std::make_shared<bool>(false);
-      t.coroutine_inflight = true;      // 标记本代协程即将启动, 供 cancel() 判断是否需延迟删文件
+      ++inflight[id];                   // 本代协程即将启动, 计数 +1, 供 cancel() 判断是否需延迟删文件
       set_state(t, TaskState::connecting);
       asio::co_spawn(rt.context(), run_task(weak_from_this(), id, t.generation), asio::detached);
     }
@@ -105,13 +105,18 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   }
   // 协程退出统一收尾入口: run_task 所有出口都必须调用它(而非直接 finish_slot), 以避免遗漏
   // pending_remove 的清理。不依赖 TaskEntry 是否存活: cancel() 已把任务从 tasks erase,
-  // 这里只按 id 匹配 pending_remove, 与 TaskEntry 生命周期解耦。
+  // 这里只按 id 匹配 pending_remove/inflight, 与 TaskEntry 生命周期解耦。
   void on_task_coroutine_exit(std::uint64_t id){
-    // 协程真正退出, 若任务仍存活(未被 cancel erase)则清除在途标记
-    if(auto it = tasks.find(id); it != tasks.end()) it->second.coroutine_inflight = false;
-    if(auto pr = pending_remove.find(id); pr != pending_remove.end()){
-      for(const auto& p : pr->second){ std::error_code ec; std::filesystem::remove(p, ec); }
-      pending_remove.erase(pr);
+    if(auto it = inflight.find(id); it != inflight.end()){
+      if(--it->second <= 0){
+        inflight.erase(it);
+        // 计数归零: 该 id 所有代的协程都已退出, PartFile 句柄全部释放, 此刻删文件在 Windows 上是安全的。
+        // 若仍 >0(pause/resume 竞态导致新旧两代协程并存), 说明还有协程持有句柄, 本次不删, 等下一次归零。
+        if(auto pr = pending_remove.find(id); pr != pending_remove.end()){
+          for(const auto& p : pr->second){ std::error_code ec; std::filesystem::remove(p, ec); }
+          pending_remove.erase(pr);
+        }
+      }
     }
     finish_slot();
   }
@@ -285,17 +290,18 @@ bool Session::cancel(std::uint64_t id, bool remove_files){
   auto it = impl_->tasks.find(id);
   if(it == impl_->tasks.end()) return false;
   auto& t = it->second;
-  // 用"协程是否真的还在途"而非可见状态判断: paused 态旧协程可能仍未排空(仍占着文件句柄),
-  // 若只看 state==connecting/downloading 会误判 paused 为"已停", 在 Windows 上立即删除会因
-  // ERROR_SHARING_VIOLATION 静默失败, 导致 .part/.part.met 泄漏。
-  const bool coroutine_inflight = t.coroutine_inflight;
+  // 用"是否有在途协程"而非可见状态判断: paused 态旧协程可能仍未排空(仍占着文件句柄),
+  // 若只看 state==connecting/downloading 会误判 paused 为"已停"。用 Impl 级计数(而非
+  // TaskEntry 布尔)是因为 pause→resume 竞态下同一 id 可能有新旧两代协程同时在途,
+  // 布尔会被后到的一代覆盖导致误判; 计数能正确反映"是否所有代都已退出"。
+  const bool has_inflight = (impl_->inflight.count(id) && impl_->inflight[id] > 0);
   if(t.stop) *t.stop = true;
   impl_->set_state(t, TaskState::cancelled);
   if(remove_files){
     std::vector<std::filesystem::path> files{
       t.out_path,
       std::filesystem::path(t.out_path.string() + ".part.met")};
-    if(coroutine_inflight){
+    if(has_inflight){
       impl_->pending_remove[id] = std::move(files);      // 协程退出后删(此刻句柄未释放)
     } else {
       for(const auto& p : files){ std::error_code ec; std::filesystem::remove(p, ec); }

@@ -376,3 +376,150 @@ TEST(Session, CancelDownloadingRemovesFilesAfterCoroutineExits){
   });
   std::filesystem::remove_all(tmp_dir);
 }
+
+// 回归(原始缺陷的真实触发路径): pause() 只是同步改 state=paused, 并不等旧协程真正退出——
+// 旧协程此刻可能仍卡在 co_await dl.run() 里、PartFile 句柄未释放。若 cancel(id,true) 在
+// pause 后立即调用(不等旧协程排空), 早期实现会因误判"paused == 已停"走立即删除, 在 Windows
+// 上因 ERROR_SHARING_VIOLATION 静默失败并泄漏 .part/.part.met。现改为按 Impl 级在途协程计数
+// 判断, 应正确走延迟删除(等最后一个持句柄的协程退出后再删)。
+TEST(Session, CancelPausedRemovesFilesAfterCoroutineExits){
+  auto mf = make_mock_file(0xBB, 0xCC);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer_slow(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_login_and_one_source(std::move(s), mf, peer.port()); co_return; });
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_cancel_paused_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 3000ms;
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session(rt, cfg);
+  Ed2kFileLink link; link.name="r.bin"; link.size=PART*2; link.hash=mf.fhash;
+  auto out = tmp_dir / "r.bin";
+  auto met = std::filesystem::path(out.string() + ".part.met");
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto id = session.add_download(link, tmp_dir);
+    asio::steady_timer timer(rt.context());
+    // 等到 downloading 且已有进度(此时协程仍在途, 文件句柄仍打开)
+    for(int i=0;i<600;++i){
+      auto s = session.query(id);
+      if(s && s->state == TaskState::downloading && s->bytes_done > 0) break;
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::downloading);
+    EXPECT_GT(snap->bytes_done, 0u);
+    bool paused_ok = session.pause(id);
+    EXPECT_TRUE(paused_ok);
+    if(!paused_ok) co_return;
+    // 关键: 不等待(不 sleep), 立即 cancel — 复现"旧协程尚未排空即 cancel"的竞态窗口
+    bool cancelled_ok = session.cancel(id, true);
+    EXPECT_TRUE(cancelled_ok);
+    if(!cancelled_ok) co_return;
+    EXPECT_FALSE(session.query(id).has_value());
+    for(int i=0;i<200 && (std::filesystem::exists(out) || std::filesystem::exists(met));++i){
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    EXPECT_FALSE(std::filesystem::exists(out));
+    EXPECT_FALSE(std::filesystem::exists(met));
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// 回归: pause 后立即(不等旧协程退出) resume, 制造"新旧两代 run_task 协程同时在途"的竞态
+// 窗口(旧代挂起在某个 co_await 上尚未醒来, 新代已被 pump() spawn 启动)。此时若再 cancel,
+// 必须等两代协程都退出(在途计数归零)才能安全删文件, 否则较早退出的一代会误清空计数,
+// 让另一代仍持有句柄时就被判定为"可以立即删"。
+TEST(Session, PauseResumeCancelRemovesFiles){
+  auto mf = make_mock_file(0xDD, 0xEE);
+  IoRuntime rt;
+  // resume 会触发第二次登录+连接, 手工 tcp::acceptor 循环 accept(先例见 app_download_test.cpp:196-206)。
+  tcp::acceptor peer_acceptor(rt.context(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    for(;;){
+      auto [ec, sock] = co_await peer_acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      { boost::system::error_code ndc; sock.set_option(tcp::no_delay(true), ndc); }
+      asio::co_spawn(rt.context(),
+        [sock = std::move(sock), &mf]() mutable -> asio::awaitable<void>{
+          try { co_await serve_full_peer_slow(std::move(sock), mf); } catch(...) {}
+          co_return;
+        }, asio::detached);
+    }
+  }, asio::detached);
+  tcp::acceptor srv_acceptor(rt.context(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const std::uint16_t peer_port = peer_acceptor.local_endpoint().port();
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    for(;;){
+      auto [ec, sock] = co_await srv_acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      asio::co_spawn(rt.context(),
+        [sock = std::move(sock), &mf, peer_port]() mutable -> asio::awaitable<void>{
+          try { co_await serve_login_and_one_source(std::move(sock), mf, peer_port); } catch(...) {}
+          co_return;
+        }, asio::detached);
+    }
+  }, asio::detached);
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_pause_resume_cancel_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 3000ms;
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv_acceptor.local_endpoint().port()};
+  Session session(rt, cfg);
+  Ed2kFileLink link; link.name="s.bin"; link.size=PART*2; link.hash=mf.fhash;
+  auto out = tmp_dir / "s.bin";
+  auto met = std::filesystem::path(out.string() + ".part.met");
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto id = session.add_download(link, tmp_dir);
+    asio::steady_timer timer(rt.context());
+    for(int i=0;i<600;++i){
+      auto s = session.query(id);
+      if(s && s->state == TaskState::downloading && s->bytes_done > 0) break;
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::downloading);
+    EXPECT_GT(snap->bytes_done, 0u);
+    bool paused_ok = session.pause(id);
+    EXPECT_TRUE(paused_ok);
+    if(!paused_ok) co_return;
+    // 关键: 不等待旧协程排空, 立即 resume — 制造新旧两代协程同时在途的竞态窗口
+    bool resumed_ok = session.resume(id);
+    EXPECT_TRUE(resumed_ok);
+    if(!resumed_ok) co_return;
+    // 等新一代重新进入 downloading(第二次连接由手工 acceptor 再次 accept)
+    for(int i=0;i<600;++i){
+      auto s = session.query(id);
+      if(s && s->state == TaskState::downloading && s->bytes_done > 0) break;
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    snap = session.query(id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::downloading);
+    bool cancelled_ok = session.cancel(id, true);
+    EXPECT_TRUE(cancelled_ok);
+    if(!cancelled_ok) co_return;
+    EXPECT_FALSE(session.query(id).has_value());
+    for(int i=0;i<300 && (std::filesystem::exists(out) || std::filesystem::exists(met));++i){
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    EXPECT_FALSE(std::filesystem::exists(out));
+    EXPECT_FALSE(std::filesystem::exists(met));
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
