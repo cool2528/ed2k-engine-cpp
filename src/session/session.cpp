@@ -62,13 +62,18 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   std::vector<std::byte> server_met_bytes;
   // 服务器列表(server.met 解析结果); add_server/remove_server/update_server_met 修改后立即落盘。
   ServerList servers;
-  // 当前登录会话; nullopt 表示未连接。receive_loop 持有其 conn 的引用式访问(通过 Impl 成员)。
+  // 当前登录会话; nullopt 表示未连接。
   std::optional<app::LoginSession> login;
   server::ServerConnection::Subscription server_sub;
   ServerStateEvent server_state;
-  // 每次 connect_server/disconnect_server 递增, 令在途的旧 receive_loop 协程在唤醒后
-  // 发现代次不匹配而安静退出, 不误用已失效的 login/conn。
+  // 每次 connect_server/disconnect_server 递增, 令在途的旧 connect_server 初始快照读窗口
+  // 协程在挂起恢复后发现代次不匹配而安静退出, 不误用已失效/已被替换的 login/conn
+  // (方案 C: 见下方 connect_server 注释, 不再有常驻 receive_loop, 但快照窗口本身跨越
+  // 多次 co_await, 仍需此重入防护)。
   std::uint32_t server_generation = 0;
+  // connect_server 初始快照窗口内, on_event 回调收到 ServerIdentEvent 时置位, 供窗口循环
+  // 判断是否可提前结束(拿到服务器自报的真实身份即可, 无需耗满整个窗口预算)。
+  bool snapshot_ident_seen = false;
   // cancel(remove_files=true) 在任务运行中被调用时, 文件此刻仍被 PartFile 打开(Windows 删除会失败);
   // 删除动作先记录到此处, 待协程退出(句柄已释放)后由 on_task_coroutine_exit 执行。键 = 任务 id。
   std::map<std::uint64_t, std::vector<std::filesystem::path>> pending_remove;
@@ -113,8 +118,8 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     }
   }
 
-  // 断开当前服务器连接: 幂等(未连接时 no-op)。递增 server_generation 使在途的 receive_loop
-  // 唤醒后发现代次不匹配而安静退出, 不重复 emit。
+  // 断开当前服务器连接: 幂等(未连接时 no-op)。递增 server_generation 使在途的 connect_server
+  // 快照窗口协程在挂起恢复后发现代次不匹配而安静退出, 不重复 emit、不误用已失效连接。
   void disconnect_server_internal(){
     if(!login) return;
     login->conn.close();
@@ -123,32 +128,6 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     ++server_generation;
     server_state.connected = false;
     emit(server_state);
-  }
-
-  // 服务器推送事件常驻循环(static + weak_ptr: Session 析构后挂起协程安全退化)。
-  // 与 sampler 不同, 此处需直接访问 self->login->conn 发起下一轮 receive_events, 故 co_await
-  // 期间必须持有 self(与 run_task 的网络等待同构); disconnect_server_internal() 会先 close()
-  // 连接, 促使挂起中的 recv 尽快以错误返回, 避免 Impl 生命周期被无谓拖长。
-  static asio::awaitable<void> receive_loop(std::weak_ptr<Impl> weak, std::uint32_t gen){
-    for(;;){
-      auto self = weak.lock();
-      if(!self || self->shutting_down) co_return;
-      if(self->server_generation != gen || !self->login) co_return;
-      auto r = co_await self->login->conn.receive_events(self->cfg.per_server_timeout);
-      self = weak.lock();
-      if(!self || self->shutting_down) co_return;
-      if(self->server_generation != gen) co_return;   // 本轮连接已被替换/主动断开, 结果作废
-      if(!r){
-        // C1 修复: eD2k 不是心跳协议, 登录后服务器常年长时间静默(仅登录时发一次 STATUS/IDENT)
-        // 是完全正常的现象。receive_events 在 per_server_timeout 窗口内无推送会返回 timed_out,
-        // 这不代表连接已断——必须继续下一轮监听, 只有真实的连接错误(如 connection_closed)
-        // 才判定为断线。
-        if(r.error() == make_error_code(errc::timed_out)) continue;
-        self->disconnect_server_internal();            // 连接异常断开: 收尾并 emit disconnected
-        co_return;
-      }
-      // 成功收到一次推送(已在 on_event 回调中分发/合并进 server_state), 继续下一轮监听
-    }
   }
 
   void emit(const SessionEvent& ev){ if(handler) handler(ev); }
@@ -329,11 +308,10 @@ void Session::shutdown() noexcept {
   if(!impl_ || impl_->shutting_down) return;   // 幂等: shutting_down 已 true 时不重复处理
   impl_->shutting_down = true;
   for(auto& [id, t] : impl_->tasks) if(t.stop) *t.stop = true;
-  // I2: 主动关闭服务器 socket, 促使挂起在 receive_events 里的 receive_loop 尽快以错误唤醒返回,
-  // 不必等到 per_server_timeout 超时 Impl 才被释放。这里只调用 close()(而非完整的
-  // disconnect_server_internal()): shutdown() 是 noexcept 且在析构路径上被调用, 不适合在此处
-  // emit 事件(调用用户 handler 可能抛出); receive_loop 醒来后会先看到 shutting_down==true 直接
-  // 退出, 不会重复处理该连接。
+  // I2: 主动关闭服务器 socket, 促使挂起在 connect_server 初始快照窗口(或前台请求 search/
+  // get_sources 等)里的 recv 尽快以错误唤醒返回, 不必等到超时 Impl 才被释放。这里只调用
+  // close()(而非完整的 disconnect_server_internal()): shutdown() 是 noexcept 且在析构路径上
+  // 被调用, 不适合在此处 emit 事件(调用用户 handler 可能抛出)。
   if(impl_->login) impl_->login->conn.close();
 }
 
@@ -456,6 +434,7 @@ Session::connect_server(std::optional<app::ServerTarget> target){
 
   // ServerStatusEvent(users/files) 与 ServerIdentEvent(name+ip+port, 服务器自报的真实身份)
   // 合并进 server_state 并转发为 SessionEvent。
+  impl_->snapshot_ident_seen = false;
   impl_->server_sub = impl_->login->conn.on_event(
     [weak = impl_->weak_from_this()](const server::ServerEvent& ev){
       auto self = weak.lock();
@@ -468,12 +447,39 @@ Session::connect_server(std::optional<app::ServerTarget> target){
         self->server_state.name = ident->name;
         self->server_state.ip = ident->ip;      // C2: 用服务器自报地址覆盖占位的 target/override
         self->server_state.port = ident->port;
+        self->snapshot_ident_seen = true;
         self->emit(self->server_state);
       }
     });
 
-  asio::co_spawn(impl_->rt.context(), Impl::receive_loop(impl_->weak_from_this(), gen), asio::detached);
-  impl_->emit(impl_->server_state);
+  impl_->emit(impl_->server_state);   // 先 emit 一次 connected=true(占位地址), 让调用方尽快感知已连接
+
+  // 方案 C: 不再启动常驻 receive_loop——Task 6 的常驻推送监听与 search()/get_sources() 等前台
+  // 请求共用同一条连接时会并发调用 conn.recv(), 而 asio 不允许对同一 socket 并发发起读操作;
+  // 曾尝试用 owner/waiter 解复用修复(见历史提交), 但 Opus 审查发现服务器掉线时挂起的等待者
+  // 会在已析构对象上恢复(UAF), 且 eD2k 响应帧不带请求 ID, 并发同 opcode 请求会互相错投。
+  // 根治方式是回到"单读者"模型: 一条连接任意时刻至多一个协程读取。
+  // 因此这里只在 login 成功后同步读一个短窗口(<= per_server_timeout 且 <= 2s), 尽量捕获服务器
+  // 紧跟着 login 应答(IDCHANGE)发来的 SERVERSTATUS/SERVERIDENT 初始快照(经上面的 on_event
+  // 合并进 server_state 并各自触发一次 emit); 拿到 SERVERIDENT(真实身份)后可提前结束, 否则
+  // 读满窗口预算即停。窗口结束后连接转入空闲(无任何协程持续读取), 之后 search()/get_sources()
+  // 等前台请求可安全独占读取该连接, 无需任何并发协调。
+  // 已知降级(方案 C 的取舍): 窗口结束后服务器再推送的状态更新不会被感知; 也不再主动检测服务器
+  // 掉线, 只有在下一次前台请求(如 search)因连接已断而失败时才会发现。
+  const auto snapshot_budget = std::min(impl_->cfg.per_server_timeout, std::chrono::milliseconds(2000));
+  const auto snapshot_deadline = std::chrono::steady_clock::now() + snapshot_budget;
+  for(;;){
+    if(impl_->server_generation != gen || !impl_->login)
+      co_return tl::unexpected(make_error_code(errc::cancelled));   // 被更晚的调用抢先, 让出
+    auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+      snapshot_deadline - std::chrono::steady_clock::now());
+    if(rem.count() <= 0) break;                // 窗口预算耗尽, 结束快照读取
+    auto r = co_await impl_->login->conn.receive_events(rem);
+    if(impl_->server_generation != gen || !impl_->login)
+      co_return tl::unexpected(make_error_code(errc::cancelled));
+    if(!r) break;                              // 超时或本轮无更多推送: 结束窗口(login 已成功, 不因此判定断线)
+    if(impl_->snapshot_ident_seen) break;       // 已拿到服务器自报的真实身份, 无需再等
+  }
   co_return result;
 }
 

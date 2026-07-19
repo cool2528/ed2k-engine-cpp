@@ -66,7 +66,10 @@ TEST(SessionServer, ConnectEmitsStateAndDisconnectClears){
   });
   auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_srv_test";
   std::filesystem::create_directories(tmp_dir);
-  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 3000ms;
+  // 方案 C: connect_server 在 login 后会同步读一个 min(per_server_timeout, 2s) 的初始快照窗口
+  // (mock 在此用例里发完 IDCHANGE 后不再推送任何内容); 把 per_server_timeout 设小, 让不关心
+  // 快照内容的用例快速跑完窗口, 而不是每次都白等到 2s 上限。
+  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 100ms;
   Session session(rt, cfg);
   std::vector<ed2k::session::ServerStateEvent> events;
   session.set_event_handler([&](const ed2k::session::SessionEvent& ev){
@@ -112,11 +115,14 @@ TEST(SessionServer, AddRemovePersistsServerMet){
   std::filesystem::remove_all(tmp_dir);
 }
 
-// 回归(C1): eD2k 不是心跳协议, 服务器登录后长时间静默(仅登录时发一次 STATUS/IDENT)是正常现象。
-// mock server 发完 IDCHANGE 后只保持连接打开、不再推送/不关闭; per_server_timeout 设得很短
-// (300ms), 等待跨越好几个超时窗口后, 连接必须仍然存活, 且不应该收到任何 disconnected 事件
-// (期间 receive_events 的 timed_out 不能被误判为断线)。
-TEST(SessionServer, StaysConnectedThroughIdleTimeout){
+// 方案 C(替代原 C1 回归用例): connect_server 不再启动常驻 receive_loop——仅在 login 后同步读一个
+// min(per_server_timeout, 2s) 的初始快照窗口, 窗口结束后连接转入空闲, 不再有任何协程持续读取
+// (消除了它与前台请求 search()/get_sources() 并发读同一 socket 的根源)。这是有意接受的降级:
+// Session 不再主动检测服务器掉线, 只会在下一次前台请求因连接已失效而失败时才发现。
+// mock server 发完 IDCHANGE 后只保持连接打开、不再推送/不关闭(快照窗口读满 per_server_timeout
+// 后自然结束); 之后连接空闲一段时间(跨越好几个 per_server_timeout 周期), 由于没有任何主动检测
+// 机制, server_connected() 必须恒为 true, 且不应该产生任何 spurious disconnected 事件。
+TEST(SessionServer, RemainsConnectedWhileIdleWithNoActiveReader){
   IoRuntime rt;
   ed2k::test::MockServer srv(rt.context());
   srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
@@ -140,16 +146,17 @@ TEST(SessionServer, StaysConnectedThroughIdleTimeout){
     EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
     if(!r) co_return;                     // 协程体内禁用 ASSERT_*; 失败时守卫式提前返回
     EXPECT_TRUE(session.server_connected());
-    // 跨越约 3 个 per_server_timeout 周期静默等待(模拟真实服务器长时间不推送)
+    // 跨越约 3 个 per_server_timeout 周期静默等待, 期间连接完全空闲(无任何协程读取该 socket)。
     asio::steady_timer timer(rt.context());
     timer.expires_after(cfg.per_server_timeout * 3);
     co_await timer.async_wait(asio::use_awaitable);
-    EXPECT_TRUE(session.server_connected());   // 修复前: receive_loop 会把首次 timed_out 误判为断线
+    // 方案 C: 没有常驻读者主动检测断线, 纯本地状态位在空闲期间恒为 true。
+    EXPECT_TRUE(session.server_connected());
     session.disconnect_server();
     co_return;
   });
   // 期望恰好两条事件: connect 时的 connected=true, 以及测试末尾主动 disconnect 的 connected=false。
-  // 中途若混入任何 timed_out 触发的伪断线事件, 数量会大于 2。
+  // 空闲期间不应产生任何额外事件(既没有常驻读者, 也就不会有 spurious disconnected)。
   ASSERT_EQ(events.size(), 2u);
   EXPECT_TRUE(events.front().connected);
   EXPECT_FALSE(events.back().connected);
@@ -159,6 +166,8 @@ TEST(SessionServer, StaysConnectedThroughIdleTimeout){
 // 回归(C2): connect_server 收到的 ServerIdentEvent 除 name 外还带着服务器自报的 ip/port——
 // login_with_rotation 可能故障转移到 target 之外的服务器, 因此最终 server_state 的 ip/port
 // 必须以 ServerIdentEvent 的值为准, 而不是停留在最初连接请求的 target 占位值上。
+// 方案 C: mock server 在 IDCHANGE 后紧接着发 SERVERIDENT, 落在 connect_server 的初始快照窗口
+// 内, 会在 connect_server 返回前同步处理完毕(收到 Ident 后窗口提前结束), 不再需要额外等待。
 TEST(SessionServer, IdentUpdatesServerAddress){
   IoRuntime rt;
   const auto ident_ip = IPv4::from_dotted("203.0.113.7").value();   // 刻意不同于 target(127.0.0.1)
@@ -195,10 +204,7 @@ TEST(SessionServer, IdentUpdatesServerAddress){
     auto r = co_await session.connect_server(ed2k::app::ServerTarget{target_ip, srv.port()});
     EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
     if(!r) co_return;                     // 协程体内禁用 ASSERT_*; 失败时守卫式提前返回
-    // 让 receive_loop 有机会跑一轮, 收下 mock server 推送的 SERVERIDENT 并分发。
-    asio::steady_timer timer(rt.context());
-    timer.expires_after(200ms);
-    co_await timer.async_wait(asio::use_awaitable);
+    // 方案 C: SERVERIDENT 已在 connect_server 的初始快照窗口内同步处理完毕, 无需额外等待。
     co_return;
   });
   ASSERT_EQ(events.size(), 2u);           // connect 时的初始占位事件 + ident 更新后的事件
@@ -251,7 +257,10 @@ TEST(SessionSearch, ReturnsFilteredResults){
   });
   auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_search_test";
   std::filesystem::create_directories(tmp_dir);
-  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 3000ms;
+  // 方案 C: mock 在 IDCHANGE 后不发任何快照推送(直接等 SEARCHREQUEST), connect_server 的初始
+  // 快照窗口会读满 per_server_timeout 才结束; 设小一些让测试快速跑完, 不影响 search() 本身的
+  // 独占读取(窗口结束后连接已空闲, search() 按需单独占用, 无并发)。
+  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 100ms;
   Session session(rt, cfg);
   run_coro(rt, [&]() -> asio::awaitable<void>{
     auto lr = co_await session.connect_server(
