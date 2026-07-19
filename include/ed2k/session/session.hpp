@@ -58,6 +58,9 @@ class ED2K_EXPORT Session {
   Session& operator=(const Session&) = delete;
   // 契约: 所有方法必须在网络线程(rt.executor())上调用
   std::uint64_t add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir);
+  bool pause(std::uint64_t id);                       // queued/connecting/downloading → paused
+  bool resume(std::uint64_t id);                      // paused/failed → queued(重新排队, .part.met 续传)
+  bool cancel(std::uint64_t id, bool remove_files);   // 任意态 → 移除任务; remove_files 删数据+met(延迟到协程退出后)
   std::optional<TaskSnapshot> query(std::uint64_t id) const;
   std::vector<TaskSnapshot> query_all() const;
   void set_event_handler(std::function<void(const SessionEvent&)> handler);

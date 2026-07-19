@@ -52,6 +52,9 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   bool shutting_down = false;
   std::function<void(const SessionEvent&)> handler;
   std::vector<std::byte> server_met_bytes;
+  // cancel(remove_files=true) 在任务运行中被调用时, 文件此刻仍被 PartFile 打开(Windows 删除会失败);
+  // 删除动作先记录到此处, 待协程退出(句柄已释放)后由 on_task_coroutine_exit 执行。键 = 任务 id。
+  std::map<std::uint64_t, std::vector<std::filesystem::path>> pending_remove;
 
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
     : rt(rt_arg), cfg(std::move(cfg_arg)) {
@@ -61,6 +64,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   void emit(const SessionEvent& ev){ if(handler) handler(ev); }
   void set_state(TaskEntry& t, TaskState s, std::error_code ec = {}){
     t.state = s; t.error = ec;
+    if(s == TaskState::failed) t.speed_bps = 0;   // 失败态清空速度, 避免残留旧速度
     emit(TaskStateEvent{t.id, s, ec});
   }
   // 指定代次仍存活的任务; 不匹配返回 nullptr(任务已删/已重启新代)
@@ -79,8 +83,10 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // 启动排队任务直到并发上限
   void pump(){
     if(shutting_down) return;
+    // max_concurrent_tasks == 0 会使下面的 active>=上限 恒真, 队列永不启动(死锁); clamp 到至少 1
+    const std::size_t max_slots = std::max<std::size_t>(1, cfg.max_concurrent_tasks);
     for(auto& [id, t] : tasks){
-      if(active >= cfg.max_concurrent_tasks) break;
+      if(active >= max_slots) break;
       if(t.state != TaskState::queued) continue;
       ++active;
       t.stop = std::make_shared<bool>(false);
@@ -92,6 +98,16 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     if(active > 0) --active;
     pump();
   }
+  // 协程退出统一收尾入口: run_task 所有出口都必须调用它(而非直接 finish_slot), 以避免遗漏
+  // pending_remove 的清理。不依赖 TaskEntry 是否存活: cancel() 已把任务从 tasks erase,
+  // 这里只按 id 匹配 pending_remove, 与 TaskEntry 生命周期解耦。
+  void on_task_coroutine_exit(std::uint64_t id){
+    if(auto pr = pending_remove.find(id); pr != pending_remove.end()){
+      for(const auto& p : pr->second){ std::error_code ec; std::filesystem::remove(p, ec); }
+      pending_remove.erase(pr);
+    }
+    finish_slot();
+  }
 
   // 任务编排协程(static + weak_ptr: Session 析构后挂起协程安全退化为 no-op)。
   // 流程复刻 app::download_link: login_with_rotation → get_sources → MultiSourceDownload。
@@ -100,7 +116,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     if(!self) co_return;
     auto ex = self->rt.executor();
     auto* t = self->find_alive(id, gen);
-    if(!t || t->state != TaskState::connecting){ self->finish_slot(); co_return; }
+    if(!t || t->state != TaskState::connecting){ self->on_task_coroutine_exit(id); co_return; }
     auto stop = t->stop;
     auto link = t->link;
     auto out_path = t->out_path;
@@ -109,20 +125,20 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
                                                 self->login_params(), self->cfg.per_server_timeout);
     self = weak.lock(); if(!self) co_return;
     t = self->find_alive(id, gen);
-    if(!t){ self->finish_slot(); co_return; }
-    if(stop && *stop){ self->finish_slot(); co_return; }        // pause/cancel 已改状态, 不覆盖
-    if(!lg){ self->set_state(*t, TaskState::failed, lg.error()); self->finish_slot(); co_return; }
+    if(!t){ self->on_task_coroutine_exit(id); co_return; }
+    if(stop && *stop){ self->on_task_coroutine_exit(id); co_return; }        // pause/cancel 已改状态, 不覆盖
+    if(!lg){ self->set_state(*t, TaskState::failed, lg.error()); self->on_task_coroutine_exit(id); co_return; }
 
     auto gs = co_await lg->conn.get_sources(link.hash, link.size, self->cfg.per_server_timeout);
     self = weak.lock(); if(!self) co_return;
     t = self->find_alive(id, gen);
-    if(!t){ self->finish_slot(); co_return; }
-    if(stop && *stop){ self->finish_slot(); co_return; }
-    if(!gs){ self->set_state(*t, TaskState::failed, gs.error()); self->finish_slot(); co_return; }
+    if(!t){ self->on_task_coroutine_exit(id); co_return; }
+    if(stop && *stop){ self->on_task_coroutine_exit(id); co_return; }
+    if(!gs){ self->set_state(*t, TaskState::failed, gs.error()); self->on_task_coroutine_exit(id); co_return; }
     t->known_sources = gs->sources.size();
     if(gs->sources.empty()){
       self->set_state(*t, TaskState::failed, make_error_code(errc::file_not_found));
-      self->finish_slot(); co_return;
+      self->on_task_coroutine_exit(id); co_return;
     }
 
     // LowID 源回调需要 listener; bind 失败(端口占用)时保持为空, worker 守卫优雅跳过 LowID
@@ -165,7 +181,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
         self->set_state(*t, TaskState::failed, r.error());
       }
     }
-    self->finish_slot();
+    self->on_task_coroutine_exit(id);
     co_return;
   }
 
@@ -228,6 +244,55 @@ std::uint64_t Session::add_download(const Ed2kFileLink& link, const std::filesys
   impl_->emit(TaskStateEvent{id, TaskState::queued, {}});
   impl_->pump();
   return id;
+}
+
+bool Session::pause(std::uint64_t id){
+  auto it = impl_->tasks.find(id);
+  if(it == impl_->tasks.end()) return false;
+  auto& t = it->second;
+  // 尚未启动的排队任务直接改状态即可, 无需置停标志
+  if(t.state == TaskState::queued){ impl_->set_state(t, TaskState::paused); return true; }
+  if(t.state != TaskState::connecting && t.state != TaskState::downloading) return false;
+  if(t.stop) *t.stop = true;         // 通知 run_task/下载协程尽快退出(errc::cancelled 分支不覆盖终态)
+  t.speed_bps = 0;
+  impl_->set_state(t, TaskState::paused);
+  return true;
+}
+
+bool Session::resume(std::uint64_t id){
+  auto it = impl_->tasks.find(id);
+  if(it == impl_->tasks.end()) return false;
+  auto& t = it->second;
+  if(t.state != TaskState::paused && t.state != TaskState::failed) return false;
+  ++t.generation;                       // 旧代协程若仍在收尾, 其回写全部作废
+  t.stop.reset();
+  t.error = {};
+  t.last_sample_time = {};
+  t.last_sample_bytes = t.bytes_done;
+  impl_->set_state(t, TaskState::queued);
+  impl_->pump();
+  return true;
+}
+
+bool Session::cancel(std::uint64_t id, bool remove_files){
+  auto it = impl_->tasks.find(id);
+  if(it == impl_->tasks.end()) return false;
+  auto& t = it->second;
+  const bool running = (t.state == TaskState::connecting || t.state == TaskState::downloading);
+  if(t.stop) *t.stop = true;
+  impl_->set_state(t, TaskState::cancelled);
+  if(remove_files){
+    std::vector<std::filesystem::path> files{
+      t.out_path,
+      std::filesystem::path(t.out_path.string() + ".part.met")};
+    if(running){
+      impl_->pending_remove[id] = std::move(files);      // 协程退出后删(此刻句柄未释放)
+    } else {
+      for(const auto& p : files){ std::error_code ec; std::filesystem::remove(p, ec); }
+    }
+  }
+  impl_->tasks.erase(it);
+  return true;
 }
 
 std::optional<TaskSnapshot> Session::query(std::uint64_t id) const {

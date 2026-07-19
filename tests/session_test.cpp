@@ -118,6 +118,48 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
   co_await keep_alive(s); co_return;
 }
 
+// serve_full_peer 的慢速版: 每次回送 SENDINGPART 前先 sleep 10ms(约 106 块 * 10ms ≈ 1.1s),
+// 为 pause 测试留出足够的"downloading 且有进度"观察窗口。
+static asio::awaitable<void> serve_full_peer_slow(tcp::socket s, const MockFile& mf){
+  using namespace ed2k::peer;
+  std::vector<std::byte> full;
+  full.insert(full.end(), mf.d0.begin(), mf.d0.end());
+  full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
+    (void)r.hash16();                                    // 文件 hash
+    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
+    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
+    (void)s1;(void)s2;(void)e1;(void)e2;
+    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+    // flat 切片: [s0,e0) 可能跨 part 边界, 直接从 full 取
+    std::size_t off = static_cast<std::size_t>(s0);
+    std::size_t len = static_cast<std::size_t>(e0 - s0);
+    asio::steady_timer d(s.get_executor());
+    d.expires_after(10ms);
+    co_await d.async_wait(asio::use_awaitable);
+    codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
+    w.blob(std::span<const std::byte>(full).subspan(off, len));
+    co_await send_pkt(s, op::SENDINGPART, w.take());
+  }
+  co_await keep_alive(s); co_return;
+}
+
 // mock server 应答: LOGIN→IDCHANGE(HighID), GETSOURCES→FOUNDSOURCES(1 个 127.0.0.1 HighID 源)
 static asio::awaitable<void> serve_login_and_one_source(tcp::socket s, const MockFile& mf, std::uint16_t peer_port){
   (void)co_await read_frame(s);
@@ -197,4 +239,86 @@ TEST(Session, QueryAllListsTasksAndUnknownIdReturnsNullopt){
   Session session(rt, cfg);
   EXPECT_FALSE(session.query(42).has_value());
   EXPECT_TRUE(session.query_all().empty());
+}
+
+TEST(Session, PauseResumeCancelLifecycle){
+  auto mf = make_mock_file(0x77, 0x88);
+  IoRuntime rt;
+  // MockPeer/MockServer 的 serve() 只 accept 一次; resume 会触发第二次登录+连接,
+  // 这里改用手工 tcp::acceptor 循环 accept(先例见 app_download_test.cpp:196-206)。
+  tcp::acceptor peer_acceptor(rt.context(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    for(;;){
+      auto [ec, sock] = co_await peer_acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      { boost::system::error_code ndc; sock.set_option(tcp::no_delay(true), ndc); }
+      asio::co_spawn(rt.context(),
+        [sock = std::move(sock), &mf]() mutable -> asio::awaitable<void>{
+          try { co_await serve_full_peer_slow(std::move(sock), mf); } catch(...) {}
+          co_return;
+        }, asio::detached);
+    }
+  }, asio::detached);
+  tcp::acceptor srv_acceptor(rt.context(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const std::uint16_t peer_port = peer_acceptor.local_endpoint().port();
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    for(;;){
+      auto [ec, sock] = co_await srv_acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      asio::co_spawn(rt.context(),
+        [sock = std::move(sock), &mf, peer_port]() mutable -> asio::awaitable<void>{
+          try { co_await serve_login_and_one_source(std::move(sock), mf, peer_port); } catch(...) {}
+          co_return;
+        }, asio::detached);
+    }
+  }, asio::detached);
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_prc_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 3000ms;
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv_acceptor.local_endpoint().port()};
+  Session session(rt, cfg);
+  Ed2kFileLink link; link.name="p.bin"; link.size=PART*2; link.hash=mf.fhash;
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto id = session.add_download(link, tmp_dir);
+    asio::steady_timer timer(rt.context());
+    // 等到 downloading 且已有进度
+    for(int i=0;i<600;++i){
+      auto s = session.query(id);
+      if(s && s->state == TaskState::downloading && s->bytes_done > 0) break;
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    // 协程体内不能用 ASSERT_*(裸 return 非法), 改用 EXPECT_* + co_return 守卫
+    bool paused_ok = session.pause(id);
+    EXPECT_TRUE(paused_ok);
+    if(!paused_ok) co_return;
+    EXPECT_EQ(session.query(id)->state, TaskState::paused);
+    // 等运行协程退出(active 槽释放): 状态保持 paused 不被覆盖
+    timer.expires_after(500ms); co_await timer.async_wait(asio::use_awaitable);
+    EXPECT_EQ(session.query(id)->state, TaskState::paused);
+    // resume 后重新入队并最终完成(第二连接由手工 acceptor 再次 accept)
+    bool resumed_ok = session.resume(id);
+    EXPECT_TRUE(resumed_ok);
+    if(!resumed_ok) co_return;
+    for(int i=0;i<1200;++i){
+      auto s = session.query(id);
+      if(s && (s->state == TaskState::completed || s->state == TaskState::failed)) break;
+      timer.expires_after(50ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    EXPECT_EQ(session.query(id)->state, TaskState::completed) << session.query(id)->error.message();
+    // cancel(remove_files) 移除任务并删文件
+    bool cancelled_ok = session.cancel(id, true);
+    EXPECT_TRUE(cancelled_ok);
+    if(!cancelled_ok) co_return;
+    EXPECT_FALSE(session.query(id).has_value());
+    for(int i=0;i<100 && std::filesystem::exists(tmp_dir / "p.bin");++i){
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    EXPECT_FALSE(std::filesystem::exists(tmp_dir / "p.bin"));
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
 }
