@@ -94,7 +94,16 @@ struct UploadStats {
 };
 
 // GUI 友好的任务管理门面: 任务注册表 + 下载编排协程 + 并发调度 + 1s 速度采样 + 状态事件。
-// 契约: 所有公共方法必须在网络线程(rt.executor())上调用; 内部状态无 mutex/condition_variable。
+// 契约(调用方必须遵守):
+//  1. 所有公共方法必须在网络线程(rt.executor())上调用; 内部状态无 mutex/condition_variable。
+//  2. set_event_handler 注册的回调不得抛出异常(在 detached 协程内触发, 抛出会 std::terminate);
+//     回调内也不得反过来调用 Session 的方法(如 add_download/cancel), 应把事件转投到 UI 线程后处理。
+//  3. 同一条服务器连接上的前台请求(connect_server/search/update_server_met 等)必须串行:
+//     await 上一个完成后再发起下一个, 不可并发。否则会在同一 socket 上产生并发 recv(单读者模型
+//     被破坏)。下载任务各自独立连接, 不受此限。
+// 维护者注意: 新增任何跨 co_await 的成员协程时, 必须沿用 run_task/sampler 的 weak_ptr 驱动模式
+//   (每次 co_await 后 weak.lock() 判空 + 检查 shutting_down, 绝不跨 co_await 解引用 this/impl_),
+//   否则调用方在协程挂起期间销毁 Session 会造成 use-after-free。
 class ED2K_EXPORT Session {
  public:
   Session(net::IoRuntime& rt, SessionConfig cfg);

@@ -290,7 +290,14 @@ management, and a single event stream — everything a desktop client needs with
 > 2. **The event callback registered via `set_event_handler` fires on the network thread too.**
 >    A GUI integration must not touch UI widgets directly from inside it. Post/queue the event to
 >    the UI thread (e.g. Qt `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`) before acting
->    on it.
+>    on it. The callback **must not throw** (it runs inside a detached coroutine — an escaping
+>    exception calls `std::terminate`) and **must not re-enter `Session`** (e.g. call
+>    `add_download`/`cancel` from inside the callback); queue to the UI thread and act there.
+> 3. **Foreground requests on the server connection must be serialized.** `connect_server`,
+>    `search`, and `update_server_met` all read the single shared server socket. Await one to
+>    completion before issuing the next — never fire a `search` while a `connect_server` is still
+>    in flight — or two coroutines will `recv` the same socket concurrently (the single-reader
+>    model breaks). Download tasks each use their own independent connection and are exempt.
 
 ```cpp
 namespace ed2k::session {
