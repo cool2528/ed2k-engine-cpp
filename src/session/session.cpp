@@ -4,11 +4,14 @@
 #include <exception>
 #include <fstream>
 #include <map>
+#include <unordered_set>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include "ed2k/download/download.hpp"
+#include "ed2k/infra/http_download.hpp"
+#include "ed2k/metfile/server_met.hpp"
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/server/connection.hpp"
 #include "ed2k/util/error.hpp"
@@ -52,6 +55,15 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   bool shutting_down = false;
   std::function<void(const SessionEvent&)> handler;
   std::vector<std::byte> server_met_bytes;
+  // 服务器列表(server.met 解析结果); add_server/remove_server/update_server_met 修改后立即落盘。
+  ServerList servers;
+  // 当前登录会话; nullopt 表示未连接。receive_loop 持有其 conn 的引用式访问(通过 Impl 成员)。
+  std::optional<app::LoginSession> login;
+  server::ServerConnection::Subscription server_sub;
+  ServerStateEvent server_state;
+  // 每次 connect_server/disconnect_server 递增, 令在途的旧 receive_loop 协程在唤醒后
+  // 发现代次不匹配而安静退出, 不误用已失效的 login/conn。
+  std::uint32_t server_generation = 0;
   // cancel(remove_files=true) 在任务运行中被调用时, 文件此刻仍被 PartFile 打开(Windows 删除会失败);
   // 删除动作先记录到此处, 待协程退出(句柄已释放)后由 on_task_coroutine_exit 执行。键 = 任务 id。
   std::map<std::uint64_t, std::vector<std::filesystem::path>> pending_remove;
@@ -63,6 +75,58 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
     : rt(rt_arg), cfg(std::move(cfg_arg)) {
     server_met_bytes = read_file_bytes(cfg.data_dir / "server.met");
+    // 解析失败(文件不存在/损坏)保持 servers 为空表; login_with_rotation 内部走内建 fallback。
+    if(auto parsed = parse_server_met(server_met_bytes)) servers = std::move(*parsed);
+  }
+
+  // 把 servers 落盘到 cfg.data_dir/server.met: 写临时文件后 rename 原子替换。
+  // 无论落盘是否成功, server_met_bytes 都同步更新, 保证运行期(login_with_rotation 的轮换目标)
+  // 立即反映最新列表, 不依赖磁盘 IO 结果。
+  void persist_server_met(){
+    auto bytes = write_server_met(servers);
+    server_met_bytes = bytes;
+    std::error_code ec;
+    std::filesystem::create_directories(cfg.data_dir, ec);
+    auto tmp_path = cfg.data_dir / "server.met.tmp";
+    auto final_path = cfg.data_dir / "server.met";
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if(!f) return;                          // 打不开临时文件: 内存态已更新, 放弃本次落盘
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    f.close();
+    std::filesystem::rename(tmp_path, final_path, ec);   // 原子替换
+  }
+
+  // 断开当前服务器连接: 幂等(未连接时 no-op)。递增 server_generation 使在途的 receive_loop
+  // 唤醒后发现代次不匹配而安静退出, 不重复 emit。
+  void disconnect_server_internal(){
+    if(!login) return;
+    login->conn.close();
+    login.reset();
+    server_sub = server::ServerConnection::Subscription{};
+    ++server_generation;
+    server_state.connected = false;
+    emit(server_state);
+  }
+
+  // 服务器推送事件常驻循环(static + weak_ptr: Session 析构后挂起协程安全退化)。
+  // 与 sampler 不同, 此处需直接访问 self->login->conn 发起下一轮 receive_events, 故 co_await
+  // 期间必须持有 self(与 run_task 的网络等待同构); disconnect_server_internal() 会先 close()
+  // 连接, 促使挂起中的 recv 尽快以错误返回, 避免 Impl 生命周期被无谓拖长。
+  static asio::awaitable<void> receive_loop(std::weak_ptr<Impl> weak, std::uint32_t gen){
+    for(;;){
+      auto self = weak.lock();
+      if(!self || self->shutting_down) co_return;
+      if(self->server_generation != gen || !self->login) co_return;
+      auto r = co_await self->login->conn.receive_events(self->cfg.per_server_timeout);
+      self = weak.lock();
+      if(!self || self->shutting_down) co_return;
+      if(self->server_generation != gen) co_return;   // 本轮连接已被替换/主动断开, 结果作废
+      if(!r){
+        self->disconnect_server_internal();            // 连接异常断开: 收尾并 emit disconnected
+        co_return;
+      }
+      // 成功收到一次推送(已在 on_event 回调中分发/合并进 server_state), 继续下一轮监听
+    }
   }
 
   void emit(const SessionEvent& ev){ if(handler) handler(ev); }
@@ -326,6 +390,120 @@ std::vector<TaskSnapshot> Session::query_all() const {
 
 void Session::set_event_handler(std::function<void(const SessionEvent&)> handler){
   impl_->handler = std::move(handler);
+}
+
+asio::awaitable<tl::expected<server::LoginResult, std::error_code>>
+Session::connect_server(std::optional<app::ServerTarget> target){
+  impl_->disconnect_server_internal();      // 先清掉旧连接(幂等), 保证只有一个在途 receive_loop
+  auto ex = impl_->rt.executor();
+  auto lg = co_await app::login_with_rotation(ex, impl_->server_met_bytes,
+                                              target ? target : impl_->cfg.server_override,
+                                              impl_->login_params(), impl_->cfg.per_server_timeout);
+  if(!lg) co_return tl::unexpected(lg.error());
+  auto result = lg->result;                 // 先取值, 避免 move 之后再读悬空成员
+  impl_->login = std::move(*lg);
+  ++impl_->server_generation;
+  const auto gen = impl_->server_generation;
+
+  impl_->server_state = ServerStateEvent{};
+  impl_->server_state.connected = true;
+  impl_->server_state.high_id = result.high_id;
+  if(target){ impl_->server_state.ip = target->ip; impl_->server_state.port = target->port; }
+  else if(impl_->cfg.server_override){
+    impl_->server_state.ip = impl_->cfg.server_override->ip;
+    impl_->server_state.port = impl_->cfg.server_override->port;
+  }
+
+  // ServerStatusEvent(users/files) 与 ServerIdentEvent(name) 合并进 server_state 并转发为 SessionEvent。
+  impl_->server_sub = impl_->login->conn.on_event(
+    [weak = impl_->weak_from_this()](const server::ServerEvent& ev){
+      auto self = weak.lock();
+      if(!self) return;
+      if(auto* status = std::get_if<server::ServerStatusEvent>(&ev)){
+        self->server_state.users = status->users;
+        self->server_state.files = status->files;
+        self->emit(self->server_state);
+      } else if(auto* ident = std::get_if<server::ServerIdentEvent>(&ev)){
+        self->server_state.name = ident->name;
+        self->emit(self->server_state);
+      }
+    });
+
+  asio::co_spawn(impl_->rt.context(), Impl::receive_loop(impl_->weak_from_this(), gen), asio::detached);
+  impl_->emit(impl_->server_state);
+  co_return result;
+}
+
+void Session::disconnect_server(){
+  impl_->disconnect_server_internal();
+}
+
+bool Session::server_connected() const {
+  return impl_->login.has_value();
+}
+
+std::vector<ServerInfo> Session::server_list() const {
+  std::vector<ServerInfo> out;
+  out.reserve(impl_->servers.servers.size());
+  const bool connected = impl_->login.has_value() && impl_->server_state.connected;
+  for(const auto& e : impl_->servers.servers){
+    ServerInfo info;
+    info.ip = e.ip; info.port = e.port; info.name = e.name;
+    info.connected = connected && impl_->server_state.ip == e.ip && impl_->server_state.port == e.port;
+    out.push_back(std::move(info));
+  }
+  return out;
+}
+
+bool Session::add_server(IPv4 ip, std::uint16_t port, const std::string& name){
+  auto& list = impl_->servers.servers;
+  bool exists = std::any_of(list.begin(), list.end(),
+    [&](const ServerEntry& e){ return e.ip == ip && e.port == port; });
+  if(exists) return false;
+  ServerEntry e; e.ip = ip; e.port = port; e.name = name;
+  list.push_back(std::move(e));
+  impl_->persist_server_met();
+  return true;
+}
+
+bool Session::remove_server(IPv4 ip, std::uint16_t port){
+  auto& list = impl_->servers.servers;
+  auto it = std::find_if(list.begin(), list.end(),
+    [&](const ServerEntry& e){ return e.ip == ip && e.port == port; });
+  if(it == list.end()) return false;
+  list.erase(it);
+  impl_->persist_server_met();
+  return true;
+}
+
+asio::awaitable<tl::expected<std::size_t, std::error_code>>
+Session::update_server_met(const std::string& url){
+  std::error_code ec;
+  std::filesystem::create_directories(impl_->cfg.data_dir, ec);
+  auto tmp_path = impl_->cfg.data_dir / "server_met_download.tmp";
+  infra::HTTPDownload dl(impl_->rt.executor());
+  auto fr = co_await dl.fetch(url, tmp_path, std::chrono::seconds(30));
+  if(!fr) co_return tl::unexpected(fr.error());
+
+  auto bytes = read_file_bytes(tmp_path);
+  std::filesystem::remove(tmp_path, ec);
+  auto parsed = parse_server_met(bytes);
+  if(!parsed) co_return tl::unexpected(parsed.error());
+
+  auto key = [](IPv4 ip, std::uint16_t port){ return (std::uint64_t(ip.host()) << 16) | port; };
+  std::unordered_set<std::uint64_t> seen;
+  seen.reserve(impl_->servers.servers.size());
+  for(const auto& e : impl_->servers.servers) seen.insert(key(e.ip, e.port));
+
+  std::size_t added = 0;
+  for(auto& e : parsed->servers){
+    if(seen.insert(key(e.ip, e.port)).second){
+      impl_->servers.servers.push_back(std::move(e));
+      ++added;
+    }
+  }
+  if(added > 0) impl_->persist_server_met();
+  co_return added;
 }
 
 }

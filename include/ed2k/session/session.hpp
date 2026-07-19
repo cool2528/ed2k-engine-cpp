@@ -46,7 +46,20 @@ struct SessionConfig {
 };
 
 struct TaskStateEvent { std::uint64_t task_id = 0; TaskState state = TaskState::queued; std::error_code error; };
-using SessionEvent = std::variant<TaskStateEvent>;
+
+struct ServerInfo {                      // UI 服务器列表行
+  IPv4 ip; std::uint16_t port = 0;
+  std::string name;                      // 来自 server.met tags 或 IDENT, 可为空
+  bool connected = false;
+};
+struct ServerStateEvent {                // 服务器连接状态变化事件
+  bool connected = false;
+  IPv4 ip; std::uint16_t port = 0;
+  std::string name;
+  bool high_id = false;
+  std::uint32_t users = 0, files = 0;
+};
+using SessionEvent = std::variant<TaskStateEvent, ServerStateEvent>;
 
 // GUI 友好的任务管理门面: 任务注册表 + 下载编排协程 + 并发调度 + 1s 速度采样 + 状态事件。
 // 契约: 所有公共方法必须在网络线程(rt.executor())上调用; 内部状态无 mutex/condition_variable。
@@ -65,6 +78,19 @@ class ED2K_EXPORT Session {
   std::vector<TaskSnapshot> query_all() const;
   void set_event_handler(std::function<void(const SessionEvent&)> handler);
   void shutdown() noexcept;   // 置停全部任务; 幂等; 析构自动调用
+
+  // 服务器管理: 连接状态 + 列表维护 + server.met 持久化。所有方法必须在网络线程调用。
+  // target 为空时按 cfg.server_override + server.met + 内建 fallback 轮换登录。
+  boost::asio::awaitable<tl::expected<server::LoginResult, std::error_code>>
+    connect_server(std::optional<app::ServerTarget> target);
+  void disconnect_server();                                       // 幂等; 未连接时 no-op
+  bool server_connected() const;
+  std::vector<ServerInfo> server_list() const;
+  bool add_server(IPv4 ip, std::uint16_t port, const std::string& name);   // 去重; 落盘 server.met
+  bool remove_server(IPv4 ip, std::uint16_t port);                          // 落盘 server.met
+  // 从 url 下载 server.met, 按 (ip,port) 去重合并进当前列表并落盘, 返回新增条数。
+  boost::asio::awaitable<tl::expected<std::size_t, std::error_code>>
+    update_server_met(const std::string& url);
  private:
   struct Impl;
   std::shared_ptr<Impl> impl_;   // 协程持 weak_ptr, Session 销毁后挂起协程安全退化
