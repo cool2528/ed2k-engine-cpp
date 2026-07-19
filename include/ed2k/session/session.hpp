@@ -43,6 +43,8 @@ struct SessionConfig {
   std::optional<app::ServerTarget> server_override;  // 测试/设置注入的优先服务器
   std::chrono::milliseconds per_server_timeout = std::chrono::seconds(30);
   std::chrono::milliseconds task_io_timeout = std::chrono::seconds(60);  // 每次网络操作超时(非总时长)
+  bool enable_kad = false;              // 启用 Kad(DHT) 网络; 用 data_dir/nodes.dat 做种子引导
+  std::uint16_t kad_udp_port = 4672;    // Kad UDP 监听端口; 0 = 系统分配
 };
 
 struct TaskStateEvent { std::uint64_t task_id = 0; TaskState state = TaskState::queued; std::error_code error; };
@@ -106,6 +108,11 @@ class ED2K_EXPORT Session {
   // 搜索: 关键词 + 类型/大小/源数过滤。需已 connect_server, 否则返回 errc::connect_failed。
   boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
     search(const std::string& keyword, const SearchFilters& filters);
+
+  // Kad(DHT) 状态: running 反映 cfg.enable_kad 是否生效(网络对象是否已构造), contacts 为路由表
+  // 当前联系人数。cfg.enable_kad=false 时恒为 {false, 0}。
+  struct KadStatus { bool running = false; std::size_t contacts = 0; };
+  KadStatus kad_status() const;
  private:
   struct Impl;
   std::shared_ptr<Impl> impl_;   // 协程持 weak_ptr, Session 销毁后挂起协程安全退化

@@ -13,6 +13,8 @@
 #include <spdlog/spdlog.h>
 #include "ed2k/download/download.hpp"
 #include "ed2k/infra/http_download.hpp"
+#include "ed2k/kad/network.hpp"
+#include "ed2k/kad/nodes_dat.hpp"
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/server/connection.hpp"
@@ -81,12 +83,31 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // pause→resume 竞态下同一 id 可能有新旧两代协程并存(旧代挂起未醒, 新代已 pump 启动),
   // 用布尔标记无法表达"多个在途"这一状态, 必须用计数; 只有归零(最后一个持句柄的协程退出)才安全删文件。
   std::map<std::uint64_t, int> inflight;
+  // Kad(DHT) 网络实例; cfg.enable_kad=false 时恒为空。run_task 构建 Builder 时若非空则追加
+  // .kad_network(*kad), 交由 MultiSourceDownload 在缺源时自动增源。
+  std::unique_ptr<kad::KadNetwork> kad;
 
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
     : rt(rt_arg), cfg(std::move(cfg_arg)) {
     server_met_bytes = read_file_bytes(cfg.data_dir / "server.met");
     // 解析失败(文件不存在/损坏)保持 servers 为空表; login_with_rotation 内部走内建 fallback。
     if(auto parsed = parse_server_met(server_met_bytes)) servers = std::move(*parsed);
+    if(cfg.enable_kad){
+      const auto user_hash = effective_user_hash();
+      kad::KadNetworkOptions opts;
+      opts.id = kad::KadID::from_user_hash(user_hash, 1);
+      opts.ip = IPv4::from_dotted("0.0.0.0").value();   // 本地公网 IP 未知, 占位(与 CLI 一致)
+      opts.udp_port = cfg.kad_udp_port;
+      opts.tcp_port = cfg.tcp_port;
+      opts.version = kad::kad2_version;
+      opts.user_hash = kad::KadID::from_bytes(user_hash.bytes());
+      kad = std::make_unique<kad::KadNetwork>(rt.executor(), opts);
+    }
+  }
+
+  // cfg.user_hash 未设置时的默认值(与既有 login_params() 保持一致的占位 user_hash)。
+  UserHash effective_user_hash() const {
+    return cfg.user_hash.value_or(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
   }
 
   // 把 servers 落盘到 cfg.data_dir/server.met: 写临时文件后 rename 原子替换。
@@ -114,6 +135,32 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     std::filesystem::rename(tmp_path, final_path, ec);   // 原子替换
     if(ec){
       spdlog::warn("Session::persist_server_met: rename {} -> {} failed: {}",
+                   tmp_path.string(), final_path.string(), ec.message());
+    }
+  }
+
+  // 把当前 Kad 路由表联系人落盘到 cfg.data_dir/nodes.dat: 写临时文件后 rename 原子替换,
+  // 与 persist_server_met 同构(临时文件名带 tcp_port + 进程内自增序号防并发覆盖)。仅在
+  // shutdown() 里调用一次(kad->close() 之后), 不在运行期频繁落盘。
+  void persist_nodes_dat(){
+    if(!kad) return;
+    auto bytes = kad::write_nodes_dat(kad->routing_table().all_contacts());
+    std::error_code ec;
+    std::filesystem::create_directories(cfg.data_dir, ec);
+    const auto seq = g_persist_seq.fetch_add(1, std::memory_order_relaxed);
+    auto tmp_path = cfg.data_dir /
+      ("nodes.dat." + std::to_string(cfg.tcp_port) + "." + std::to_string(seq) + ".tmp");
+    auto final_path = cfg.data_dir / "nodes.dat";
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if(!f){
+      spdlog::warn("Session::persist_nodes_dat: failed to open temp file {}", tmp_path.string());
+      return;
+    }
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    f.close();
+    std::filesystem::rename(tmp_path, final_path, ec);
+    if(ec){
+      spdlog::warn("Session::persist_nodes_dat: rename {} -> {} failed: {}",
                    tmp_path.string(), final_path.string(), ec.message());
     }
   }
@@ -146,7 +193,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     server::LoginParams p;
     p.nickname = cfg.nickname;
     p.client_port = cfg.tcp_port;
-    p.user_hash = cfg.user_hash.value_or(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
+    p.user_hash = effective_user_hash();
     return p;
   }
   // 启动排队任务直到并发上限
@@ -241,6 +288,9 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
           if(auto* e = s->find_alive(id, gen)) e->bytes_done = done;
       });
     if(listener) builder.listener(*listener);
+    // enable_kad 时把 Kad 网络注入 Builder; MultiSourceDownload::run() 内部若发现 sources 不足
+    // 会自动调用 kad_network.find_sources(...) 增源(既有逻辑, 见 download.cpp)。
+    if(self->kad) builder.kad_network(*self->kad);
     auto dl = builder.build();
     auto r = co_await dl.run(self->cfg.task_io_timeout, 3);
 
@@ -287,6 +337,37 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     }
   }
 
+  // Kad 常驻协程(static + weak_ptr: Session 析构后挂起协程安全退化为 no-op, 与 run_task/sampler
+  // 同构)。先用 nodes.dat 解析出的 seeds 做一次性 bootstrap(填充路由表), 完成后转入 serve_once
+  // 常驻循环(应答入站 Kad 请求, 使本节点成为正常网络参与者)。
+  // 刻意合并成单协程顺序执行(而非 bootstrap/serve 各自独立 co_spawn): KadNetwork 的 UDP 收包
+  // (recv_kad_packet)是无请求/响应 ID 分发的单读者模型——bootstrap()/serve_once() 都直接
+  // co_await 同一个 socket 的 recv, 谁在当前时刻发起 recv 谁就拿走下一个到达的数据报。若两者
+  // 并发跑在同一个 KadNetwork 实例上, 会互相偷走对方期待的响应包(与 Task 6/7 里
+  // server::ServerConnection 必须"单读者"的既有约束同构)。顺序执行从根上避免这个自引入的竞态。
+  // 已知风险(超出本任务范围, 见 task-8-brief.md "已识别的实现风险"): run_task 里
+  // MultiSourceDownload::run() 内部调用的 kad_network.find_sources(...) 仍可能与这里的
+  // serve_once 常驻循环在同一 KadNetwork 实例上并发发起 recv, 根治需要在 KadNetwork 内部引入
+  // 按 opcode/target 的请求路由, 属于更底层改动。
+  static asio::awaitable<void> kad_run(std::weak_ptr<Impl> weak, std::vector<kad::Contact> seeds){
+    auto self = weak.lock();
+    if(!self || self->shutting_down || !self->kad) co_return;
+    auto bootstrapped = co_await self->kad->bootstrap(seeds, std::chrono::milliseconds(1500));
+    (void)bootstrapped;   // 失败(无种子/全部超时)不致命; serve_once 循环仍可被动学习到联系人
+    self = weak.lock();
+    if(!self || self->shutting_down || !self->kad) co_return;
+
+    for(;;){
+      // self 在 co_await 期间保持存活(持有额外 shared_ptr 引用), 保证 self->kad 指向的
+      // KadNetwork 不会被析构; shutdown() 会调用 kad->close() 促使 recv 尽快因 socket 关闭
+      // 而返回错误, 不会无限期挂起到 Impl 引用计数归零才被回收。
+      auto served = co_await self->kad->serve_once(std::chrono::milliseconds(2000));
+      (void)served;       // 超时/解析失败/socket 已关闭都继续下一轮
+      self = weak.lock();
+      if(!self || self->shutting_down || !self->kad) co_return;   // Session 已析构/正在关闭
+    }
+  }
+
   TaskSnapshot snapshot(const TaskEntry& t) const {
     TaskSnapshot s;
     s.id = t.id; s.name = t.link.name; s.hash = t.link.hash;
@@ -300,6 +381,14 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
 Session::Session(net::IoRuntime& rt, SessionConfig cfg)
   : impl_(std::make_shared<Impl>(rt, std::move(cfg))) {
   asio::co_spawn(rt.context(), Impl::sampler(impl_->weak_from_this()), asio::detached);
+  if(impl_->kad){
+    // nodes.dat 不存在/解析失败(首次运行/损坏)时 seeds 为空; Impl::kad_run 内部的 bootstrap()
+    // 对空 seeds 会快速返回失败, 不阻塞 Session 可用, 随后仍进入 serve_once 常驻循环。
+    std::vector<kad::Contact> seeds;
+    auto nodes_bytes = read_file_bytes(impl_->cfg.data_dir / "nodes.dat");
+    if(auto parsed = kad::parse_nodes_dat(nodes_bytes)) seeds = std::move(*parsed);
+    asio::co_spawn(rt.context(), Impl::kad_run(impl_->weak_from_this(), std::move(seeds)), asio::detached);
+  }
 }
 
 Session::~Session(){ shutdown(); }
@@ -313,6 +402,14 @@ void Session::shutdown() noexcept {
   // close()(而非完整的 disconnect_server_internal()): shutdown() 是 noexcept 且在析构路径上
   // 被调用, 不适合在此处 emit 事件(调用用户 handler 可能抛出)。
   if(impl_->login) impl_->login->conn.close();
+  // 同理关闭 Kad UDP socket, 促使 kad_run 里挂起的 bootstrap/serve_once recv 尽快因 socket
+  // 已关闭而返回错误(而非等到超时); 随后落盘当前路由表联系人到 nodes.dat, 供下次启动做种子
+  // 引导。persist_nodes_dat 内部已用 std::error_code/spdlog::warn 处理失败, 不抛异常, 满足
+  // shutdown() 的 noexcept 约束。
+  if(impl_->kad){
+    impl_->kad->close();
+    impl_->persist_nodes_dat();
+  }
 }
 
 std::uint64_t Session::add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir){
@@ -596,6 +693,11 @@ Session::search(const std::string& keyword, const SearchFilters& filters){
   self = weak.lock();
   if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));
   co_return r;
+}
+
+Session::KadStatus Session::kad_status() const {
+  return KadStatus{impl_->kad != nullptr,
+                    impl_->kad ? impl_->kad->routing_table().size() : std::size_t{0}};
 }
 
 }
