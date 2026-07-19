@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -278,5 +279,65 @@ TEST(SessionSearch, ReturnsFilteredResults){
     EXPECT_EQ((*r)[0].size, 123456u);
     co_return;
   });
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// UAF 回归: connect_server()/search() 跨多次 co_await 访问 Impl 必须走 weak_ptr(与
+// run_task/sampler 同构), 而不是隐式捕获 this——否则 Session 在协程挂起期间被销毁(如调用方
+// quit/切账号)会导致挂起协程恢复后访问已悬垂的 this->impl_。
+// 构造确定性场景: mock server 在 login 后立即回一个最小 SERVERIDENT(让 connect_server 的初始
+// 快照窗口秒结束, 不必等满 2s 上限), 随后读到 SEARCHREQUEST 后故意不回复(让 search() 底层
+// conn.recv() 一直挂起等待响应)。另起一个协程在明显早于 search() 自身 per_server_timeout(特意
+// 设得很长, 5s)的时间点(300ms)主动销毁 Session——其析构会 close() 掉同一条连接, 促使 search()
+// 挂起的 recv() 在下一个 io_context tick 以错误唤醒。断言: 进程不崩溃(UAF 会在此处崩溃或数据
+// 损坏)、search 协程能安全收尾并返回错误(而非死等或崩溃)。
+TEST(SessionSearch, SearchSurvivesSessionDestructionWhileAwaitingReply){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+    { codec::ByteWriter w;   // 立即发最小 SERVERIDENT(0 个 tag), 让快照窗口尽快结束
+      w.hash16(MD4Hash{});
+      w.u32_be(IPv4::from_dotted("127.0.0.1").value().host());
+      w.u16(0);
+      w.u32(0);
+      co_await send_pkt(s, ed2k::server::op::SERVERIDENT, w.take());
+    }
+    (void)co_await read_frame(s);   // SEARCHREQUEST — 故意不回复, 让 search() 的 recv 一直挂起
+    co_await keep_alive(s);         // 保持连接打开, 直到客户端 close(Session 析构触发)
+    co_return;
+  });
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_search_uaf_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 5000ms;   // 远大于下面销毁 Session 前的等待时长, 确保销毁时 search 仍挂起中
+  std::optional<Session> session;
+  session.emplace(rt, cfg);
+  bool search_completed = false;
+  bool search_had_error = false;
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    auto lr = co_await session->connect_server(
+      ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()});
+    if(!lr){ search_completed = true; co_return; }   // 守卫: 不应发生, 连接失败就不必继续
+    auto r = co_await session->search("foo", {});
+    // 走到这里说明 search() 协程即便在 Session 已被销毁的情况下也安全收尾(没有 UAF 崩溃)。
+    search_completed = true;
+    search_had_error = !r.has_value();
+    co_return;
+  }, asio::detached);
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    asio::steady_timer timer(rt.context());
+    // 300ms 远小于 per_server_timeout(5s), 留足时间让上面的协程已发出 SEARCHREQUEST 并挂起在
+    // 等待响应的 recv() 上, 确保下面的销毁确实落在"协程挂起期间", 而不是抢在其发起请求之前。
+    timer.expires_after(300ms);
+    co_await timer.async_wait(asio::use_awaitable);
+    session.reset();                // 触发 ~Session -> shutdown() -> conn.close()
+    co_return;
+  }, asio::detached);
+  rt.run(); rt.restart();
+  EXPECT_TRUE(search_completed);
+  EXPECT_TRUE(search_had_error);    // 连接被关闭, search 应以错误收尾, 而非死等或崩溃
   std::filesystem::remove_all(tmp_dir);
 }

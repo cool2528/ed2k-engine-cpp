@@ -88,6 +88,10 @@ class ED2K_EXPORT Session {
 
   // 服务器管理: 连接状态 + 列表维护 + server.met 持久化。所有方法必须在网络线程调用。
   // target 为空时按 cfg.server_override + server.met + 内建 fallback 轮换登录。
+  // 方案 C 降级(见 session.cpp 实现注释): 登录成功后仅同步读一个短窗口(<= 2s)捕获服务器初始
+  // 推送快照(SERVERSTATUS/SERVERIDENT), 窗口结束后连接转入空闲——不再有常驻读者。因此窗口结束
+  // 后服务器再推送的状态更新不会被感知, 也不再主动检测服务器掉线, 只有下一次前台请求(如
+  // search)因连接已失效而失败时才会发现。
   boost::asio::awaitable<tl::expected<server::LoginResult, std::error_code>>
     connect_server(std::optional<app::ServerTarget> target);
   void disconnect_server();                                       // 幂等; 未连接时 no-op

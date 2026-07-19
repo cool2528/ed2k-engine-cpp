@@ -400,59 +400,70 @@ void Session::set_event_handler(std::function<void(const SessionEvent&)> handler
 
 asio::awaitable<tl::expected<server::LoginResult, std::error_code>>
 Session::connect_server(std::optional<app::ServerTarget> target){
-  impl_->disconnect_server_internal();      // 先清掉旧连接(幂等), 保证只有一个存活连接
+  // UAF 修复: 本方法跨越多次 co_await(login_with_rotation + 快照窗口内的多轮 receive_events),
+  // 若中途 Session 被销毁(如调用方 quit/切账号), 隐式捕获的 this 会在挂起恢复后变成悬垂指针。
+  // 与 run_task/sampler 同构: 只经 weak_ptr 访问 Impl, 每个 co_await 之后都重新 lock() 并判空;
+  // lock() 成功期间 self 持有一份额外的 shared_ptr 引用, 足以让 Impl(及其里面的连接)在本协程
+  // 收尾前不被析构, 即使 Session 本体已经先行销毁。
+  auto weak = impl_->weak_from_this();
+  auto self = weak.lock();
+  if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));   // 理论上入口处必然存活, 仅防御
+  self->disconnect_server_internal();      // 先清掉旧连接(幂等), 保证只有一个存活连接
   // I1: 在挂起(co_await login_with_rotation)之前就占用本次连接尝试的代次。若挂起期间又有
   // 一次更晚的 connect_server()/disconnect_server() 调用抢先执行, 它会继续推进
   // server_generation; 本次恢复后发现代次已不匹配, 即可判定"被抢先", 从而丢弃自己刚建立的
-  // 连接而不覆盖 impl_->login, 避免两次并发 connect_server 都各自 std::move 进 login 导致
+  // 连接而不覆盖 self->login, 避免两次并发 connect_server 都各自 std::move 进 login 导致
   // 静默丢弃前一个连接、绕过"先 close 再 reset"的次序。
-  const auto gen = ++impl_->server_generation;
-  auto ex = impl_->rt.executor();
-  auto lg = co_await app::login_with_rotation(ex, impl_->server_met_bytes,
-                                              target ? target : impl_->cfg.server_override,
-                                              impl_->login_params(), impl_->cfg.per_server_timeout);
-  if(impl_->server_generation != gen){
+  const auto gen = ++self->server_generation;
+  auto ex = self->rt.executor();
+  auto lg = co_await app::login_with_rotation(ex, self->server_met_bytes,
+                                              target ? target : self->cfg.server_override,
+                                              self->login_params(), self->cfg.per_server_timeout);
+  self = weak.lock();
+  if(!self || self->shutting_down) co_return tl::unexpected(make_error_code(errc::cancelled));
+  if(self->server_generation != gen){
     // 本次尝试已被更晚的调用抢先: 关闭刚建立的连接(若登录成功), 不写入 login, 直接返回。
     if(lg) lg->conn.close();
     co_return tl::unexpected(make_error_code(errc::cancelled));
   }
   if(!lg) co_return tl::unexpected(lg.error());
   auto result = lg->result;                 // 先取值, 避免 move 之后再读悬空成员
-  impl_->login = std::move(*lg);
+  self->login = std::move(*lg);
 
-  impl_->server_state = ServerStateEvent{};
-  impl_->server_state.connected = true;
-  impl_->server_state.high_id = result.high_id;
+  self->server_state = ServerStateEvent{};
+  self->server_state.connected = true;
+  self->server_state.high_id = result.high_id;
   // C2: 这里的 ip/port 只是"请求连接的目标"占位值——login_with_rotation 内部会在该目标失败时
   // 故障转移到 server.met/内建 fallback 里的其它服务器, 实际连上的可能是另一个地址。真正权威
   // 的地址以下面 on_event 收到的 ServerIdentEvent(服务器自报的 ip/port/name)为准并会覆盖。
-  if(target){ impl_->server_state.ip = target->ip; impl_->server_state.port = target->port; }
-  else if(impl_->cfg.server_override){
-    impl_->server_state.ip = impl_->cfg.server_override->ip;
-    impl_->server_state.port = impl_->cfg.server_override->port;
+  if(target){ self->server_state.ip = target->ip; self->server_state.port = target->port; }
+  else if(self->cfg.server_override){
+    self->server_state.ip = self->cfg.server_override->ip;
+    self->server_state.port = self->cfg.server_override->port;
   }
 
   // ServerStatusEvent(users/files) 与 ServerIdentEvent(name+ip+port, 服务器自报的真实身份)
-  // 合并进 server_state 并转发为 SessionEvent。
-  impl_->snapshot_ident_seen = false;
-  impl_->server_sub = impl_->login->conn.on_event(
-    [weak = impl_->weak_from_this()](const server::ServerEvent& ev){
-      auto self = weak.lock();
-      if(!self) return;
+  // 合并进 server_state 并转发为 SessionEvent。回调本身已经是 weak_ptr 驱动(与本方法体无关的
+  // 独立生命周期), 直接复用上面拿到的 weak, 不必再派生一次。
+  self->snapshot_ident_seen = false;
+  self->server_sub = self->login->conn.on_event(
+    [weak](const server::ServerEvent& ev){
+      auto s = weak.lock();
+      if(!s) return;
       if(auto* status = std::get_if<server::ServerStatusEvent>(&ev)){
-        self->server_state.users = status->users;
-        self->server_state.files = status->files;
-        self->emit(self->server_state);
+        s->server_state.users = status->users;
+        s->server_state.files = status->files;
+        s->emit(s->server_state);
       } else if(auto* ident = std::get_if<server::ServerIdentEvent>(&ev)){
-        self->server_state.name = ident->name;
-        self->server_state.ip = ident->ip;      // C2: 用服务器自报地址覆盖占位的 target/override
-        self->server_state.port = ident->port;
-        self->snapshot_ident_seen = true;
-        self->emit(self->server_state);
+        s->server_state.name = ident->name;
+        s->server_state.ip = ident->ip;      // C2: 用服务器自报地址覆盖占位的 target/override
+        s->server_state.port = ident->port;
+        s->snapshot_ident_seen = true;
+        s->emit(s->server_state);
       }
     });
 
-  impl_->emit(impl_->server_state);   // 先 emit 一次 connected=true(占位地址), 让调用方尽快感知已连接
+  self->emit(self->server_state);   // 先 emit 一次 connected=true(占位地址), 让调用方尽快感知已连接
 
   // 方案 C: 不再启动常驻 receive_loop——Task 6 的常驻推送监听与 search()/get_sources() 等前台
   // 请求共用同一条连接时会并发调用 conn.recv(), 而 asio 不允许对同一 socket 并发发起读操作;
@@ -466,19 +477,20 @@ Session::connect_server(std::optional<app::ServerTarget> target){
   // 等前台请求可安全独占读取该连接, 无需任何并发协调。
   // 已知降级(方案 C 的取舍): 窗口结束后服务器再推送的状态更新不会被感知; 也不再主动检测服务器
   // 掉线, 只有在下一次前台请求(如 search)因连接已断而失败时才会发现。
-  const auto snapshot_budget = std::min(impl_->cfg.per_server_timeout, std::chrono::milliseconds(2000));
+  const auto snapshot_budget = std::min(self->cfg.per_server_timeout, std::chrono::milliseconds(2000));
   const auto snapshot_deadline = std::chrono::steady_clock::now() + snapshot_budget;
   for(;;){
-    if(impl_->server_generation != gen || !impl_->login)
-      co_return tl::unexpected(make_error_code(errc::cancelled));   // 被更晚的调用抢先, 让出
+    if(self->shutting_down || self->server_generation != gen || !self->login)
+      co_return tl::unexpected(make_error_code(errc::cancelled));   // 被更晚的调用抢先/正在关闭, 让出
     auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
       snapshot_deadline - std::chrono::steady_clock::now());
     if(rem.count() <= 0) break;                // 窗口预算耗尽, 结束快照读取
-    auto r = co_await impl_->login->conn.receive_events(rem);
-    if(impl_->server_generation != gen || !impl_->login)
+    auto r = co_await self->login->conn.receive_events(rem);
+    self = weak.lock();
+    if(!self || self->shutting_down || self->server_generation != gen || !self->login)
       co_return tl::unexpected(make_error_code(errc::cancelled));
     if(!r) break;                              // 超时或本轮无更多推送: 结束窗口(login 已成功, 不因此判定断线)
-    if(impl_->snapshot_ident_seen) break;       // 已拿到服务器自报的真实身份, 无需再等
+    if(self->snapshot_ident_seen) break;        // 已拿到服务器自报的真实身份, 无需再等
   }
   co_return result;
 }
@@ -527,11 +539,18 @@ bool Session::remove_server(IPv4 ip, std::uint16_t port){
 
 asio::awaitable<tl::expected<std::size_t, std::error_code>>
 Session::update_server_met(const std::string& url){
+  // UAF 修复: 同 connect_server/search——co_await dl.fetch(...) 期间 Session 可能被销毁,
+  // 改为 weak_ptr 驱动, co_await 之后重新 lock() 才能安全访问 Impl。
+  auto weak = impl_->weak_from_this();
+  auto self = weak.lock();
+  if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));
   std::error_code ec;
-  std::filesystem::create_directories(impl_->cfg.data_dir, ec);
-  auto tmp_path = impl_->cfg.data_dir / "server_met_download.tmp";
-  infra::HTTPDownload dl(impl_->rt.executor());
+  std::filesystem::create_directories(self->cfg.data_dir, ec);
+  auto tmp_path = self->cfg.data_dir / "server_met_download.tmp";
+  infra::HTTPDownload dl(self->rt.executor());
   auto fr = co_await dl.fetch(url, tmp_path, std::chrono::seconds(30));
+  self = weak.lock();
+  if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));
   if(!fr) co_return tl::unexpected(fr.error());
 
   auto bytes = read_file_bytes(tmp_path);
@@ -541,23 +560,29 @@ Session::update_server_met(const std::string& url){
 
   auto key = [](IPv4 ip, std::uint16_t port){ return (std::uint64_t(ip.host()) << 16) | port; };
   std::unordered_set<std::uint64_t> seen;
-  seen.reserve(impl_->servers.servers.size());
-  for(const auto& e : impl_->servers.servers) seen.insert(key(e.ip, e.port));
+  seen.reserve(self->servers.servers.size());
+  for(const auto& e : self->servers.servers) seen.insert(key(e.ip, e.port));
 
   std::size_t added = 0;
   for(auto& e : parsed->servers){
     if(seen.insert(key(e.ip, e.port)).second){
-      impl_->servers.servers.push_back(std::move(e));
+      self->servers.servers.push_back(std::move(e));
       ++added;
     }
   }
-  if(added > 0) impl_->persist_server_met();
+  if(added > 0) self->persist_server_met();
   co_return added;
 }
 
 asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
 Session::search(const std::string& keyword, const SearchFilters& filters){
-  if(!impl_->login) co_return tl::unexpected(make_error_code(errc::connect_failed));
+  // UAF 修复: 与 connect_server 同理——co_await conn.search(...) 期间若 Session 被销毁, 隐式
+  // 捕获的 this 会在挂起恢复后悬垂。改为 weak_ptr 驱动: 入口 lock 一次拿到 self(其持有的额外
+  // shared_ptr 引用保证 Impl/连接在本协程收尾前存活), co_await 之后再 lock 一次才能安全返回。
+  auto weak = impl_->weak_from_this();
+  auto self = weak.lock();
+  if(!self || self->shutting_down || !self->login)
+    co_return tl::unexpected(make_error_code(errc::connect_failed));
   // 按 filters 逐项用 operator& 组合进 SearchExpr; 只在非默认值时才追加对应子表达式。
   server::SearchExpr expr = server::Keyword{keyword};
   if(filters.type != server::FileType::Any)
@@ -566,7 +591,11 @@ Session::search(const std::string& keyword, const SearchFilters& filters){
     expr = std::move(expr) & server::SearchExpr(server::SizeAtLeast{filters.min_size});
   if(filters.min_avail > 0)
     expr = std::move(expr) & server::SearchExpr(server::AvailAtLeast{filters.min_avail});
-  co_return co_await impl_->login->conn.search(expr, impl_->cfg.per_server_timeout);
+  const auto timeout = self->cfg.per_server_timeout;
+  auto r = co_await self->login->conn.search(expr, timeout);
+  self = weak.lock();
+  if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));
+  co_return r;
 }
 
 }
