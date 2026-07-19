@@ -45,6 +45,5 @@ TEST(Error, LegacyNumericCodesRemainStable) {
 TEST(Error, CancelledHasMessage){
   auto ec = ed2k::make_error_code(ed2k::errc::cancelled);
   EXPECT_TRUE(ec);
-  EXPECT_FALSE(ec.message().empty());
-  EXPECT_NE(ec.message(), "unknown");
+  EXPECT_EQ(ec.message(), "operation cancelled");
 }
