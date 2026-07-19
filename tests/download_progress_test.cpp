@@ -143,3 +143,30 @@ TEST(DownloadProgress, ReportsMonotonicProgressToCompletion){
   std::filesystem::remove(tmp);
   std::filesystem::remove(tmp.string() + ".part.met");
 }
+
+TEST(DownloadProgress, StopFlagCancelsRun){
+  auto mf = make_mock_file(0x33, 0x44);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  auto tmp = std::filesystem::temp_directory_path() / "ed2k_stop_test.bin";
+  std::filesystem::remove(tmp);
+  std::filesystem::remove(tmp.string() + ".part.met");
+  auto stop = std::make_shared<bool>(false);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = ed2k::download::MultiSourceDownload::Builder(rt.executor())
+      .out(tmp).hash(mf.fhash).size(PART*2)
+      .sources(std::vector<SourceEndpoint>{{0x0100007Fu, peer.port()}})
+      .on_progress([&](std::uint64_t d, std::uint64_t){ if(d > 0) *stop = true; })  // 首块后请求停止
+      .stop_flag(stop)
+      .build();
+    auto r = co_await dl.run(20000ms, 3);
+    // 注: 协程体内不可用裸 return (C++20 规则, ASSERT_* 宏内含 return 无法编译),
+    // 故以 EXPECT_FALSE + 条件守卫替代 ASSERT_FALSE, 避免在 r 意外持有值时访问 r.error() 触发 UB。
+    EXPECT_FALSE(r.has_value());
+    if(!r.has_value()) EXPECT_EQ(r.error(), ed2k::make_error_code(ed2k::errc::cancelled));
+    co_return;
+  });
+  std::filesystem::remove(tmp);
+  std::filesystem::remove(tmp.string() + ".part.met");
+}

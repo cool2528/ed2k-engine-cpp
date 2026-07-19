@@ -88,6 +88,7 @@ class MultiSourceDownload {
       return *this;
     }
     Builder& on_progress(ProgressFn fn) { on_progress_ = std::move(fn); return *this; }
+    Builder& stop_flag(std::shared_ptr<const bool> flag) { stop_ = std::move(flag); return *this; }
     MultiSourceDownload build();
    private:
     friend class MultiSourceDownload;
@@ -105,6 +106,7 @@ class MultiSourceDownload {
     std::shared_ptr<const infra::IPFilter> ip_filter_;
     std::uint8_t ip_filter_level_ = 127;
     ProgressFn on_progress_;
+    std::shared_ptr<const bool> stop_;
   };
 
   [[deprecated("Use MultiSourceDownload::Builder")]]
@@ -140,7 +142,8 @@ class MultiSourceDownload {
                       std::uint8_t ip_filter_level,
                       peer::ObfuscationPolicy obfuscation_policy,
                       std::optional<UserHash> local_user_hash,
-                      ProgressFn on_progress);
+                      ProgressFn on_progress,
+                      std::shared_ptr<const bool> stop);
   struct Impl;
   std::unique_ptr<Impl> impl_;
   friend class Builder;
