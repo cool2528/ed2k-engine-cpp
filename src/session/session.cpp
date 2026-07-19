@@ -1,0 +1,250 @@
+#include "ed2k/session/session.hpp"
+#include <algorithm>
+#include <cstring>
+#include <exception>
+#include <fstream>
+#include <map>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include "ed2k/download/download.hpp"
+#include "ed2k/peer/inbound_listener.hpp"
+#include "ed2k/server/connection.hpp"
+#include "ed2k/util/error.hpp"
+
+namespace ed2k::session {
+namespace asio = boost::asio;
+
+namespace {
+// 读整个文件到内存; 不存在/失败返回空(login_with_rotation 空 met 时走内建 fallback 服务器)
+std::vector<std::byte> read_file_bytes(const std::filesystem::path& p){
+  std::ifstream f(p, std::ios::binary);
+  if(!f) return {};
+  std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  std::vector<std::byte> out(buf.size());
+  std::memcpy(out.data(), buf.data(), buf.size());
+  return out;
+}
+}
+
+struct TaskEntry {
+  std::uint64_t id = 0;
+  Ed2kFileLink link;
+  std::filesystem::path out_path;
+  TaskState state = TaskState::queued;
+  std::error_code error;
+  std::uint64_t bytes_done = 0;
+  std::uint64_t speed_bps = 0;
+  std::uint64_t last_sample_bytes = 0;
+  std::chrono::steady_clock::time_point last_sample_time{};
+  std::size_t known_sources = 0;
+  std::shared_ptr<bool> stop;        // 本代运行的停止标志
+  std::uint32_t generation = 0;      // resume 递增; 旧代协程回写作废
+};
+
+struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
+  net::IoRuntime& rt;
+  SessionConfig cfg;
+  std::uint64_t next_id = 1;
+  std::map<std::uint64_t, TaskEntry> tasks;
+  std::size_t active = 0;
+  bool shutting_down = false;
+  std::function<void(const SessionEvent&)> handler;
+  std::vector<std::byte> server_met_bytes;
+
+  Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
+    : rt(rt_arg), cfg(std::move(cfg_arg)) {
+    server_met_bytes = read_file_bytes(cfg.data_dir / "server.met");
+  }
+
+  void emit(const SessionEvent& ev){ if(handler) handler(ev); }
+  void set_state(TaskEntry& t, TaskState s, std::error_code ec = {}){
+    t.state = s; t.error = ec;
+    emit(TaskStateEvent{t.id, s, ec});
+  }
+  // 指定代次仍存活的任务; 不匹配返回 nullptr(任务已删/已重启新代)
+  TaskEntry* find_alive(std::uint64_t id, std::uint32_t gen){
+    auto it = tasks.find(id);
+    if(it == tasks.end() || it->second.generation != gen) return nullptr;
+    return &it->second;
+  }
+  server::LoginParams login_params() const {
+    server::LoginParams p;
+    p.nickname = cfg.nickname;
+    p.client_port = cfg.tcp_port;
+    p.user_hash = cfg.user_hash.value_or(*UserHash::from_hex("0123456789abcdeffedcba9876543210"));
+    return p;
+  }
+  // 启动排队任务直到并发上限
+  void pump(){
+    if(shutting_down) return;
+    for(auto& [id, t] : tasks){
+      if(active >= cfg.max_concurrent_tasks) break;
+      if(t.state != TaskState::queued) continue;
+      ++active;
+      t.stop = std::make_shared<bool>(false);
+      set_state(t, TaskState::connecting);
+      asio::co_spawn(rt.context(), run_task(weak_from_this(), id, t.generation), asio::detached);
+    }
+  }
+  void finish_slot(){
+    if(active > 0) --active;
+    pump();
+  }
+
+  // 任务编排协程(static + weak_ptr: Session 析构后挂起协程安全退化为 no-op)。
+  // 流程复刻 app::download_link: login_with_rotation → get_sources → MultiSourceDownload。
+  static asio::awaitable<void> run_task(std::weak_ptr<Impl> weak, std::uint64_t id, std::uint32_t gen){
+    auto self = weak.lock();
+    if(!self) co_return;
+    auto ex = self->rt.executor();
+    auto* t = self->find_alive(id, gen);
+    if(!t || t->state != TaskState::connecting){ self->finish_slot(); co_return; }
+    auto stop = t->stop;
+    auto link = t->link;
+    auto out_path = t->out_path;
+
+    auto lg = co_await app::login_with_rotation(ex, self->server_met_bytes, self->cfg.server_override,
+                                                self->login_params(), self->cfg.per_server_timeout);
+    self = weak.lock(); if(!self) co_return;
+    t = self->find_alive(id, gen);
+    if(!t){ self->finish_slot(); co_return; }
+    if(stop && *stop){ self->finish_slot(); co_return; }        // pause/cancel 已改状态, 不覆盖
+    if(!lg){ self->set_state(*t, TaskState::failed, lg.error()); self->finish_slot(); co_return; }
+
+    auto gs = co_await lg->conn.get_sources(link.hash, link.size, self->cfg.per_server_timeout);
+    self = weak.lock(); if(!self) co_return;
+    t = self->find_alive(id, gen);
+    if(!t){ self->finish_slot(); co_return; }
+    if(stop && *stop){ self->finish_slot(); co_return; }
+    if(!gs){ self->set_state(*t, TaskState::failed, gs.error()); self->finish_slot(); co_return; }
+    t->known_sources = gs->sources.size();
+    if(gs->sources.empty()){
+      self->set_state(*t, TaskState::failed, make_error_code(errc::file_not_found));
+      self->finish_slot(); co_return;
+    }
+
+    // LowID 源回调需要 listener; bind 失败(端口占用)时保持为空, worker 守卫优雅跳过 LowID
+    bool has_low_id = std::any_of(gs->sources.begin(), gs->sources.end(),
+                                  [](const server::SourceEndpoint& s){ return s.low_id(); });
+    std::optional<peer::InboundListener> listener;
+    if(has_low_id){
+      try { listener.emplace(ex, self->cfg.tcp_port); }
+      catch(const std::exception&) { /* 端口被占 — LowID 源跳过 */ }
+    }
+
+    self->set_state(*t, TaskState::downloading);
+    auto builder = download::MultiSourceDownload::Builder(ex)
+      .out(out_path).hash(link.hash).size(link.size)
+      .aich(std::nullopt)
+      .sources(std::move(gs->sources))
+      .obfuscation(self->cfg.obfuscation, self->cfg.user_hash)
+      .server(lg->conn)
+      .disk_executor(self->rt.disk_executor())
+      .stop_flag(stop)
+      .on_progress([weak, id, gen](std::uint64_t done, std::uint64_t){
+        if(auto s = weak.lock())
+          if(auto* e = s->find_alive(id, gen)) e->bytes_done = done;
+      });
+    if(listener) builder.listener(*listener);
+    auto dl = builder.build();
+    auto r = co_await dl.run(self->cfg.task_io_timeout, 3);
+
+    self = weak.lock(); if(!self) co_return;
+    t = self->find_alive(id, gen);
+    if(t){
+      if(r){
+        t->bytes_done = link.size;
+        t->speed_bps = 0;
+        self->set_state(*t, TaskState::completed);
+      } else if(r.error() == make_error_code(errc::cancelled)) {
+        // pause()/cancel() 已设终态并发过事件, 此处不覆盖
+        t->speed_bps = 0;
+      } else {
+        self->set_state(*t, TaskState::failed, r.error());
+      }
+    }
+    self->finish_slot();
+    co_return;
+  }
+
+  // 1s 速度采样循环(差分)。weak_ptr 防悬垂; shutdown 后自然退出。
+  static asio::awaitable<void> sampler(std::weak_ptr<Impl> weak){
+    for(;;){
+      auto self = weak.lock();
+      if(!self || self->shutting_down) co_return;
+      asio::steady_timer timer(self->rt.context());
+      timer.expires_after(std::chrono::seconds(1));
+      self.reset();                                    // 等待期间不持有 Impl
+      co_await timer.async_wait(asio::use_awaitable);
+      self = weak.lock();
+      if(!self || self->shutting_down) co_return;
+      const auto now = std::chrono::steady_clock::now();
+      for(auto& [id, t] : self->tasks){
+        if(t.state != TaskState::downloading) continue;
+        if(t.last_sample_time.time_since_epoch().count() != 0){
+          auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - t.last_sample_time).count();
+          if(ms > 0 && t.bytes_done >= t.last_sample_bytes)
+            t.speed_bps = (t.bytes_done - t.last_sample_bytes) * 1000 / static_cast<std::uint64_t>(ms);
+        }
+        t.last_sample_bytes = t.bytes_done;
+        t.last_sample_time = now;
+      }
+    }
+  }
+
+  TaskSnapshot snapshot(const TaskEntry& t) const {
+    TaskSnapshot s;
+    s.id = t.id; s.name = t.link.name; s.hash = t.link.hash;
+    s.total_size = t.link.size; s.bytes_done = t.bytes_done; s.speed_bps = t.speed_bps;
+    s.known_sources = t.known_sources; s.state = t.state; s.error = t.error;
+    s.out_path = t.out_path;
+    return s;
+  }
+};
+
+Session::Session(net::IoRuntime& rt, SessionConfig cfg)
+  : impl_(std::make_shared<Impl>(rt, std::move(cfg))) {
+  asio::co_spawn(rt.context(), Impl::sampler(impl_->weak_from_this()), asio::detached);
+}
+
+Session::~Session(){ shutdown(); }
+
+void Session::shutdown() noexcept {
+  if(!impl_ || impl_->shutting_down) return;
+  impl_->shutting_down = true;
+  for(auto& [id, t] : impl_->tasks) if(t.stop) *t.stop = true;
+}
+
+std::uint64_t Session::add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir){
+  if(link.size == 0 || link.name.empty()) return 0;
+  TaskEntry t;
+  t.id = impl_->next_id++;
+  t.link = link;
+  t.out_path = save_dir / link.name;
+  auto id = t.id;
+  impl_->tasks.emplace(id, std::move(t));
+  impl_->emit(TaskStateEvent{id, TaskState::queued, {}});
+  impl_->pump();
+  return id;
+}
+
+std::optional<TaskSnapshot> Session::query(std::uint64_t id) const {
+  auto it = impl_->tasks.find(id);
+  if(it == impl_->tasks.end()) return std::nullopt;
+  return impl_->snapshot(it->second);
+}
+
+std::vector<TaskSnapshot> Session::query_all() const {
+  std::vector<TaskSnapshot> out;
+  out.reserve(impl_->tasks.size());
+  for(const auto& [id, t] : impl_->tasks) out.push_back(impl_->snapshot(t));
+  return out;
+}
+
+void Session::set_event_handler(std::function<void(const SessionEvent&)> handler){
+  impl_->handler = std::move(handler);
+}
+
+}
