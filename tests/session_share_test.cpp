@@ -125,7 +125,10 @@ TEST(SessionShare, SharesScannedFilesUploadsToDirectPeerAndUnsharesCleanly){
 
   // Step 1: 扫描目录 → shared_files() 返回一条记录, size/hash 正确。
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    auto r = co_await session.set_shared_dirs({share_dir});
+    // GCC 13 对协程内 co_await f({非空花括号列表}) 会 ICE(build_special_member_call),
+    // 临时 vector 必须先构造为具名变量再传入。
+    std::vector<std::filesystem::path> dirs{share_dir};
+    auto r = co_await session.set_shared_dirs(std::move(dirs));
     EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
     co_return;
   });
@@ -247,7 +250,9 @@ TEST(SessionShare, SetSharedDirsDegradesGracefullyWhileDownloadListenerActive){
 
     // 下载 LowID listener 占用 cfg.tcp_port 期间调用 set_shared_dirs: 必须不报错——扫描/发布
     // 仍按合同正常完成, 只是(不可黑盒观察地)不启动分享的入站上传监听。
-    auto r = co_await session.set_shared_dirs({share_dir});
+    // 具名 vector 同 Step 1: 绕过 GCC 13 协程 ICE。
+    std::vector<std::filesystem::path> dirs{share_dir};
+    auto r = co_await session.set_shared_dirs(std::move(dirs));
     EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
     co_return;
   });
