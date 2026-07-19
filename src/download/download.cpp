@@ -198,13 +198,14 @@ struct MultiSourceDownload::Impl {
        std::shared_ptr<const infra::IPFilter> ip_filter_arg,
        std::uint8_t ip_filter_level_arg,
        peer::ObfuscationPolicy obfuscation_policy_arg,
-       std::optional<UserHash> local_user_hash_arg)
+       std::optional<UserHash> local_user_hash_arg,
+       ProgressFn on_progress_arg)
     : ex(net_ex), disk_ex(std::move(disk_ex_arg)), out(std::move(out_arg)), hash(hash_arg), size(size_arg),
       aich(std::move(aich_arg)), sources(std::move(sources_arg)),
       server_conn(std::move(server_conn_arg)), listener(std::move(listener_arg)),
       kad_network(std::move(kad_network_arg)), ip_filter(std::move(ip_filter_arg)),
       ip_filter_level(ip_filter_level_arg), obfuscation_policy(obfuscation_policy_arg),
-      local_user_hash(std::move(local_user_hash_arg)) {}
+      local_user_hash(std::move(local_user_hash_arg)), on_progress(std::move(on_progress_arg)) {}
 
   boost::asio::any_io_executor ex;
   boost::asio::any_io_executor disk_ex;   // 默认 = ex (同步等效), Builder.disk_executor 注入 disk 池
@@ -220,6 +221,7 @@ struct MultiSourceDownload::Impl {
   std::uint8_t ip_filter_level = 127;
   peer::ObfuscationPolicy obfuscation_policy = peer::ObfuscationPolicy::disabled;
   std::optional<UserHash> local_user_hash;
+  ProgressFn on_progress;
 };
 
 MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
@@ -238,7 +240,7 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
       }(),
       server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt,
       listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt,
-      std::nullopt, nullptr, 127, peer::ObfuscationPolicy::disabled, std::nullopt)) {}
+      std::nullopt, nullptr, 127, peer::ObfuscationPolicy::disabled, std::nullopt, nullptr)) {}
 
 MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor net_ex,
                                          boost::asio::any_io_executor disk_ex,
@@ -251,11 +253,13 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor net_ex,
                                          std::shared_ptr<const infra::IPFilter> ip_filter,
                                          std::uint8_t ip_filter_level,
                                          peer::ObfuscationPolicy obfuscation_policy,
-                                         std::optional<UserHash> local_user_hash)
+                                         std::optional<UserHash> local_user_hash,
+                                         ProgressFn on_progress)
   : impl_(std::make_unique<Impl>(net_ex, std::move(disk_ex), std::move(out), hash, size,
                                  std::move(aich), std::move(sources), std::move(server_conn),
                                  std::move(listener), std::move(kad_network), std::move(ip_filter),
-                                 ip_filter_level, obfuscation_policy, std::move(local_user_hash))) {}
+                                 ip_filter_level, obfuscation_policy, std::move(local_user_hash),
+                                 std::move(on_progress))) {}
 
 MultiSourceDownload::~MultiSourceDownload() = default;
 MultiSourceDownload::MultiSourceDownload(MultiSourceDownload&&) noexcept = default;
@@ -270,7 +274,8 @@ MultiSourceDownload MultiSourceDownload::Builder::build() {
                              std::move(aich_), std::move(sources_),
                              std::move(server_), std::move(listener_),
                              std::move(kad_network_), std::move(ip_filter_), ip_filter_level_,
-                             obfuscation_policy_, std::move(local_user_hash_));
+                             obfuscation_policy_, std::move(local_user_hash_),
+                             std::move(on_progress_));
 }
 
 // === raccoon 多源并发 (P4c-3) ===
@@ -354,6 +359,13 @@ struct SharedState {
   bool complete = false;
   std::size_t active_workers = 0;
   std::optional<std::error_code> first_err;
+  std::uint64_t bytes_done = 0;
+  ProgressFn on_progress;
+  void add_progress(std::uint64_t n) {
+    assert_owner();
+    bytes_done += n;
+    if(on_progress) on_progress(bytes_done, size);
+  }
 #ifndef NDEBUG
   std::thread::id owner_thread = std::this_thread::get_id();
   void assert_owner() const { assert(owner_thread == std::this_thread::get_id()); }
@@ -510,6 +522,7 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
       }
       auto w = co_await st.pf.write_block_async(b.start, b.end, b.data, st.disk_ex);
       if(!w){ st.alloc.requeue_block(part_index, block_in_part); co_return tl::unexpected(w.error()); }
+      st.add_progress(b.end - b.start);
       if(st.alloc.mark_block_done(part_index, block_in_part)){ st.mark_complete(); break; }
       retry = 0;   // 成功一块, 重置同源重试计数
     }
@@ -595,10 +608,17 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
 
   // 共享状态 (仅网络线程访问 → 无锁)。pf 为空 (M1 不接 .part.met); alloc 从 pf 恢复 (全 pending)。
   PartFile pf(self.out, self.size, self.hash, fr.part_hashes);
+  // 断点续传恢复值: size 减去 pf 剩余 gap 总长度 = 已完成字节数 (全新下载 gaps 覆盖全文件, 结果为 0)。
+  std::uint64_t initial_done = self.size;
+  for(const auto& [gs, ge] : pf.gaps()) initial_done -= (ge - gs);
   BlockAllocator alloc(self.size, fr.part_hashes, self.aich, pf);
   std::size_t n_workers = self.sources.size() - setup_idx;
   SharedState st{std::move(pf), std::move(alloc), std::nullopt, self.aich, self.hash, self.size,
                  self.disk_ex, false, n_workers, std::nullopt};
+  // 聚合初始化后补显式赋值: SharedState 尾部含 NDEBUG 条件成员, 位置初始化脆弱, 显式赋值更安全。
+  st.bytes_done = initial_done;
+  st.on_progress = self.on_progress;
+  if(st.on_progress) st.on_progress(st.bytes_done, st.size);   // 初始进度(续传时非 0)
   if(self.aich) st.checker.emplace(*self.aich, self.size);
 
   // 阶段二: raccoon — N worker 并发。worker[setup_idx] 复用 setup 连接, 其余全新连接。

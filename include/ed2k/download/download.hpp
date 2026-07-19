@@ -25,6 +25,9 @@ namespace ed2k::download {
 std::optional<peer::PeerIdentity>
 peer_identity_from_kad_source(const kad::KadSearchEntry& entry);
 
+// GUI 进度回调: (已完成字节, 总字节)。在网络线程触发, 调用方负责跨线程转投。
+using ProgressFn = std::function<void(std::uint64_t bytes_done, std::uint64_t total)>;
+
 class Download {
  public:
   Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
@@ -84,6 +87,7 @@ class MultiSourceDownload {
       ip_filter_level_ = level;
       return *this;
     }
+    Builder& on_progress(ProgressFn fn) { on_progress_ = std::move(fn); return *this; }
     MultiSourceDownload build();
    private:
     friend class MultiSourceDownload;
@@ -100,6 +104,7 @@ class MultiSourceDownload {
     std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
     std::shared_ptr<const infra::IPFilter> ip_filter_;
     std::uint8_t ip_filter_level_ = 127;
+    ProgressFn on_progress_;
   };
 
   [[deprecated("Use MultiSourceDownload::Builder")]]
@@ -134,7 +139,8 @@ class MultiSourceDownload {
                       std::shared_ptr<const infra::IPFilter> ip_filter,
                       std::uint8_t ip_filter_level,
                       peer::ObfuscationPolicy obfuscation_policy,
-                      std::optional<UserHash> local_user_hash);
+                      std::optional<UserHash> local_user_hash,
+                      ProgressFn on_progress);
   struct Impl;
   std::unique_ptr<Impl> impl_;
   friend class Builder;
