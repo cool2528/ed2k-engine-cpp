@@ -84,3 +84,4 @@
 
 // High-level session orchestration
 #include "ed2k/app/server_session.hpp"
+#include "ed2k/session/session.hpp"

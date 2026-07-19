@@ -14,3 +14,6 @@ docs/superpowers/
 amule_*.cpp
 login.out
 server.met
+
+# stray build/test console redirects (session scratch, never tracked)
+*.log

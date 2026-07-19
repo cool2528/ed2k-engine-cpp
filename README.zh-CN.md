@@ -30,9 +30,11 @@
 | 客户端基础设施（IPFilter、偏好设置、统计、代理、合集、调度器、聊天） | ✅ |
 | 服务器 UDP 完整支持 / MuleInfo / 压缩上传 / aMule `.part.met` | ✅ |
 | Linux / CI | ✅ |
+| **Session 门面（`ed2k::session::Session`）——面向 GUI 嵌入的任务/服务器/搜索/Kad/分享 API** | ✅ |
 
-最新完整 Windows 测试套件：**504/504 项均有结果**（483 项通过 + 21 项预期的环境/实时/CLI 跳过）。
-实时路径涵盖服务器、Kad、下载、上传和跨客户端断点续传验证。版本：`2.2.0`。
+最新完整 Windows 测试套件（2026-07-19）：**557/557 项均有结果**（541 项通过 +
+16 项预期的实时门控跳过），0 项失败；安装与独立消费者冒烟均通过。
+实时路径涵盖服务器、Kad、下载、上传和跨客户端断点续传验证。版本：`2.3.0`。
 
 ## 构建
 
@@ -221,11 +223,16 @@ ED2K_LIVE=1 ED2K_LINK="ed2k://|file|...|/" ED2K_SOURCE=ip:port \
 
 ```
 apps/cli/         ed2k-tool CLI
-include/ed2k/     公共头文件（net、peer、server、download、hash、codec、link、metfile）
+include/ed2k/     公共头文件（net、peer、server、download、hash、codec、link、metfile、session）
 src/              库源文件（镜像 include/ 布局）
 tests/            GoogleTest（单个 ed2k_tests 可执行文件；live_* 受 ED2K_LIVE 控制）
-docs/             RELEASE-PLAN.md（权威进度跟踪文档）、specs/、plans/
+docs/             RELEASE-PLAN.md（权威进度跟踪文档）、API.md、specs/、plans/
 ```
+
+以嵌入方式使用本引擎的 GUI 客户端（而非直接驱动底层构件）应从 `ed2k::session::Session`
+开始——头文件为 `include/ed2k/session/session.hpp`，完整文档见
+[docs/API.zh-CN.md](docs/API.zh-CN.md#ed2ksession--session-门面面向-gui-嵌入)
+（线程契约、状态机、Phase 0 已知限制）。
 
 ## 致谢
 

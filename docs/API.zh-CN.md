@@ -269,6 +269,174 @@ awaitable<expected<void, ec>>
   send_file_desc(std::uint8_t rating, std::string_view comment);
 ```
 
+## `ed2k/session` — Session 门面（面向 GUI 嵌入）
+
+`Session` 是上述底层构件之上的 GUI 友好门面：任务注册表、下载编排、并发调度、
+1 秒速度采样、服务器/Kad/分享管理，以及单一事件流——桌面客户端所需的一切，
+无需直接接触 `MultiSourceDownload`、`ServerConnection` 或 `KadNetwork`。
+
+> **线程契约——使用 `Session` 前必读（以下两条均为强约束，非建议）：**
+> 1. **`Session` 的所有公共方法必须在网络线程上调用**，即从运行在
+>    `IoRuntime::executor()` 上的协程或回调中调用。`Session` 内部不持有
+>    `mutex`/`condition_variable`；从其它线程调用不是"不支持"，而是数据竞争。
+> 2. **通过 `set_event_handler` 注册的事件回调同样在网络线程上触发。** GUI
+>    集成不得在回调内部直接操作 UI 控件，必须先将事件转投（post/queue）到
+>    UI 线程（例如 Qt 的 `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`），
+>    再据此更新界面。
+
+```cpp
+namespace ed2k::session {
+
+enum class TaskState { queued, connecting, downloading, paused, completed, failed, cancelled };
+
+struct TaskSnapshot {
+  std::uint64_t id;
+  std::string name;
+  FileHash hash;
+  std::uint64_t total_size;
+  std::uint64_t bytes_done;
+  std::uint64_t speed_bps;
+  std::size_t known_sources;
+  TaskState state;
+  std::error_code error;
+  std::filesystem::path out_path;
+};
+
+struct SessionConfig {
+  std::string nickname = "ed2k";
+  std::uint16_t tcp_port = 4662;
+  std::filesystem::path data_dir;                          // server.met 等数据目录
+  std::size_t max_concurrent_tasks = 3;
+  peer::ObfuscationPolicy obfuscation = peer::ObfuscationPolicy::disabled;
+  std::optional<UserHash> user_hash;
+  std::optional<app::ServerTarget> server_override;         // 测试/设置注入的优先服务器
+  std::chrono::milliseconds per_server_timeout = std::chrono::seconds(30);
+  std::chrono::milliseconds task_io_timeout = std::chrono::seconds(60);
+  bool enable_kad = false;                                  // 见下方 Phase 0 已知限制
+  std::uint16_t kad_udp_port = 4672;                        // 0 = 由系统分配
+};
+
+struct TaskStateEvent { std::uint64_t task_id; TaskState state; std::error_code error; };
+struct ServerInfo { IPv4 ip; std::uint16_t port; std::string name; bool connected; };
+struct ServerStateEvent {
+  bool connected; IPv4 ip; std::uint16_t port; std::string name;
+  bool high_id; std::uint32_t users, files;
+};
+using SessionEvent = std::variant<TaskStateEvent, ServerStateEvent>;
+
+struct SearchFilters {
+  server::FileType type = server::FileType::Any;
+  std::uint64_t min_size = 0;    // 字节；0 = 不限
+  std::uint32_t min_avail = 0;   // 最少源数；0 = 不限
+};
+
+struct SharedFileInfo {
+  std::string name; std::filesystem::path path; std::uint64_t size; FileHash hash;
+  std::uint64_t uploaded;  // 近似值：只分享单个文件时为会话累计上传字节数的精确值，
+                           // 否则为全部分享文件的未拆分汇总（见下方类说明）
+};
+
+struct UploadStats { std::size_t active_sessions; std::uint64_t total_uploaded; };
+
+class ED2K_EXPORT Session {
+ public:
+  Session(net::IoRuntime& rt, SessionConfig cfg);
+  ~Session();
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+  // 任务生命周期——以下每个方法都必须在 rt.executor() 上运行。
+  std::uint64_t add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir);
+  bool pause(std::uint64_t id);                        // queued/connecting/downloading -> paused
+  bool resume(std::uint64_t id);                       // paused/failed -> queued（重新进入调度，
+                                                         // 从 .part.met 续传）
+  bool cancel(std::uint64_t id, bool remove_files);    // 任意状态 -> 移除任务；remove_files 额外
+                                                         // 删除数据 + .part.met，延迟到该任务
+                                                         // 在途协程完全退出后执行
+  std::optional<TaskSnapshot> query(std::uint64_t id) const;
+  std::vector<TaskSnapshot> query_all() const;
+  void set_event_handler(std::function<void(const SessionEvent&)> handler);
+  void shutdown() noexcept;   // 停止全部任务；幂等；析构函数也会调用
+
+  // 服务器管理：连接状态 + 列表维护 + server.met 持久化。
+  // target 为 nullopt 时按 cfg.server_override + server.met + 内建 fallback 列表轮换登录。
+  boost::asio::awaitable<tl::expected<server::LoginResult, std::error_code>>
+    connect_server(std::optional<app::ServerTarget> target);
+  void disconnect_server();                            // 幂等；未连接时 no-op
+  bool server_connected() const;
+  std::vector<ServerInfo> server_list() const;
+  bool add_server(IPv4 ip, std::uint16_t port, const std::string& name);      // 去重；落盘
+  bool remove_server(IPv4 ip, std::uint16_t port);                            // 落盘
+  boost::asio::awaitable<tl::expected<std::size_t, std::error_code>>
+    update_server_met(const std::string& url);          // 拉取 + 按 (ip,port) 去重合并；
+                                                          // 返回新增条目数
+
+  // 搜索：关键词 + 类型/大小/源数过滤。需先 connect_server()——否则返回
+  // errc::connect_failed。
+  boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+    search(const std::string& keyword, const SearchFilters& filters);
+
+  // Kad(DHT) 状态。
+  struct KadStatus { bool running = false; std::size_t contacts = 0; };
+  KadStatus kad_status() const;
+
+  // 分享/上传。dirs 为空 -> 停止分享并释放入站监听器。
+  boost::asio::awaitable<tl::expected<void, std::error_code>>
+    set_shared_dirs(std::vector<std::filesystem::path> dirs);
+  std::vector<SharedFileInfo> shared_files() const;
+  UploadStats upload_stats() const;
+
+ private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;   // 协程持 weak_ptr；Session 析构后安全降级退出
+};
+
+}
+```
+
+### `TaskState` 状态机
+
+```
+queued --(调度器取出)--> connecting --(找到来源)--> downloading --(完成)--> completed
+  ^                            |                          |
+  |                            +----------(pause)---------+
+  |                                       v
+  +----------------(resume)----------- paused
+  |
+  +----------------(任意状态，遇不可恢复错误)--------------> failed
+  |
+  +----------------(cancel()，任意状态均可)-----------------> cancelled（从注册表移除；
+                                                              不会作为 query() 观察到的
+                                                              TaskSnapshot::state 出现）
+```
+`resume()` 接受 `paused` 或 `failed`；两者都重新进入 `queued`，并从任务的 `.part.met`
+续传（已验证的分块不重新哈希）。`cancel()` 在任意状态下都可调用，会将任务从注册表中
+移除；`remove_files=true` 会额外删除已下载的数据和 `.part.met`，且延迟到该任务在途的
+协程完全退出后才执行（因此正处于网络 I/O 中的任务永远不会被抽走其正在写入的文件）。
+
+### Phase 0 已知限制
+
+以下是刻意划定的范围裁剪，在此显式记录而非隐藏假设——今天要嵌入 `Session` 的 GUI
+应据此设计：
+
+- **服务器推送状态不会实时刷新。** 成功 `connect_server` 之后，连接只在一个短窗口
+  （≤ 2 秒）内同步读取，以捕获服务器的初始 `SERVERSTATUS`/`SERVERIDENT` 推送，随后
+  连接转入空闲——不存在常驻读者。此后服务器端的推送（用户数/文件数变化等）不会被
+  感知，也不会主动检测连接掉线；只有下一次前台请求（如 `search`）因连接已失效而
+  失败时才会发现。
+- **`enable_kad` 不会为下载增源。** 设为 `true` 只会让本地节点参与 Kad DHT（维护
+  路由表、可被其它 Kad 节点发现、`shutdown()` 时把路由表落盘到 `nodes.dat`），但
+  `add_download` 不会用 Kad 的 `find_sources` 结果扩充其来源列表——接入该功能会与
+  Kad 常驻的单读者 socket 争抢同一连接，留待后续专项任务实现。`kad_status()` 会
+  反映该子系统是否真正启动成功（若 `kad_udp_port` 已被其它进程占用，会静默禁用，
+  不会导致 `Session` 构造失败）。
+- **下载侧的 LowID 监听器与分享侧的入站上传监听器不能同时绑定同一个
+  `cfg.tcp_port`。** 谁先占用谁生效；另一方会优雅降级（LowID 下载来源被跳过，
+  或 `set_shared_dirs` 仍会完成扫描/发布但不会启动上传监听器，两种情况都只记一条
+  `warn` 日志）而不是直接失败。占用方释放端口后，另一方重试即可恢复正常。
+- **暂停粒度为 part 级**，而非 block 级：`pause()` 会先让该任务当前 part 上正在
+  进行的块写入完成，任务才真正停止。
+
 ## 并发约定（重要）
 
 - **只能由一个网络线程**访问 `BlockAllocator` / `PartFile` 状态 / `MultiSourceDownload`
@@ -278,3 +446,6 @@ awaitable<expected<void, ec>>
   （参见 README → Asio 注意事项）。
 - 在 GoogleTest 协程中使用 `EXPECT_*` + `if (!x) co_return;`（不要使用 `ASSERT_*`——它会
   中止协程并导致 `io_context` 挂起）。
+- **`ed2k::session::Session`** 在此基础上叠加了同样的规则：所有公共方法都必须在
+  `rt.executor()` 上调用，其事件回调（`set_event_handler`）也在该线程上触发——完整的
+  线程契约见上方 `ed2k/session` 一节。

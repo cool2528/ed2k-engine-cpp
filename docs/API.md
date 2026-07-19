@@ -275,6 +275,181 @@ awaitable<expected<void, ec>>
   send_file_desc(std::uint8_t rating, std::string_view comment);
 ```
 
+## `ed2k/session` — Session facade (GUI embedding)
+
+`Session` is the GUI-friendly facade over the lower-level building blocks above: a task
+registry, download orchestration, concurrency scheduling, 1s speed sampling, server/Kad/share
+management, and a single event stream — everything a desktop client needs without touching
+`MultiSourceDownload`, `ServerConnection`, or `KadNetwork` directly.
+
+> **Threading contract — read before using `Session` (both rules are load-bearing, not advisory):**
+> 1. **Every public `Session` method must be called on the network thread**, i.e. from a
+>    coroutine or callback running on `IoRuntime::executor()`. `Session` keeps no internal
+>    `mutex`/`condition_variable`; calling from any other thread is a data race, not merely
+>    unsupported.
+> 2. **The event callback registered via `set_event_handler` fires on the network thread too.**
+>    A GUI integration must not touch UI widgets directly from inside it. Post/queue the event to
+>    the UI thread (e.g. Qt `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`) before acting
+>    on it.
+
+```cpp
+namespace ed2k::session {
+
+enum class TaskState { queued, connecting, downloading, paused, completed, failed, cancelled };
+
+struct TaskSnapshot {
+  std::uint64_t id;
+  std::string name;
+  FileHash hash;
+  std::uint64_t total_size;
+  std::uint64_t bytes_done;
+  std::uint64_t speed_bps;
+  std::size_t known_sources;
+  TaskState state;
+  std::error_code error;
+  std::filesystem::path out_path;
+};
+
+struct SessionConfig {
+  std::string nickname = "ed2k";
+  std::uint16_t tcp_port = 4662;
+  std::filesystem::path data_dir;                          // server.met etc.
+  std::size_t max_concurrent_tasks = 3;
+  peer::ObfuscationPolicy obfuscation = peer::ObfuscationPolicy::disabled;
+  std::optional<UserHash> user_hash;
+  std::optional<app::ServerTarget> server_override;         // preferred server (test/settings)
+  std::chrono::milliseconds per_server_timeout = std::chrono::seconds(30);
+  std::chrono::milliseconds task_io_timeout = std::chrono::seconds(60);
+  bool enable_kad = false;                                  // see Phase 0 limitations below
+  std::uint16_t kad_udp_port = 4672;                        // 0 = OS-assigned
+};
+
+struct TaskStateEvent { std::uint64_t task_id; TaskState state; std::error_code error; };
+struct ServerInfo { IPv4 ip; std::uint16_t port; std::string name; bool connected; };
+struct ServerStateEvent {
+  bool connected; IPv4 ip; std::uint16_t port; std::string name;
+  bool high_id; std::uint32_t users, files;
+};
+using SessionEvent = std::variant<TaskStateEvent, ServerStateEvent>;
+
+struct SearchFilters {
+  server::FileType type = server::FileType::Any;
+  std::uint64_t min_size = 0;    // bytes; 0 = unbounded
+  std::uint32_t min_avail = 0;   // minimum source count; 0 = unbounded
+};
+
+struct SharedFileInfo {
+  std::string name; std::filesystem::path path; std::uint64_t size; FileHash hash;
+  std::uint64_t uploaded;  // approximate: session-wide upload total when sharing one file, else an
+                           // un-split aggregate across all shared files (see class docs below)
+};
+
+struct UploadStats { std::size_t active_sessions; std::uint64_t total_uploaded; };
+
+class ED2K_EXPORT Session {
+ public:
+  Session(net::IoRuntime& rt, SessionConfig cfg);
+  ~Session();
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+  // Task lifecycle — every method below must run on rt.executor().
+  std::uint64_t add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir);
+  bool pause(std::uint64_t id);                        // queued/connecting/downloading -> paused
+  bool resume(std::uint64_t id);                       // paused/failed -> queued (re-enters the
+                                                         // scheduler; resumes from .part.met)
+  bool cancel(std::uint64_t id, bool remove_files);    // any state -> removed; remove_files also
+                                                         // deletes data + .part.met, deferred until
+                                                         // the task's in-flight coroutine exits
+  std::optional<TaskSnapshot> query(std::uint64_t id) const;
+  std::vector<TaskSnapshot> query_all() const;
+  void set_event_handler(std::function<void(const SessionEvent&)> handler);
+  void shutdown() noexcept;   // stops every task; idempotent; also called from the destructor
+
+  // Server management: connection state + list maintenance + server.met persistence.
+  // target == nullopt rotates through cfg.server_override + server.met + a built-in fallback list.
+  boost::asio::awaitable<tl::expected<server::LoginResult, std::error_code>>
+    connect_server(std::optional<app::ServerTarget> target);
+  void disconnect_server();                            // idempotent; no-op if not connected
+  bool server_connected() const;
+  std::vector<ServerInfo> server_list() const;
+  bool add_server(IPv4 ip, std::uint16_t port, const std::string& name);      // de-duped; persists
+  bool remove_server(IPv4 ip, std::uint16_t port);                            // persists
+  boost::asio::awaitable<tl::expected<std::size_t, std::error_code>>
+    update_server_met(const std::string& url);          // fetch + merge by (ip,port); returns
+                                                          // count of newly added entries
+
+  // Search: keyword + type/size/source-count filters. Requires connect_server() first —
+  // otherwise returns errc::connect_failed.
+  boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+    search(const std::string& keyword, const SearchFilters& filters);
+
+  // Kad(DHT) status.
+  struct KadStatus { bool running = false; std::size_t contacts = 0; };
+  KadStatus kad_status() const;
+
+  // Sharing / upload. dirs empty -> stops sharing and releases the inbound listener.
+  boost::asio::awaitable<tl::expected<void, std::error_code>>
+    set_shared_dirs(std::vector<std::filesystem::path> dirs);
+  std::vector<SharedFileInfo> shared_files() const;
+  UploadStats upload_stats() const;
+
+ private:
+  struct Impl;
+  std::shared_ptr<Impl> impl_;   // coroutines hold a weak_ptr; safe degrade after Session dtor
+};
+
+}
+```
+
+### `TaskState` state machine
+
+```
+queued --(scheduler picks up)--> connecting --(source found)--> downloading --(complete)--> completed
+  ^                                    |                              |
+  |                                    +------------(pause)-----------+
+  |                                                 v
+  +-----------------------(resume)------------- paused
+  |
+  +-------------------------(any state, on unrecoverable error)------> failed
+  |
+  +-------------------------(cancel(), from any state)----------------> cancelled (removed from
+                                                                          the registry; not a
+                                                                          TaskSnapshot::state you
+                                                                          will observe via query())
+```
+`resume()` accepts `paused` or `failed`; both re-enter `queued` and resume from the task's
+`.part.met` (no re-hash of already-verified parts). `cancel()` is accepted from any state and
+removes the task from the registry; `remove_files=true` additionally deletes the downloaded data
+and `.part.met`, deferred until the task's in-flight coroutine has fully exited (so a task mid
+network I/O never has its backing file yanked out from under it).
+
+### Phase 0 known limitations
+
+These are deliberate scope cuts recorded here rather than hidden assumptions — a GUI embedding
+`Session` today should design around them:
+
+- **Server push status is not live-refreshed.** After a successful `connect_server`, the
+  connection reads a short window (≤ 2s) to capture the server's initial `SERVERSTATUS` /
+  `SERVERIDENT` push, then goes idle — there is no persistent reader. Later server-side pushes
+  (user/file count changes, etc.) are not observed, and a dropped connection is not detected
+  proactively; it only surfaces the next time a foreground request (e.g. `search`) fails against
+  the now-dead connection.
+- **`enable_kad` does not feed download source discovery.** Setting it to `true` makes the local
+  node participate in the Kad DHT (routing table maintained, discoverable by other Kad nodes,
+  `nodes.dat` persisted on `shutdown()`), but `add_download` does not augment its source list from
+  Kad `find_sources` results — wiring that in would contend with Kad's single-reader socket for
+  the same connection and is left for a future dedicated task. `kad_status()` reports whether the
+  subsystem actually started (it silently disables itself, without failing `Session` construction,
+  if `kad_udp_port` is already taken by another process).
+- **The download-side LowID listener and the share inbound-upload listener cannot both bind
+  `cfg.tcp_port` at the same time.** Whichever claims it first wins; the other degrades
+  gracefully (a LowID download source is skipped, or `set_shared_dirs` completes its scan/publish
+  but does not start the upload listener, logging a `warn` either way) rather than failing
+  outright. Retrying the losing side after the winner releases the port succeeds normally.
+- **Pause granularity is per-part**, not per-block: `pause()` lets in-flight block writes for the
+  task's current part finish before the task actually stops.
+
 ## Concurrency contract (important)
 
 - **Only one network thread** may touch `BlockAllocator` / `PartFile` state / `MultiSourceDownload`
@@ -283,3 +458,6 @@ awaitable<expected<void, ec>>
   `post(ex, bind_executor(ex, use_awaitable))` (see README → Asio gotcha).
 - In GoogleTest coroutines use `EXPECT_*` + `if (!x) co_return;` (no `ASSERT_*` — it aborts the
   coroutine and hangs the `io_context`).
+- **`ed2k::session::Session`** layers the same rule on top: every public method must be called on
+  `rt.executor()`, and its event callback (`set_event_handler`) also fires on that thread — see
+  the `ed2k/session` section above for the full threading contract.

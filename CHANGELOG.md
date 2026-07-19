@@ -3,7 +3,28 @@
 All notable changes to ed2kengine. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
-## Unreleased
+## [2.3.0] — 2026-07-19
+
+### Added — Session facade (GUI embedding)
+- New `ed2k::session::Session` facade (`include/ed2k/session/session.hpp`, pulled into the
+  `ed2k/ed2k.hpp` umbrella header): a task registry with orchestration, concurrency scheduling,
+  and 1s speed sampling (`add_download`/`pause`/`resume`/`cancel`/`query`/`query_all`); a single
+  `SessionEvent` stream (`set_event_handler`); server connection management with `server.met`
+  persistence (`connect_server`/`disconnect_server`/`server_list`/`add_server`/`remove_server`/
+  `update_server_met`); server-side `search` with type/size/source-count filters; optional Kad
+  (DHT) participation with `nodes.dat` persistence (`kad_status`); and sharing/upload
+  (`set_shared_dirs`/`shared_files`/`upload_stats`). Full contract, state machine, and Phase 0
+  known limitations are documented in `docs/API.md` / `docs/API.zh-CN.md`.
+- `download::MultiSourceDownload::Builder::on_progress` progress hook and `::stop_flag`
+  cooperative cancellation, plus `errc::cancelled`, backing `Session`'s pause/cancel semantics.
+- Threading contract: every `Session` method must run on the network thread
+  (`IoRuntime::executor()`); its event callback fires on that same thread, so GUI integrations
+  must queue events to the UI thread rather than touching widgets directly from the callback.
+- Known Phase 0 scope cuts (see docs for detail): server push status is not live-refreshed after
+  the initial post-login window; `enable_kad` does not yet feed download source discovery;
+  the download-side LowID listener and the share inbound-upload listener cannot both bind
+  `cfg.tcp_port` at once (first bind wins, the other degrades gracefully); pause granularity is
+  per-part.
 
 ### Fixed
 - The managed aMule optional-mode upload live gate now passes. Two root causes were fixed:
@@ -33,6 +54,9 @@ Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
   flushed. Parent-directory crash durability is best-effort where directory fsync is unsupported.
 
 ### Tests
+- 2026-07-19 release acceptance for the Session facade: Windows Debug ctest 557 total, 541 pass
+  + 16 live-gated skip, 0 fail; install (`cmake --install`) and independent-consumer package
+  smoke confirmed `session/session.hpp` and `ed2kConfig.cmake` present.
 - 2026-07-15: managed aMule 2.3.3 optional mode fully green twice — 4/4 obfuscation assertions
   plus real upload evidence: aMule joined the local login stub, connected to the injected source,
   and downloaded the complete 19,456,000-byte fixture through the engine upload session in 54s

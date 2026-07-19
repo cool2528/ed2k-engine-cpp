@@ -30,13 +30,16 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | Client infrastructure (IPFilter, preferences, stats, proxy, collection, scheduler, chat) | ✅ |
 | Server UDP completeness / MuleInfo / compressed upload / aMule `.part.met` | ✅ |
 | Linux / CI | ✅ |
+| **Session facade (`ed2k::session::Session`) — GUI-embeddable task/server/search/Kad/share API** | ✅ |
 
-Latest local acceptance (2026-07-15): Windows Debug **535/535** (519 pass + 16 live-gated
-skips); Linux Debug **524/524** (508 pass + 16 live-gated skips); install and independent
-consumer smokes green in all four Debug/Release configurations (2026-07-12). The managed
-aMule 2.3.3 live harness passes both modes, including real upload evidence: aMule downloads
-the complete fixture from the engine's upload session.
-Version: `2.2.0`.
+Latest local acceptance (2026-07-19): Windows Debug **557/557** (541 pass + 16 live-gated
+skips), 0 failed; install and independent consumer smokes green. Earlier acceptance
+(2026-07-15): Windows Debug 535/535 (519 pass + 16 live-gated skips); Linux Debug 524/524
+(508 pass + 16 live-gated skips); install and independent consumer smokes green in all four
+Debug/Release configurations (2026-07-12). The managed aMule 2.3.3 live harness passes both
+modes, including real upload evidence: aMule downloads the complete fixture from the engine's
+upload session.
+Version: `2.3.0`.
 
 ## Build
 
@@ -296,11 +299,16 @@ interop run.
 
 ```
 apps/cli/         ed2k-tool CLI
-include/ed2k/     public headers (net, peer, server, download, hash, codec, link, metfile)
+include/ed2k/     public headers (net, peer, server, download, hash, codec, link, metfile, session)
 src/              library sources (mirror include/ layout)
 tests/            GoogleTest (single ed2k_tests executable; live_* gated by ED2K_LIVE)
-docs/             RELEASE-PLAN.md (canonical progress tracker), specs/, plans/
+docs/             RELEASE-PLAN.md (canonical progress tracker), API.md, specs/, plans/
 ```
+
+GUI clients embedding this engine (rather than driving the lower-level building blocks
+directly) should start from `ed2k::session::Session` — `include/ed2k/session/session.hpp`,
+documented in full in [docs/API.md](docs/API.md#ed2ksession--session-facade-gui-embedding)
+(threading contract, state machine, Phase 0 known limitations).
 
 ## Acknowledgements
 
