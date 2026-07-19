@@ -8,6 +8,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/ip/udp.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/session/session.hpp"
@@ -66,4 +67,25 @@ TEST(SessionKad, EnabledWithMissingNodesDatStartsAndShutsDownCleanly){
   // shutdown 落盘的 nodes.dat 应该存在(即使联系人为空, write_nodes_dat 也会写出一个有效的空表)。
   EXPECT_TRUE(std::filesystem::exists(tmp_dir / "nodes.dat"));
   std::filesystem::remove_all(tmp_dir);
+}
+
+// enable_kad=true 但 kad_udp_port 已被占用(如本机同时跑着真实 eMule/aMule, 或多个 Session
+// 实例误配了同一固定端口): KadNetwork 构造函数同步 bind 会抛异常, 修复后应被 Impl 构造函数
+// 内的 try/catch 捕获并降级为 kad=nullptr, 而不是让整个 Session 构造函数把异常向上抛出。
+TEST(SessionKad, EnabledWithOccupiedPortDegradesGracefully){
+  IoRuntime rt;
+  // 先用一个独立 UDP socket 占住一个系统分配的端口(不设 SO_REUSEADDR, 默认行为下第二个 bind
+  // 到同一端口会失败), 再把这个端口号喂给 enable_kad 的 SessionConfig, 制造端口冲突场景。
+  asio::ip::udp::socket occupier(rt.context(), asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+  const auto occupied_port = occupier.local_endpoint().port();
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_kad_port_conflict_test";
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.enable_kad = true;
+  cfg.kad_udp_port = occupied_port;
+  Session session(rt, cfg);   // 关键断言: 构造不应抛出(occupier 仍持有该端口)
+  auto status = session.kad_status();
+  EXPECT_FALSE(status.running);
+  EXPECT_EQ(status.contacts, 0u);
 }

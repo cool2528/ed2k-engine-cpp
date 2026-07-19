@@ -83,8 +83,9 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // pause→resume 竞态下同一 id 可能有新旧两代协程并存(旧代挂起未醒, 新代已 pump 启动),
   // 用布尔标记无法表达"多个在途"这一状态, 必须用计数; 只有归零(最后一个持句柄的协程退出)才安全删文件。
   std::map<std::uint64_t, int> inflight;
-  // Kad(DHT) 网络实例; cfg.enable_kad=false 时恒为空。run_task 构建 Builder 时若非空则追加
-  // .kad_network(*kad), 交由 MultiSourceDownload 在缺源时自动增源。
+  // Kad(DHT) 网络实例; cfg.enable_kad=false 时、或 enable_kad=true 但 UDP 端口绑定失败时恒为空。
+  // 目前仅由 Impl::kad_run 作为唯一读者维护(路由表/可被网络发现/nodes.dat 持久化); 下载侧的
+  // Kad 增源(find_sources)刻意未接入 run_task 的 Builder, 见 run_task 内注释。
   std::unique_ptr<kad::KadNetwork> kad;
 
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
@@ -101,7 +102,16 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       opts.tcp_port = cfg.tcp_port;
       opts.version = kad::kad2_version;
       opts.user_hash = kad::KadID::from_bytes(user_hash.bytes());
-      kad = std::make_unique<kad::KadNetwork>(rt.executor(), opts);
+      // KadNetwork 构造函数同步 bind UDP 端口; 端口被占用(如本机已跑真实 eMule/aMule, 或同一
+      // data_dir 下多个 enable_kad=true 的 Session 实例复用了同一固定端口)会抛异常。Kad 是
+      // 可选子系统, 不应该因为端口冲突拖垮整个 Session 构造——bind 失败时降级为 kad=nullptr
+      // (kad_status().running 自然为 false), 仅记一条 warn, Session 其余功能不受影响。
+      try {
+        kad = std::make_unique<kad::KadNetwork>(rt.executor(), opts);
+      } catch(const std::exception& e){
+        spdlog::warn("Session: Kad UDP port {} bind failed, Kad disabled: {}", cfg.kad_udp_port, e.what());
+        kad.reset();
+      }
     }
   }
 
@@ -288,9 +298,16 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
           if(auto* e = s->find_alive(id, gen)) e->bytes_done = done;
       });
     if(listener) builder.listener(*listener);
-    // enable_kad 时把 Kad 网络注入 Builder; MultiSourceDownload::run() 内部若发现 sources 不足
-    // 会自动调用 kad_network.find_sources(...) 增源(既有逻辑, 见 download.cpp)。
-    if(self->kad) builder.kad_network(*self->kad);
+    // 刻意不注入 builder.kad_network(*self->kad): MultiSourceDownload::run() 内部若发现
+    // sources 不足会自动调用 kad_network.find_sources(...) 增源(既有逻辑, 见 download.cpp),
+    // 但 find_sources 的 UDP recv 与 Impl::kad_run 常驻的 serve_once 循环共用同一个
+    // KadNetwork 实例、同一个 socket——KadNetwork 的收包路径无请求/响应 ID 分发, 谁在当前
+    // 时刻发起 recv 谁就拿走下一个到达的数据报, 两者并发会互相偷走对方期待的响应包
+    // (与用户已批准的方案 C 要根治的"并发读同一 socket"是同一类问题; 见 Task 6/7 里
+    // server::ServerConnection 的单读者约束)。enable_kad 目前只负责 Kad DHT 参与本身
+    // (路由表维护/可被网络发现/nodes.dat 持久化), 由 kad_run 作为唯一读者正确维护;
+    // 下载侧的 Kad 增源留待后续专项任务, 参照 Task 7 的单读者仲裁模式实现(该仲裁同时也能
+    // 根治多个并发下载任务各自调用 find_sources 时相互抢占同一 socket 的问题)。
     auto dl = builder.build();
     auto r = co_await dl.run(self->cfg.task_io_timeout, 3);
 
@@ -345,10 +362,9 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // co_await 同一个 socket 的 recv, 谁在当前时刻发起 recv 谁就拿走下一个到达的数据报。若两者
   // 并发跑在同一个 KadNetwork 实例上, 会互相偷走对方期待的响应包(与 Task 6/7 里
   // server::ServerConnection 必须"单读者"的既有约束同构)。顺序执行从根上避免这个自引入的竞态。
-  // 已知风险(超出本任务范围, 见 task-8-brief.md "已识别的实现风险"): run_task 里
-  // MultiSourceDownload::run() 内部调用的 kad_network.find_sources(...) 仍可能与这里的
-  // serve_once 常驻循环在同一 KadNetwork 实例上并发发起 recv, 根治需要在 KadNetwork 内部引入
-  // 按 opcode/target 的请求路由, 属于更底层改动。
+  // 这个 kad_run 协程是本 Session 里唯一持续读取 self->kad 这个 socket 的地方(run_task 刻意
+  // 未把 kad 注入 MultiSourceDownload::Builder, 见 run_task 内注释), 因此整个 Kad 子系统在任意
+  // 时刻只有一个 socket 读者, 严格单读者、零竞态。
   static asio::awaitable<void> kad_run(std::weak_ptr<Impl> weak, std::vector<kad::Contact> seeds){
     auto self = weak.lock();
     if(!self || self->shutting_down || !self->kad) co_return;

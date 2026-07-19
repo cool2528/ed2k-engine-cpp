@@ -43,7 +43,12 @@ struct SessionConfig {
   std::optional<app::ServerTarget> server_override;  // 测试/设置注入的优先服务器
   std::chrono::milliseconds per_server_timeout = std::chrono::seconds(30);
   std::chrono::milliseconds task_io_timeout = std::chrono::seconds(60);  // 每次网络操作超时(非总时长)
-  bool enable_kad = false;              // 启用 Kad(DHT) 网络; 用 data_dir/nodes.dat 做种子引导
+  // 启用 Kad(DHT) 子系统: 用 data_dir/nodes.dat 做种子引导, 维护路由表并可被其它 Kad 节点发现,
+  // shutdown 时把当前路由表落盘回 nodes.dat。当前不接入下载增源(find_sources) ——
+  // 该功能会与 Kad 常驻的单读者 socket 争抢同一连接, 留待后续专项任务实现; 见 kad_status()。
+  // kad_udp_port 端口绑定失败(如已被其它 Kad 客户端占用)时自动降级为不启用, 不影响 Session
+  // 其余功能; kad_status().running 会反映实际是否成功启用。
+  bool enable_kad = false;
   std::uint16_t kad_udp_port = 4672;    // Kad UDP 监听端口; 0 = 系统分配
 };
 
