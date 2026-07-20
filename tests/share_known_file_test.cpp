@@ -85,6 +85,20 @@ TEST(ShareKnownFile, ScanDirIndexesRegularFiles) {
   std::filesystem::remove_all(dir);
 }
 
+// 请求计数: note_request 累加, 未知 hash 返回 0, adopt 迁移旧计数
+TEST(KnownFileDB, RequestCounting) {
+  share::KnownFileDB db;
+  auto h = *FileHash::from_hex("4127a47867b6110f0f86f2d9845fb374");
+  EXPECT_EQ(db.request_count(h), 0u);
+  db.note_request(h);
+  db.note_request(h);
+  EXPECT_EQ(db.request_count(h), 2u);
+
+  share::KnownFileDB rebuilt;
+  rebuilt.adopt_request_counts(db);
+  EXPECT_EQ(rebuilt.request_count(h), 2u);
+}
+
 TEST(ShareKnownFile, PartFileConvertsCompletedFileToKnownFile) {
   auto dir = temp_dir("ed2k_share_partfile");
   auto file = dir / "complete.bin";

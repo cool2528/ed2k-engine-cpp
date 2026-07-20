@@ -299,6 +299,7 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     if(!decoded) co_return tl::unexpected(decoded.error());
     const KnownFile* file = files_.find(*decoded);
     if(!file) co_return co_await send_not_found(*decoded);
+    files_.note_request(*decoded);  // 每文件请求数统计
 
     ed2k::net::Packet ans;
     ans.protocol = ed2k::net::proto::eDonkey;

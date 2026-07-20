@@ -905,6 +905,7 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
     }
   }
 
+  new_db.adopt_request_counts(self->db);  // 重扫保留请求计数
   self->db = std::move(new_db);
   self->shared_dirs = std::move(dirs);
 
@@ -966,6 +967,7 @@ std::vector<SharedFileInfo> Session::shared_files() const {
     info.size = f.size;
     info.hash = f.hash;
     info.uploaded = total_uploaded;
+    info.requests = impl_->db.request_count(f.hash);
     out.push_back(std::move(info));
   }
   return out;

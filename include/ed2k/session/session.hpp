@@ -89,6 +89,7 @@ struct SharedFileInfo {
   // 文件, 因此这里用会话内全部上传字节的汇总近似代表——只分享单个文件时是精确值, 同时分享
   // 多个文件时无法精确拆分到每个文件。
   std::uint64_t uploaded = 0;
+  std::uint32_t requests = 0;  // 会话内累计被请求次数(目录重扫时按 hash 保留)
 };
 
 // 上传统计快照(UI 展示用)。

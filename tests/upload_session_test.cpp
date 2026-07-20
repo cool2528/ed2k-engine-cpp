@@ -605,6 +605,41 @@ TEST(UploadSession, AcceptsStartUploadWhenQueueSlotAvailable){
   });
 }
 
+// STARTUPLOADREQ 命中已知文件时应累加该文件的请求计数
+TEST(UploadSession, StartUploadReqIncrementsRequestCount){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "queued.bin";
+  f.size = 1;
+  db.add(f);
+  UploadQueue queue(1);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), &queue);
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::STARTUPLOADREQ, encode_start_upload(f.hash));
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.opcode, op::ACCEPTUPLOADREQ);
+    s.close();
+    co_return;
+  });
+  EXPECT_EQ(db.request_count(f.hash), 1u);
+}
+
 TEST(UploadSession, QueuesStartUploadWhenSlotsAreFull){
   ed2k::net::IoRuntime rt;
   KnownFileDB db;

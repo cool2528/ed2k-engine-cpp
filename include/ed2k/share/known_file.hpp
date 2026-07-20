@@ -49,9 +49,20 @@ class KnownFileDB {
   const KnownFile* find(const FileHash& hash) const;
   const std::vector<KnownFile>& files() const noexcept { return files_; }
 
+  // 记录一次对该文件的上传请求(STARTUPLOADREQ 命中)
+  void note_request(const FileHash& hash) { ++request_counts_[hash]; }
+  // 会话内该文件累计被请求次数
+  std::uint32_t request_count(const FileHash& hash) const {
+    auto it = request_counts_.find(hash);
+    return it == request_counts_.end() ? 0u : it->second;
+  }
+  // 目录重扫整体重建 DB 时迁移旧计数(按 hash)
+  void adopt_request_counts(const KnownFileDB& old) { request_counts_ = old.request_counts_; }
+
  private:
   std::vector<KnownFile> files_;
   std::unordered_map<FileHash, std::size_t> by_hash_;
+  std::unordered_map<FileHash, std::uint32_t> request_counts_;
 };
 
 } // namespace ed2k::share
