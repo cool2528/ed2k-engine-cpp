@@ -11,6 +11,7 @@
 #include <tl/expected.hpp>
 #include "ed2k/core/hash.hpp"
 #include "ed2k/export.hpp"
+#include "ed2k/kad/messages.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
@@ -153,6 +154,13 @@ class ED2K_EXPORT Session {
   // 当前联系人数。cfg.enable_kad=false 时恒为 {false, 0}。
   struct KadStatus { bool running = false; std::size_t contacts = 0; };
   KadStatus kad_status() const;
+
+  // Kad(DHT) 关键词搜索。为绕开常驻 kad_run 协程对主 Kad socket 的单读者独占, 每次搜索
+  // 构造一个临时 KadNetwork(ephemeral 端口)独立收发, 待查询 peer 取自主实例路由表快照,
+  // 用完即弃。Kad 未启用或路由表为空时返回 errc::connect_failed(沿用现有错误码, 不新增)。
+  // 契约: 必须在网络线程(rt.executor())上调用。
+  boost::asio::awaitable<tl::expected<std::vector<kad::KadSearchEntry>, std::error_code>>
+  kad_search(const std::string& keyword);
 
   // 分享与上传: 重新扫描 dirs 下全部文件并(重新)启动入站上传监听; dirs 为空则停止分享、释放
   // listener。哈希扫描经磁盘线程执行, 不阻塞网络线程。已连接服务器时会尝试发布分享列表给服务器

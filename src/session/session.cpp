@@ -15,6 +15,7 @@
 #include <spdlog/spdlog.h>
 #include "ed2k/download/download.hpp"
 #include "ed2k/infra/http_download.hpp"
+#include "ed2k/kad/keywords.hpp"
 #include "ed2k/kad/network.hpp"
 #include "ed2k/kad/nodes_dat.hpp"
 #include "ed2k/metfile/server_met.hpp"
@@ -824,6 +825,37 @@ Session::search_more(){
 Session::KadStatus Session::kad_status() const {
   return KadStatus{impl_->kad != nullptr,
                     impl_->kad ? impl_->kad->routing_table().size() : std::size_t{0}};
+}
+
+asio::awaitable<tl::expected<std::vector<kad::KadSearchEntry>, std::error_code>>
+Session::kad_search(const std::string& keyword){
+  // 与其它跨 co_await 门面同构的 weak_ptr 驱动: 入口 lock 一次, co_await 后再 lock 一次。
+  auto weak = impl_->weak_from_this();
+  auto self = weak.lock();
+  if(!self || self->shutting_down || !self->kad)
+    co_return tl::unexpected(make_error_code(errc::connect_failed));
+  // 取路由表联系人快照(拷贝): 临时查询实例查询期间主表可能被 kad_run 改动, 用快照隔离。
+  std::vector<kad::Contact> peers = self->kad->routing_table().all_contacts();
+  if(peers.empty())
+    co_return tl::unexpected(make_error_code(errc::connect_failed));
+  // 临时查询实例: udp_port=0 走系统分配的 ephemeral 端口, 用独立 socket 自收自响应,
+  // 从而不与常驻 kad_run 协程争抢主 Kad socket。id/user_hash 与主实例同源(见 Impl 构造)。
+  const auto user_hash = self->effective_user_hash();
+  kad::KadNetworkOptions opts;
+  opts.id = kad::KadID::from_user_hash(user_hash, 1);
+  opts.ip = IPv4::from_dotted("0.0.0.0").value();   // 本地公网 IP 未知, 占位(与主实例一致)
+  opts.udp_port = 0;                                // ephemeral, 独立 socket
+  opts.tcp_port = self->cfg.tcp_port;
+  opts.version = kad::kad2_version;
+  opts.user_hash = kad::KadID::from_bytes(user_hash.bytes());
+  kad::KadNetwork query_node(self->rt.executor(), std::move(opts));
+  const auto key = kad::keyword_id(keyword);
+  const auto timeout = self->cfg.per_server_timeout;
+  auto r = co_await query_node.search_keyword(peers, key, timeout);
+  // co_await 期间 Session 可能被销毁: 再 lock 一次才能安全返回(query_node 是本协程栈上局部, 仍存活)。
+  self = weak.lock();
+  if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));
+  co_return r;
 }
 
 asio::awaitable<tl::expected<void, std::error_code>>
