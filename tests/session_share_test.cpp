@@ -185,6 +185,26 @@ TEST(SessionShare, SharesScannedFilesUploadsToDirectPeerAndUnsharesCleanly){
   std::filesystem::remove_all(share_dir);
 }
 
+// 无上传活动时新统计字段应为 0（字段存在性 + 默认值；速率的运行时正确性由采样公式与
+// 下载侧逐字对齐 + 代码审查保证，不在此处写伪造的计时断言，见 task-1-brief 决定）。
+TEST(SessionShare, UploadStatsNewFieldsDefaultZero){
+  auto data_dir = std::filesystem::temp_directory_path() / "ed2k_session_share_test_defaults_data";
+  std::filesystem::remove_all(data_dir);
+  std::filesystem::create_directories(data_dir);
+
+  IoRuntime rt;
+  SessionConfig cfg;
+  cfg.data_dir = data_dir;
+  cfg.tcp_port = 48175;   // 与其它用例不同的专用端口, 避免冲突
+
+  Session session(rt, cfg);
+  auto stats = session.upload_stats();
+  EXPECT_EQ(stats.speed_bps, 0u);
+  EXPECT_EQ(stats.queued_count, 0u);
+
+  std::filesystem::remove_all(data_dir);
+}
+
 // 反向门控回归用例(2026-07 复审发现并修复): 下载侧的 LowID InboundListener 先占住 cfg.tcp_port
 // 时, set_shared_dirs 不得在同一端口上再起第二个 acceptor(InboundListener 构造设置了
 // SO_REUSEADDR, 若不做门控, Windows 上第二次 bind 会"成功"而不是失败, 两个 acceptor 同时监听

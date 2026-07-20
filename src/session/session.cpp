@@ -121,6 +121,10 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   share::ClientCredits credits;
   share::UploadQueue upload_queue{default_upload_slots, &credits};
   std::size_t active_uploads = 0;
+  // 上传速率采样(与下载采样同一协程内做差分)
+  std::uint64_t upload_speed_bps = 0;
+  std::uint64_t upload_last_sample_bytes = 0;
+  std::chrono::steady_clock::time_point upload_last_sample_time{};
 
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
     : rt(rt_arg), cfg(std::move(cfg_arg)) {
@@ -406,6 +410,17 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
         t.last_sample_bytes = t.bytes_done;
         t.last_sample_time = now;
       }
+      // 上传总量差分 -> 全局上传速率
+      std::uint64_t uploaded_now = 0;
+      for(const auto& rec : self->credits.records()) uploaded_now += rec.uploaded;
+      if(self->upload_last_sample_time.time_since_epoch().count() != 0){
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - self->upload_last_sample_time).count();
+        if(ms > 0 && uploaded_now >= self->upload_last_sample_bytes)
+          self->upload_speed_bps = (uploaded_now - self->upload_last_sample_bytes) * 1000 / static_cast<std::uint64_t>(ms);
+      }
+      self->upload_last_sample_bytes = uploaded_now;
+      self->upload_last_sample_time = now;
     }
   }
 
@@ -960,6 +975,8 @@ UploadStats Session::upload_stats() const {
   UploadStats stats;
   stats.active_sessions = impl_->active_uploads;
   for(const auto& record : impl_->credits.records()) stats.total_uploaded += record.uploaded;
+  stats.speed_bps = impl_->upload_speed_bps;
+  stats.queued_count = static_cast<std::uint32_t>(impl_->upload_queue.queued_size());
   return stats;
 }
 

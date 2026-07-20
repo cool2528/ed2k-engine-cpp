@@ -98,3 +98,17 @@ TEST(UploadQueue, FriendSlotTakesPriorityOverQueuedNonFriends){
   ASSERT_EQ(grants.size(), 1u);
   EXPECT_EQ(grants[0].user_hash, friend_peer);
 }
+
+// 排队人数应可查询：占满槽位后新请求进入等待队列
+TEST(UploadQueue, QueuedSizeReflectsWaitingPeers){
+  UploadQueue q(1);
+  const auto file = file_hash("00112233445566778899aabbccddeeff");
+  const auto p1 = user_hash("11111111111111111111111111111111");
+  const auto p2 = user_hash("22222222222222222222222222222222");
+
+  EXPECT_EQ(q.enqueue(p1, file).state, UploadQueueState::accepted);
+  EXPECT_EQ(q.enqueue(p2, file).state, UploadQueueState::queued);
+  EXPECT_EQ(q.queued_size(), 1u);
+  q.remove(p2);
+  EXPECT_EQ(q.queued_size(), 0u);
+}

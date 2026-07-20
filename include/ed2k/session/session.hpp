@@ -95,6 +95,8 @@ struct SharedFileInfo {
 struct UploadStats {
   std::size_t active_sessions = 0;   // 当前在途的入站上传会话数
   std::uint64_t total_uploaded = 0;  // 本会话累计上传字节数(全部对端汇总)
+  std::uint64_t speed_bps = 0;       // 上传速率(1s 采样, 全局)
+  std::uint32_t queued_count = 0;    // 等待上传的排队人数
 };
 
 // GUI 友好的任务管理门面: 任务注册表 + 下载编排协程 + 并发调度 + 1s 速度采样 + 状态事件。

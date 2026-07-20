@@ -35,6 +35,8 @@ class UploadQueue {
   void remove(const UserHash& user_hash);
   bool has_slot(const UserHash& user_hash) const;
   std::uint16_t rank(const UserHash& user_hash) const;
+  // 当前等待上传的排队人数
+  std::size_t queued_size() const noexcept { return queued_.size(); }
 
  private:
   struct Entry {
