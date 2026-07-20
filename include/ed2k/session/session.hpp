@@ -170,19 +170,6 @@ class ED2K_EXPORT Session {
  private:
   struct Impl;
   std::shared_ptr<Impl> impl_;   // 协程持 weak_ptr, Session 销毁后挂起协程安全退化
-  friend void test_only_set_server_static_stats(Session&, IPv4, std::uint16_t,
-                                                 std::uint32_t, std::uint32_t, std::uint32_t);
 };
-
-// 仅供单元测试使用: 直接向 Session 内部服务器列表中匹配 (ip,port) 的一项写入非零的
-// users/files/max_users 静态值, 绕过 server.met 编解码的限制——真实 eD2k 协议里
-// server.met 并无 ST_USERS 这类标签(在线人数只能来自已连接服务器的 SERVERSTATUS 实时推送),
-// 而 files 目前的编解码器也未接入 SoftFiles/HardFiles 标签, 因此这三个字段目前只能通过
-// 直接构造内存态来覆盖非零值, 用于单独锁定 server_list() 中 "非连接行取 ServerEntry
-// 静态值" 这一条回填逻辑, 与真实 server.met 解析路径(仅 max_users 可达)互补。
-// 生产代码不得调用本函数。
-ED2K_EXPORT void test_only_set_server_static_stats(Session& session, IPv4 ip, std::uint16_t port,
-                                                     std::uint32_t users, std::uint32_t files,
-                                                     std::uint32_t max_users);
 
 }

@@ -454,13 +454,12 @@ TEST(SessionSearch, SearchMoreNotConnectedReturnsError){
 
 // server_list() 应回填 ServerEntry 的 users/files/max_users; 未连接的静态记录三者均取
 // ServerEntry 静态值。max_users 有对应的 server.met 标签(ST_MAXUSERS), 走真实
-// parse_server_met 即可驱动非零值; 但 users 在真实 eD2k 协议里没有静态标签(只能来自已连接
-// 服务器的 SERVERSTATUS 实时推送), files 目前的编解码器也未接入 SoftFiles/HardFiles 标签,
-// 因此二者在真实加载路径下恒为 0——单靠 server.met 无法覆盖这两个字段的非零分支。
-// 这里先用真实 server.met 驱动 max_users, 再用 test_only_set_server_static_stats 测试钩子
-// (session.hpp) 直接对内存中的 ServerEntry 补写非零 users/files, 三个字段合起来完整锁定
-// session.cpp 中 info.users=e.users / info.files=e.files / info.max_users=e.max_users 这条
-// 回填赋值——删掉该行三处任意一处, ServerInfo 默认值 0 都会与这里注入的非零值不等, 用例 FAIL。
+// parse_server_met 即可驱动非零值, 因此本用例经真实 server.met 编解码路径注入一条带非零
+// max_users 的 ServerEntry, 断言 server_list() 非连接行的 max_users 等于该静态值——这条
+// 断言锁定 session.cpp 中 info.max_users=e.max_users 这一行回填赋值(删掉它, 断言从 789 变为
+// 默认值 0, 用例 FAIL)。users/files 在真实 eD2k 协议里没有对应的静态标签(在线人数只能来自
+// 已连接服务器的 SERVERSTATUS 实时推送, files 目前的编解码器也未接入 SoftFiles/HardFiles
+// 标签), 生产加载路径下恒为 0, 因此这里按 brief 原始设计断言默认值 0。
 TEST(SessionServer, ServerListCarriesUsersAndFiles){
   IoRuntime rt;
   auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_srvinfo_test";
@@ -476,13 +475,12 @@ TEST(SessionServer, ServerListCarriesUsersAndFiles){
   }
   SessionConfig cfg; cfg.data_dir = tmp_dir;
   Session session(rt, cfg);
-  ed2k::session::test_only_set_server_static_stats(session, e.ip, e.port, 123u, 456u, 789u);
   run_coro(rt, [&]() -> asio::awaitable<void>{
     auto list = session.server_list();
     EXPECT_EQ(list.size(), 1u);
     if(list.size()!=1u) co_return;
-    EXPECT_EQ(list[0].users, 123u);
-    EXPECT_EQ(list[0].files, 456u);
+    EXPECT_EQ(list[0].users, 0u);
+    EXPECT_EQ(list[0].files, 0u);
     EXPECT_EQ(list[0].max_users, 789u);
     co_return;
   });
