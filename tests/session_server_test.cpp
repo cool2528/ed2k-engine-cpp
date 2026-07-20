@@ -282,6 +282,46 @@ TEST(SessionSearch, ReturnsFilteredResults){
   std::filesystem::remove_all(tmp_dir);
 }
 
+// 搜索结果的源数/完整源数应从 FT_SOURCES(0x15)/FT_COMPLETE_SOURCES(0x30) tag 直读为字段
+TEST(SessionSearch, ExtractsSourcesAndCompleteSources){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+    (void)co_await read_frame(s);   // SEARCHREQUEST
+    { codec::ByteWriter w; w.u32(1);
+      auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+      w.hash16(h); w.u32(0xDDCCBBAAu); w.u16(0x1234u); w.u32(4);
+      w.u8(0x82); w.u8(ed2k::server::tag::FT_FILENAME); w.string16("plain");
+      w.u8(0x83); w.u8(ed2k::server::tag::FT_FILESIZE); w.u32(123456u);
+      w.u8(0x83); w.u8(ed2k::server::tag::FT_SOURCES); w.u32(56u);
+      w.u8(0x83); w.u8(ed2k::server::tag::FT_COMPLETE_SOURCES); w.u32(41u);
+      co_await send_pkt(s, ed2k::server::op::SEARCHRESULT, w.take());
+    }
+    co_await keep_alive(s);
+    co_return;
+  });
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_srcs_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 100ms;
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto lr = co_await session.connect_server(
+      ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()});
+    EXPECT_TRUE(lr.has_value());
+    if(!lr) co_return;
+    auto r = co_await session.search("foo", {});
+    EXPECT_TRUE(r.has_value());
+    if(!r || r->size()!=1u) co_return;
+    EXPECT_EQ((*r)[0].sources, 56u);
+    EXPECT_EQ((*r)[0].complete_sources, 41u);
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
+
 // UAF 回归: connect_server()/search() 跨多次 co_await 访问 Impl 必须走 weak_ptr(与
 // run_task/sampler 同构), 而不是隐式捕获 this——否则 Session 在协程挂起期间被销毁(如调用方
 // quit/切账号)会导致挂起协程恢复后访问已悬垂的 this->impl_。

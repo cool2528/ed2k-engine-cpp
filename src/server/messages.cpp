@@ -126,6 +126,10 @@ decode_search_result(std::span<const std::byte> data){
         item.name = std::get<std::string>(t.value);
       else if(t.name_id == tag::FT_FILESIZE && std::holds_alternative<std::uint64_t>(t.value))
         item.size = std::get<std::uint64_t>(t.value);
+      else if(t.name_id == tag::FT_SOURCES && std::holds_alternative<std::uint64_t>(t.value))
+        item.sources = static_cast<std::uint32_t>(std::get<std::uint64_t>(t.value));
+      else if(t.name_id == tag::FT_COMPLETE_SOURCES && std::holds_alternative<std::uint64_t>(t.value))
+        item.complete_sources = static_cast<std::uint32_t>(std::get<std::uint64_t>(t.value));
     }
     out.push_back(std::move(item));
   }

@@ -35,6 +35,7 @@ constexpr std::uint8_t FT_FILETYPE      = 0x03;
 constexpr std::uint8_t FT_FILEFORMAT    = 0x04;
 constexpr std::uint8_t FT_AICH_FILEHASH = 0x11;
 constexpr std::uint8_t FT_SOURCES       = 0x15;
+constexpr std::uint8_t FT_COMPLETE_SOURCES = 0x30;  // 完整源数(aMule FileTags.h 同值)
 constexpr std::uint8_t ST_SERVERNAME    = 0x01;
 constexpr std::uint8_t ST_DESCRIPTION   = 0x0B;
 }

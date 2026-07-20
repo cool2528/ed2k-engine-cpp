@@ -38,6 +38,8 @@ struct FoundSources    { FileHash hash; std::vector<SourceEndpoint> sources; };
 struct SearchResultItem{
   FileHash hash; std::uint32_t client_id=0; std::uint16_t port=0;
   std::string name; std::uint64_t size=0;
+  std::uint32_t sources=0;            // FT_SOURCES(0x15) 提取, 无 tag 时为 0
+  std::uint32_t complete_sources=0;   // FT_COMPLETE_SOURCES(0x30) 提取, 无 tag 时为 0
   std::vector<codec::Tag> tags;
 };
 
