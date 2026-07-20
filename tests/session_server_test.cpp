@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <optional>
 #include <string>
@@ -22,6 +23,7 @@
 #include "ed2k/net/runtime.hpp"
 #include "ed2k/net/framing.hpp"
 #include "ed2k/codec/byte_io.hpp"
+#include "ed2k/metfile/server_met.hpp"
 #include "ed2k/server/opcodes.hpp"
 #include "ed2k/server/messages.hpp"
 #include "ed2k/server/search_query.hpp"
@@ -450,22 +452,38 @@ TEST(SessionSearch, SearchMoreNotConnectedReturnsError){
   std::filesystem::remove_all(tmp_dir);
 }
 
-// server_list() 应回填 server.met 的 users/files/max_users; 未连接的静态记录三者均取 met 静态值,
-// 本用例只验证字段存在且默认 0(add_server 不带 met 静态数据)。met 静态值路径由 met 解析测试覆盖。
+// server_list() 应回填 ServerEntry 的 users/files/max_users; 未连接的静态记录三者均取
+// ServerEntry 静态值。max_users 有对应的 server.met 标签(ST_MAXUSERS), 走真实
+// parse_server_met 即可驱动非零值; 但 users 在真实 eD2k 协议里没有静态标签(只能来自已连接
+// 服务器的 SERVERSTATUS 实时推送), files 目前的编解码器也未接入 SoftFiles/HardFiles 标签,
+// 因此二者在真实加载路径下恒为 0——单靠 server.met 无法覆盖这两个字段的非零分支。
+// 这里先用真实 server.met 驱动 max_users, 再用 test_only_set_server_static_stats 测试钩子
+// (session.hpp) 直接对内存中的 ServerEntry 补写非零 users/files, 三个字段合起来完整锁定
+// session.cpp 中 info.users=e.users / info.files=e.files / info.max_users=e.max_users 这条
+// 回填赋值——删掉该行三处任意一处, ServerInfo 默认值 0 都会与这里注入的非零值不等, 用例 FAIL。
 TEST(SessionServer, ServerListCarriesUsersAndFiles){
   IoRuntime rt;
   auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_srvinfo_test";
   std::filesystem::create_directories(tmp_dir);
+  ServerList met;
+  ServerEntry e; e.ip = IPv4::from_dotted("10.0.0.1").value(); e.port = 4661; e.name = "static";
+  e.max_users = 789u;
+  met.servers = { e };
+  {
+    auto bytes = write_server_met(met);
+    std::ofstream ofs(tmp_dir / "server.met", std::ios::binary);
+    ofs.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
   SessionConfig cfg; cfg.data_dir = tmp_dir;
   Session session(rt, cfg);
+  ed2k::session::test_only_set_server_static_stats(session, e.ip, e.port, 123u, 456u, 789u);
   run_coro(rt, [&]() -> asio::awaitable<void>{
-    session.add_server(IPv4::from_dotted("10.0.0.1").value(), 4661, "static");
     auto list = session.server_list();
     EXPECT_EQ(list.size(), 1u);
     if(list.size()!=1u) co_return;
-    EXPECT_EQ(list[0].users, 0u);
-    EXPECT_EQ(list[0].files, 0u);
-    EXPECT_EQ(list[0].max_users, 0u);
+    EXPECT_EQ(list[0].users, 123u);
+    EXPECT_EQ(list[0].files, 456u);
+    EXPECT_EQ(list[0].max_users, 789u);
     co_return;
   });
   std::filesystem::remove_all(tmp_dir);

@@ -726,6 +726,16 @@ std::vector<ServerInfo> Session::server_list() const {
   return out;
 }
 
+void test_only_set_server_static_stats(Session& session, IPv4 ip, std::uint16_t port,
+                                        std::uint32_t users, std::uint32_t files,
+                                        std::uint32_t max_users){
+  auto& list = session.impl_->servers.servers;
+  auto it = std::find_if(list.begin(), list.end(),
+    [&](const ServerEntry& e){ return e.ip == ip && e.port == port; });
+  if(it == list.end()) return;
+  it->users = users; it->files = files; it->max_users = max_users;
+}
+
 bool Session::add_server(IPv4 ip, std::uint16_t port, const std::string& name){
   auto& list = impl_->servers.servers;
   bool exists = std::any_of(list.begin(), list.end(),
