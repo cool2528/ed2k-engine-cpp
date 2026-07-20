@@ -714,7 +714,13 @@ std::vector<ServerInfo> Session::server_list() const {
   for(const auto& e : impl_->servers.servers){
     ServerInfo info;
     info.ip = e.ip; info.port = e.port; info.name = e.name;
+    info.users = e.users; info.files = e.files; info.max_users = e.max_users;
     info.connected = connected && impl_->server_state.ip == e.ip && impl_->server_state.port == e.port;
+    if(info.connected){
+      // 连接期收到的 SERVERSTATUS 实时值比 met 静态值新
+      info.users = impl_->server_state.users;
+      info.files = impl_->server_state.files;
+    }
     out.push_back(std::move(info));
   }
   return out;

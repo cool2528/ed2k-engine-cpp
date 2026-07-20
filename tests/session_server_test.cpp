@@ -449,3 +449,62 @@ TEST(SessionSearch, SearchMoreNotConnectedReturnsError){
   });
   std::filesystem::remove_all(tmp_dir);
 }
+
+// server_list() 应回填 server.met 的 users/files/max_users; 未连接的静态记录三者均取 met 静态值,
+// 本用例只验证字段存在且默认 0(add_server 不带 met 静态数据)。met 静态值路径由 met 解析测试覆盖。
+TEST(SessionServer, ServerListCarriesUsersAndFiles){
+  IoRuntime rt;
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_srvinfo_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir;
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    session.add_server(IPv4::from_dotted("10.0.0.1").value(), 4661, "static");
+    auto list = session.server_list();
+    EXPECT_EQ(list.size(), 1u);
+    if(list.size()!=1u) co_return;
+    EXPECT_EQ(list[0].users, 0u);
+    EXPECT_EQ(list[0].files, 0u);
+    EXPECT_EQ(list[0].max_users, 0u);
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// 已连接行的 users/files 应以 SERVERSTATUS 推送的实时值为准, 覆盖 server.met 里的静态值。
+TEST(SessionServer, ConnectedRowUsesLiveServerStatus){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+    { codec::ByteWriter w; w.u32(42u); w.u32(7u);
+      co_await send_pkt(s, ed2k::server::op::SERVERSTATUS, w.take());
+    }
+    co_await keep_alive(s);
+    co_return;
+  });
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_srvstatus_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 3000ms;
+  Session session(rt, cfg);
+  const auto target_ip = IPv4::from_dotted("127.0.0.1").value();
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    session.add_server(target_ip, srv.port(), "target");   // 让静态记录与连接目标地址一致, 才能匹配到 connected 行
+    auto r = co_await session.connect_server(ed2k::app::ServerTarget{target_ip, srv.port()});
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;                     // 协程体内禁用 ASSERT_*; 失败时守卫式提前返回
+    auto list = session.server_list();
+    // 已连接行应携带 SERVERSTATUS 推送的实时 users/files
+    bool found_connected = false;
+    for(const auto& info : list){
+      if(info.connected){ found_connected = true;
+        EXPECT_EQ(info.users, 42u);
+        EXPECT_EQ(info.files, 7u); }
+    }
+    EXPECT_TRUE(found_connected);
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}

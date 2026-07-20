@@ -58,6 +58,9 @@ struct ServerInfo {                      // UI 服务器列表行
   IPv4 ip; std::uint16_t port = 0;
   std::string name;                      // 来自 server.met tags 或 IDENT, 可为空
   bool connected = false;
+  std::uint32_t users = 0;               // met 静态值; 已连接行为实时值
+  std::uint32_t files = 0;               // 同上
+  std::uint32_t max_users = 0;           // 仅 met 静态值(SERVERSTATUS 不含此项)
 };
 struct ServerStateEvent {                // 服务器连接状态变化事件
   bool connected = false;
