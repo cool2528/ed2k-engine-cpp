@@ -317,7 +317,12 @@ struct SessionConfig {
 };
 
 struct TaskStateEvent { std::uint64_t task_id; TaskState state; std::error_code error; };
-struct ServerInfo { IPv4 ip; std::uint16_t port; std::string name; bool connected; };
+struct ServerInfo {
+  IPv4 ip; std::uint16_t port; std::string name; bool connected;
+  std::uint32_t users;      // 静态值来自 server.met；当前已连接行会被连接期实时值覆盖
+  std::uint32_t files;      // 同上
+  std::uint32_t max_users;  // 仅 server.met 静态值——没有任何服务器推送会带这个字段
+};
 struct ServerStateEvent {
   bool connected; IPv4 ip; std::uint16_t port; std::string name;
   bool high_id; std::uint32_t users, files;
@@ -376,9 +381,23 @@ class ED2K_EXPORT Session {
   boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
     search(const std::string& keyword, const SearchFilters& filters);
 
+  // 取回上一次 search() 的下一批结果（OP_QUERYMORERESULTS），必须与 search() 在同一连接上
+  // 串行调用——该连接是单读者。未连接 -> errc::connect_failed。空 vector 表示服务器已无
+  // 更多结果。
+  boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+    search_more();
+
   // Kad(DHT) 状态。
   struct KadStatus { bool running = false; std::size_t contacts = 0; };
   KadStatus kad_status() const;
+
+  // Kad(DHT) 关键词搜索。为避免与常驻 kad_run 协程争抢主 Kad socket 的单读者名额，每次调用
+  // 都会构造一个短生命周期的临时 KadNetwork 实例（独立 socket，系统分配端口），查询用的
+  // peer 取自主实例路由表的一份快照，查询结束后即丢弃。Kad 未启用或路由表为空 ->
+  // errc::connect_failed（复用既有错误码，未新增）。搜索超时表现为 errc::timed_out，
+  // 而不是空结果。必须在网络线程（rt.executor()）上调用。
+  boost::asio::awaitable<tl::expected<std::vector<kad::KadSearchEntry>, std::error_code>>
+    kad_search(const std::string& keyword);
 
   // 分享/上传。dirs 为空 -> 停止分享并释放入站监听器。
   boost::asio::awaitable<tl::expected<void, std::error_code>>

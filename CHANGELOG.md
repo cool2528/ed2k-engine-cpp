@@ -3,6 +3,37 @@
 All notable changes to ed2kengine. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Source-of-truth progress tracker: `docs/RELEASE-PLAN.md`.
 
+## [2.4.0] — 2026-07-20
+
+### Added — Session search paging, server stats, Kad search facade (GUI phase 2a)
+- `server::SearchResultItem` carries `sources` and `complete_sources` extracted from search
+  result tags, so search UIs can show source availability without a separate `sources` round
+  trip.
+- `ServerConnection::search_more` sends `OP_QUERYMORERESULTS` (0x21) to fetch the next page of
+  results for the previous `search` on the same connection; `Session::search_more()` exposes it
+  as a facade (`boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>,
+  std::error_code>>`). Must be called serially on the same connection after a successful
+  `search()`; returns `errc::connect_failed` if not connected; an empty vector means the server
+  has no more results.
+- `ServerInfo` gained `users`, `files`, and `max_users`: the static fields are backfilled from
+  `server.met`, the `users`/`files` of the currently connected row are overwritten with live
+  connection-time values, and `max_users` remains the static `server.met` value only (no live
+  push carries it).
+- `Session::kad_search(keyword)` — a Kad(DHT) keyword-search facade
+  (`boost::asio::awaitable<tl::expected<std::vector<kad::KadSearchEntry>, std::error_code>>`)
+  that spins up a short-lived ephemeral `kad::KadNetwork` instance per call (so it never
+  contends with the resident `kad_run` coroutine's single-reader socket), seeded from a
+  snapshot of the main routing table's contacts. Returns `errc::connect_failed` if Kad is
+  disabled or the routing table is empty; a timeout surfaces as `errc::timed_out`, not an empty
+  result.
+- `docs/API.md` / `docs/API.zh-CN.md` updated: `ServerInfo` struct and the two new `Session`
+  facade signatures/semantics documented alongside the existing Session contract.
+
+### Tests
+- 2026-07-20 release acceptance: Windows Release `ed2k_tests.exe --gtest_filter="Smoke.*"`
+  3/3 pass (`Smoke.VersionMatchesRelease` confirms `ed2k::version() == "2.4.0"`); full `ctest`
+  565 total, 549 pass + 16 live-gated skip, 0 fail.
+
 ## [2.3.0] — 2026-07-19
 
 ### Added — Session facade (GUI embedding)

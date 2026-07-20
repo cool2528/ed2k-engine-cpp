@@ -332,7 +332,13 @@ struct SessionConfig {
 };
 
 struct TaskStateEvent { std::uint64_t task_id; TaskState state; std::error_code error; };
-struct ServerInfo { IPv4 ip; std::uint16_t port; std::string name; bool connected; };
+struct ServerInfo {
+  IPv4 ip; std::uint16_t port; std::string name; bool connected;
+  std::uint32_t users;      // static value from server.met; overwritten with the live value
+                             // for the currently connected row
+  std::uint32_t files;      // same as above
+  std::uint32_t max_users;  // server.met static value only -- no live push carries this field
+};
 struct ServerStateEvent {
   bool connected; IPv4 ip; std::uint16_t port; std::string name;
   bool high_id; std::uint32_t users, files;
@@ -391,9 +397,26 @@ class ED2K_EXPORT Session {
   boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
     search(const std::string& keyword, const SearchFilters& filters);
 
+  // Fetches the next page of results for the previous search() (OP_QUERYMORERESULTS) on the
+  // same connection. Must be called serially on the same connection after a successful
+  // search() -- the connection is single-reader. Not connected -> errc::connect_failed. An
+  // empty vector means the server has no more results.
+  boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+    search_more();
+
   // Kad(DHT) status.
   struct KadStatus { bool running = false; std::size_t contacts = 0; };
   KadStatus kad_status() const;
+
+  // Kad(DHT) keyword search. To avoid contending with the resident kad_run coroutine's
+  // single-reader claim on the main Kad socket, each call spins up a short-lived ephemeral
+  // KadNetwork instance (its own socket, OS-assigned port) seeded from a snapshot of the main
+  // instance's routing-table contacts, and discards it once the search completes. Kad disabled
+  // or an empty routing table -> errc::connect_failed (reuses the existing error code; no new
+  // one was added). A search timeout surfaces as errc::timed_out, not an empty result. Must be
+  // called on the network thread (rt.executor()).
+  boost::asio::awaitable<tl::expected<std::vector<kad::KadSearchEntry>, std::error_code>>
+    kad_search(const std::string& keyword);
 
   // Sharing / upload. dirs empty -> stops sharing and releases the inbound listener.
   boost::asio::awaitable<tl::expected<void, std::error_code>>

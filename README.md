@@ -31,15 +31,18 @@ Built on Boost.Asio coroutines with a single-network-thread, lock-free design.
 | Server UDP completeness / MuleInfo / compressed upload / aMule `.part.met` | ✅ |
 | Linux / CI | ✅ |
 | **Session facade (`ed2k::session::Session`) — GUI-embeddable task/server/search/Kad/share API** | ✅ |
+| Session search paging (`search_more`), server user/file counts, Kad keyword search facade | ✅ |
 
-Latest local acceptance (2026-07-19): Windows Debug **557/557** (541 pass + 16 live-gated
-skips), 0 failed; install and independent consumer smokes green. Earlier acceptance
-(2026-07-15): Windows Debug 535/535 (519 pass + 16 live-gated skips); Linux Debug 524/524
-(508 pass + 16 live-gated skips); install and independent consumer smokes green in all four
-Debug/Release configurations (2026-07-12). The managed aMule 2.3.3 live harness passes both
-modes, including real upload evidence: aMule downloads the complete fixture from the engine's
-upload session.
-Version: `2.3.0`.
+Latest local acceptance (2026-07-20): Windows Release ctest **565/565** (549 pass + 16
+live-gated skips), 0 failed (Session search paging + server user/file counts + Kad search
+facade, see CHANGELOG). Earlier acceptance (2026-07-19): Windows Debug 557/557 (541 pass + 16
+live-gated skips), 0 failed; install and independent consumer smokes green. Earlier acceptance
+(2026-07-15): Windows Debug 535/535 (519 pass + 16 live-gated skips); Linux
+Debug 524/524 (508 pass + 16 live-gated skips); install and independent consumer smokes green
+in all four Debug/Release configurations (2026-07-12). The managed aMule 2.3.3 live harness
+passes both modes, including real upload evidence: aMule downloads the complete fixture from
+the engine's upload session.
+Version: `2.4.0`.
 
 ## Build
 
