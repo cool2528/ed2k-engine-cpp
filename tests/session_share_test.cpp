@@ -219,6 +219,55 @@ TEST(SessionShare, SetSharedDirsPersistsKnownMet){
   std::filesystem::remove_all(share_dir);
 }
 
+// 取消全部分享(set_shared_dirs({}))时, known.met 应保留旧缓存文件不被覆盖为空列表——
+// 供将来重新分享同一批文件时复用哈希, 避免整批哈希白白丢弃。用文件大小(而非仅存在性)
+// 断言未被覆盖: 若被覆盖为空列表, 文件仍会存在但内容/大小会退化为空列表的最小体积。
+TEST(SessionShare, UnshareKeepsKnownMetCacheFile){
+  auto data_dir = std::filesystem::temp_directory_path() / "ed2k_session_share_unshare_known_met_data";
+  auto share_dir = std::filesystem::temp_directory_path() / "ed2k_session_share_unshare_known_met_share";
+  std::filesystem::remove_all(data_dir);
+  std::filesystem::remove_all(share_dir);
+  std::filesystem::create_directories(data_dir);
+  std::filesystem::create_directories(share_dir);
+
+  const auto data = random_bytes(4096, 0x5678u);
+  {
+    std::ofstream f(share_dir / "shared.bin", std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  }
+
+  IoRuntime rt;
+  SessionConfig cfg;
+  cfg.data_dir = data_dir;
+  cfg.tcp_port = 48177;   // 与其它用例不同的专用端口, 避免冲突
+
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    std::vector<std::filesystem::path> dirs{share_dir};
+    auto r = co_await session.set_shared_dirs(std::move(dirs));
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  const auto known_met_path = data_dir / "known.met";
+  ASSERT_TRUE(std::filesystem::exists(known_met_path));
+  const auto size_before = std::filesystem::file_size(known_met_path);
+  ASSERT_GT(size_before, 0u);   // 非空列表的 known.met 应有实际体积
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto r = co_await session.set_shared_dirs({});
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  ASSERT_TRUE(std::filesystem::exists(known_met_path));
+  const auto size_after = std::filesystem::file_size(known_met_path);
+  EXPECT_EQ(size_after, size_before);   // 未被覆盖为空列表文件
+
+  std::filesystem::remove_all(data_dir);
+  std::filesystem::remove_all(share_dir);
+}
+
 // 无上传活动时新统计字段应为 0（字段存在性 + 默认值；速率的运行时正确性由采样公式与
 // 下载侧逐字对齐 + 代码审查保证，不在此处写伪造的计时断言，见 task-1-brief 决定）。
 TEST(SessionShare, UploadStatsNewFieldsDefaultZero){

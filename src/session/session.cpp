@@ -220,9 +220,18 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
 
   // 把 db(本轮扫描结果) 落盘到 cfg.data_dir/known.met, 作为下一次 set_shared_dirs 的哈希缓存,
   // 与 persist_server_met/persist_nodes_dat 同构(临时文件名带 tcp_port + 进程内自增序号,
-  // 写临时文件后 rename 原子替换)。失败仅记日志不阻塞——缓存缺失只是让下一轮重扫变慢,
-  // 不影响功能正确性, 因此不作为 set_shared_dirs 的失败条件。
+  // 写临时文件后 rename 原子替换)。无论落盘是否成功都同步更新内存态 known_met_cache(与
+  // persist_server_met 一致), 保证下一轮 rescan 立即用上最新哈希缓存, 不依赖磁盘 IO 结果——
+  // 否则持久化持续失败(只读/磁盘满)时内存缓存永远不推进, 每次重扫都退化为全量重新哈希。
+  // 特例: 取消全部分享(db.files() 为空)且旧缓存非空时, 视为"临时清空", 保留旧缓存(内存与
+  // 磁盘 known.met 均不变), 供将来重新分享时复用哈希, 避免整批哈希白白丢弃、下次重新分享
+  // 时又要全量重算。
   void persist_known_met(){
+    const bool preserve_old_cache = db.files().empty() && !known_met_cache.files().empty();
+    if(preserve_old_cache){
+      return;   // 保留旧缓存: 内存态与磁盘 known.met 文件均不动
+    }
+    known_met_cache = db;   // 无论落盘是否成功都同步更新内存态, 语义同 persist_server_met
     auto bytes = share::write_known_files(db.files());
     std::error_code ec;
     std::filesystem::create_directories(cfg.data_dir, ec);
@@ -241,9 +250,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     if(ec){
       spdlog::warn("Session::persist_known_met: rename {} -> {} failed: {}",
                    tmp_path.string(), final_path.string(), ec.message());
-      return;
     }
-    known_met_cache = db;   // 后续 rescan 用最新缓存
   }
 
   // 断开当前服务器连接: 幂等(未连接时 no-op)。递增 server_generation 使在途的 connect_server
