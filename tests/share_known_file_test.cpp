@@ -130,6 +130,39 @@ TEST(KnownFileDB, ScanReusesCacheWhenTripleMatches) {
   std::filesystem::remove_all(dir);
 }
 
+// 缓存条目 date==0(构造时代表 mtime 读取失败)不得与真实文件(date!=0)误判命中:
+// 复现 fdate==0 探测被跳过场景的另一面——即便探测未被跳过, date 比较本身也应拒绝该匹配。
+// (对 fdate==0 时探测被直接跳过的分支, 以代码内联的一行 guard + 审查覆盖, 详见 known_file.cpp)
+TEST(KnownFileDB, ScanDoesNotReuseCacheEntryWithZeroDate) {
+  auto dir = temp_dir("ed2k_share_scan_cache_zero_date");
+  auto file = dir / "b.bin";
+  std::vector<std::byte> data(1024, std::byte{'z'});
+  write_bytes(file, data);
+
+  share::KnownFileDB first;
+  ASSERT_TRUE(first.scan_dir(dir).has_value());
+  ASSERT_EQ(first.files().size(), 1u);
+  const auto real_hash = first.files()[0].hash;
+  const auto real_size = first.files()[0].size;
+
+  // 手工构造一条 date==0 的伪缓存条目, 与真实文件同名同大小, 但哈希是假的(全零哈希)
+  share::KnownFileDB fake_cache;
+  share::KnownFile fake;
+  fake.hash = FileHash{};
+  fake.name = "b.bin";
+  fake.size = real_size;
+  fake.date = 0;
+  fake_cache.add(std::move(fake));
+
+  share::KnownFileDB second;
+  ASSERT_TRUE(second.scan_dir(dir, &fake_cache).has_value());
+  ASSERT_EQ(second.files().size(), 1u);
+  // 真实文件 mtime 不为 0, 与缓存 date==0 不相等 -> 不应命中伪缓存, 必须落回真实哈希
+  EXPECT_NE(second.files()[0].date, 0u);
+  EXPECT_EQ(second.files()[0].hash, real_hash);
+  std::filesystem::remove_all(dir);
+}
+
 // 请求计数: note_request 累加, 未知 hash 返回 0, adopt 迁移旧计数
 TEST(KnownFileDB, RequestCounting) {
   share::KnownFileDB db;

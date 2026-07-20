@@ -157,7 +157,10 @@ tl::expected<void, std::error_code> KnownFileDB::scan_dir(const std::filesystem:
       std::error_code fec;
       const auto fsize = std::filesystem::file_size(it->path(), fec);
       const auto fdate = mtime_unix_seconds(it->path());
-      if(!fec) {
+      // fdate==0 表示当前文件 mtime 读取失败(权限/文件系统异常等), 此时禁止走缓存探测:
+      // 若缓存中恰好也存在 date==0 的旧条目(例如缓存产生时同样遭遇 mtime 失败), 二者会仅凭
+      // name+size 误判命中, 复用一个可能早已过期的哈希——直接跳过探测、落入真实哈希分支更安全。
+      if(!fec && fdate != 0) {
         const KnownFile* hit = nullptr;
         for(const auto& c : cache->files())
           if(c.name == name && c.size == fsize && c.date == fdate) { hit = &c; break; }
