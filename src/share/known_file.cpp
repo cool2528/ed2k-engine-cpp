@@ -3,6 +3,7 @@
 #include "ed2k/hash/aich_hasher.hpp"
 #include "ed2k/hash/ed2k_hasher.hpp"
 #include <algorithm>
+#include <chrono>
 #include <variant>
 
 namespace ed2k::share {
@@ -59,6 +60,17 @@ KnownFile from_known_entry(KnownFileEntry e) {
   return f;
 }
 
+// 文件 mtime -> unix 秒: known.met 的 date 字段, 也是缓存复用键 (name,size,date) 的一部分
+// (eMule 惯例, 秒级精度)。转换失败(文件不存在/无权限等)时返回 0, 不当作致命错误。
+std::uint32_t mtime_unix_seconds(const std::filesystem::path& p) {
+  std::error_code ec;
+  const auto ftime = std::filesystem::last_write_time(p, ec);
+  if(ec) return 0;
+  const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+  return static_cast<std::uint32_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count());
+}
+
 tl::expected<KnownFile, std::error_code> known_from_path(const std::filesystem::path& p) {
   std::error_code ec;
   auto size = std::filesystem::file_size(p, ec);
@@ -74,6 +86,7 @@ tl::expected<KnownFile, std::error_code> known_from_path(const std::filesystem::
   f.path = p;
   f.name = p.filename().string();
   f.size = size;
+  f.date = mtime_unix_seconds(p);
   return f;
 }
 } // namespace
@@ -128,7 +141,7 @@ tl::expected<std::vector<Known2Entry>, std::error_code> parse_known2_met(std::sp
   return out;
 }
 
-tl::expected<void, std::error_code> KnownFileDB::scan_dir(const std::filesystem::path& dir) {
+tl::expected<void, std::error_code> KnownFileDB::scan_dir(const std::filesystem::path& dir, const KnownFileDB* cache) {
   std::error_code ec;
   if(!std::filesystem::exists(dir, ec) || ec) return tl::unexpected(make_error_code(errc::io_error));
   for(std::filesystem::directory_iterator it(dir, ec), end; it != end; it.increment(ec)) {
@@ -136,6 +149,25 @@ tl::expected<void, std::error_code> KnownFileDB::scan_dir(const std::filesystem:
     if(!it->is_regular_file(ec) || ec) {
       if(ec) return tl::unexpected(make_error_code(errc::io_error));
       continue;
+    }
+    // 缓存 (name,size,date) 命中 -> 跳过重哈希, 直接复用旧条目(仅刷新 path)
+    if(cache != nullptr) {
+      // 复用键: 文件名+大小+mtime(eMule known.met 惯例, met 格式本身不含路径)
+      const auto name = it->path().filename().string();
+      std::error_code fec;
+      const auto fsize = std::filesystem::file_size(it->path(), fec);
+      const auto fdate = mtime_unix_seconds(it->path());
+      if(!fec) {
+        const KnownFile* hit = nullptr;
+        for(const auto& c : cache->files())
+          if(c.name == name && c.size == fsize && c.date == fdate) { hit = &c; break; }
+        if(hit != nullptr) {
+          KnownFile reused = *hit;
+          reused.path = it->path();
+          add(std::move(reused));
+          continue;
+        }
+      }
     }
     auto f = known_from_path(it->path());
     if(!f) return tl::unexpected(f.error());

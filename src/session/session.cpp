@@ -99,6 +99,11 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // 分享的文件库(哈希扫描结果); set_shared_dirs 每次调用整体重建, 不做增量。
   share::KnownFileDB db;
   std::vector<std::filesystem::path> shared_dirs;
+  // known.met 哈希缓存: 仅首次 set_shared_dirs 调用时从 cfg.data_dir/known.met 加载一次,
+  // 之后每次扫描成功后原子写回并同步刷新, 供下一次 rescan 命中 (name,size,date) 三元组
+  // 跳过重哈希(见 set_shared_dirs 实现)。
+  bool known_met_loaded = false;
+  share::KnownFileDB known_met_cache;
   // 入站上传连接监听; sharing_active=true 时非空。与下载侧的 LowID 回调 listener 双向互斥
   // 共用同一个 cfg.tcp_port(见 run_task 内的正向门控 + 下面 download_listener_count 的反向门控)。
   std::optional<peer::InboundListener> share_listener;
@@ -211,6 +216,34 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       spdlog::warn("Session::persist_nodes_dat: rename {} -> {} failed: {}",
                    tmp_path.string(), final_path.string(), ec.message());
     }
+  }
+
+  // 把 db(本轮扫描结果) 落盘到 cfg.data_dir/known.met, 作为下一次 set_shared_dirs 的哈希缓存,
+  // 与 persist_server_met/persist_nodes_dat 同构(临时文件名带 tcp_port + 进程内自增序号,
+  // 写临时文件后 rename 原子替换)。失败仅记日志不阻塞——缓存缺失只是让下一轮重扫变慢,
+  // 不影响功能正确性, 因此不作为 set_shared_dirs 的失败条件。
+  void persist_known_met(){
+    auto bytes = share::write_known_files(db.files());
+    std::error_code ec;
+    std::filesystem::create_directories(cfg.data_dir, ec);
+    const auto seq = g_persist_seq.fetch_add(1, std::memory_order_relaxed);
+    auto tmp_path = cfg.data_dir /
+      ("known.met." + std::to_string(cfg.tcp_port) + "." + std::to_string(seq) + ".tmp");
+    auto final_path = cfg.data_dir / "known.met";
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if(!f){
+      spdlog::warn("Session::persist_known_met: failed to open temp file {}", tmp_path.string());
+      return;
+    }
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    f.close();
+    std::filesystem::rename(tmp_path, final_path, ec);
+    if(ec){
+      spdlog::warn("Session::persist_known_met: rename {} -> {} failed: {}",
+                   tmp_path.string(), final_path.string(), ec.message());
+      return;
+    }
+    known_met_cache = db;   // 后续 rescan 用最新缓存
   }
 
   // 断开当前服务器连接: 幂等(未连接时 no-op)。递增 server_generation 使在途的 connect_server
@@ -887,6 +920,23 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
   auto disk_ex = self->rt.disk_executor();
   auto net_ex = self->rt.executor();
 
+  // 首次调用: 从 cfg.data_dir/known.met 加载哈希缓存, 供本轮及后续 rescan 复用, 避免全量
+  // 重哈希。解析失败(文件不存在/损坏)时缓存保持为空, 等价于无缓存, 不影响正确性。
+  if(!self->known_met_loaded){
+    self->known_met_loaded = true;
+    const auto known_met_path = self->cfg.data_dir / "known.met";
+    std::error_code kec;
+    if(std::filesystem::exists(known_met_path, kec) && !kec){
+      auto bytes = read_file_bytes(known_met_path);
+      if(auto parsed = share::parse_known_files(bytes)){
+        for(auto& f : *parsed) self->known_met_cache.add(std::move(f));
+      } else {
+        spdlog::warn("Session::set_shared_dirs: parse_known_files({}) failed: {}",
+                     known_met_path.string(), parsed.error().message());
+      }
+    }
+  }
+
   // 整体重建: KnownFileDB::scan_dir 是增量 upsert, 若直接复用旧 db 会残留"已从 dirs 移除的
   // 目录"里的旧文件条目; 用一个全新的临时 db 逐目录扫描, 完成后整体替换 self->db。
   share::KnownFileDB new_db;
@@ -894,7 +944,7 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
     // 哈希扫描是重 CPU/IO 操作, 卸载到 disk_executor 执行(单线程磁盘池, 不占网络线程),
     // 完成后 hop 回网络线程再继续(模式同 part_file.cpp 的 disk hop 注释)。
     co_await asio::post(disk_ex, asio::bind_executor(disk_ex, asio::use_awaitable));
-    auto r = new_db.scan_dir(dir);
+    auto r = new_db.scan_dir(dir, &self->known_met_cache);
     co_await asio::post(net_ex, asio::bind_executor(net_ex, asio::use_awaitable));
     self = weak.lock();
     if(!self || self->shutting_down) co_return tl::unexpected(make_error_code(errc::cancelled));
@@ -908,6 +958,8 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
   new_db.adopt_request_counts(self->db);  // 重扫保留请求计数
   self->db = std::move(new_db);
   self->shared_dirs = std::move(dirs);
+  // 原子写回 known.met, 供下一次 set_shared_dirs 复用哈希缓存(失败仅告警, 见 persist_known_met)。
+  self->persist_known_met();
 
   if(dirs_empty){
     // 空列表 = 停止分享: 关 accept 循环(靠 sharing_active 置 false 令其下一轮退出)+ 释放 listener。

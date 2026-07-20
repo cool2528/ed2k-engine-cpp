@@ -85,6 +85,51 @@ TEST(ShareKnownFile, ScanDirIndexesRegularFiles) {
   std::filesystem::remove_all(dir);
 }
 
+// known_from_path 应把文件 mtime 写入 date 字段(known.met 复用键的一部分)
+TEST(KnownFileDB, ScanFillsDateFromMtime) {
+  auto dir = temp_dir("ed2k_share_scan_date");
+  auto file = dir / "a.bin";
+  std::vector<std::byte> data(1024, std::byte{'x'});
+  write_bytes(file, data);
+
+  share::KnownFileDB db;
+  ASSERT_TRUE(db.scan_dir(dir).has_value());
+  ASSERT_EQ(db.files().size(), 1u);
+  EXPECT_NE(db.files()[0].date, 0u);
+  std::filesystem::remove_all(dir);
+}
+
+// 缓存中 (name,size,date) 匹配时跳过重哈希: 内容被改但三元组不变 -> 沿用缓存 hash
+TEST(KnownFileDB, ScanReusesCacheWhenTripleMatches) {
+  auto dir = temp_dir("ed2k_share_scan_cache");
+  auto file = dir / "a.bin";
+  std::vector<std::byte> data_x(1024, std::byte{'x'});
+  write_bytes(file, data_x);
+
+  share::KnownFileDB first;
+  ASSERT_TRUE(first.scan_dir(dir).has_value());
+  const auto cached_hash = first.files()[0].hash;
+  const auto cached_date = first.files()[0].date;
+  const auto mtime = std::filesystem::last_write_time(file);
+
+  std::vector<std::byte> data_y(1024, std::byte{'y'});   // 同尺寸不同内容
+  write_bytes(file, data_y);
+  std::filesystem::last_write_time(file, mtime);         // 恢复 mtime -> 三元组不变
+
+  share::KnownFileDB second;
+  ASSERT_TRUE(second.scan_dir(dir, &first).has_value());
+  ASSERT_EQ(second.files().size(), 1u);
+  // mtime 恢复后 date 字段应与缓存一致(文件系统精度加固: 直接比较扫描得到的 date, 而非
+  // 假设 last_write_time 往返在所有文件系统上都精确到位)。
+  ASSERT_EQ(second.files()[0].date, cached_date);
+  EXPECT_EQ(second.files()[0].hash, cached_hash);         // 复用而非重哈希
+
+  share::KnownFileDB third;
+  ASSERT_TRUE(third.scan_dir(dir).has_value());           // 无缓存 -> 真重哈希
+  EXPECT_NE(third.files()[0].hash, cached_hash);
+  std::filesystem::remove_all(dir);
+}
+
 // 请求计数: note_request 累加, 未知 hash 返回 0, adopt 迁移旧计数
 TEST(KnownFileDB, RequestCounting) {
   share::KnownFileDB db;

@@ -42,7 +42,9 @@ tl::expected<std::vector<Known2Entry>, std::error_code> parse_known2_met(std::sp
 
 class KnownFileDB {
  public:
-  tl::expected<void, std::error_code> scan_dir(const std::filesystem::path& dir);
+  // cache 非空时, 目录中 (name,size,date) 三元组与 cache 内某条目匹配的文件跳过重哈希,
+  // 直接复用该条目的 hash/part_hashes/aich(仅 path 更新为当前路径); 未命中的文件照常哈希。
+  tl::expected<void, std::error_code> scan_dir(const std::filesystem::path& dir, const KnownFileDB* cache = nullptr);
   void add(KnownFile file);
   bool add_source(const FileHash& hash, ed2k::peer::PeerSource source);
   bool set_file_desc(const FileHash& hash, std::uint8_t rating, std::string comment);

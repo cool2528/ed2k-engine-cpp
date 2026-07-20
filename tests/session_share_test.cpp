@@ -185,6 +185,40 @@ TEST(SessionShare, SharesScannedFilesUploadsToDirectPeerAndUnsharesCleanly){
   std::filesystem::remove_all(share_dir);
 }
 
+// set_shared_dirs 成功后应把 known.met 写入 data_dir, 作为下一次扫描的哈希缓存。
+TEST(SessionShare, SetSharedDirsPersistsKnownMet){
+  auto data_dir = std::filesystem::temp_directory_path() / "ed2k_session_share_known_met_data";
+  auto share_dir = std::filesystem::temp_directory_path() / "ed2k_session_share_known_met_share";
+  std::filesystem::remove_all(data_dir);
+  std::filesystem::remove_all(share_dir);
+  std::filesystem::create_directories(data_dir);
+  std::filesystem::create_directories(share_dir);
+
+  const auto data = random_bytes(4096, 0x1234u);
+  {
+    std::ofstream f(share_dir / "shared.bin", std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  }
+
+  IoRuntime rt;
+  SessionConfig cfg;
+  cfg.data_dir = data_dir;
+  cfg.tcp_port = 48176;   // 与其它用例不同的专用端口, 避免冲突
+
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    std::vector<std::filesystem::path> dirs{share_dir};
+    auto r = co_await session.set_shared_dirs(std::move(dirs));
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+
+  EXPECT_TRUE(std::filesystem::exists(data_dir / "known.met"));
+
+  std::filesystem::remove_all(data_dir);
+  std::filesystem::remove_all(share_dir);
+}
+
 // 无上传活动时新统计字段应为 0（字段存在性 + 默认值；速率的运行时正确性由采样公式与
 // 下载侧逐字对齐 + 代码审查保证，不在此处写伪造的计时断言，见 task-1-brief 决定）。
 TEST(SessionShare, UploadStatsNewFieldsDefaultZero){
