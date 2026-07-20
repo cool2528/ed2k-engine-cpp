@@ -141,6 +141,11 @@ class ED2K_EXPORT Session {
   boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
     search(const std::string& keyword, const SearchFilters& filters);
 
+  // 取回上一次 search 的下一批结果(OP_QUERY_MORE_RESULT)。必须与 search 在同一连接上
+  // 串行调用(单读者); 未连接返回 connect_failed。空列表表示服务器已无更多结果。
+  boost::asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+  search_more();
+
   // Kad(DHT) 状态: running 反映 cfg.enable_kad 是否生效(网络对象是否已构造), contacts 为路由表
   // 当前联系人数。cfg.enable_kad=false 时恒为 {false, 0}。
   struct KadStatus { bool running = false; std::size_t contacts = 0; };

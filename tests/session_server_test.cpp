@@ -381,3 +381,71 @@ TEST(SessionSearch, SearchSurvivesSessionDestructionWhileAwaitingReply){
   EXPECT_TRUE(search_had_error);    // 连接被关闭, search 应以错误收尾, 而非死等或崩溃
   std::filesystem::remove_all(tmp_dir);
 }
+
+// search_more 应复用同一连接取回下一批结果
+TEST(SessionSearch, SearchMoreReturnsNextBatch){
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+    (void)co_await read_frame(s);   // SEARCHREQUEST
+    { codec::ByteWriter w; w.u32(1);
+      auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+      w.hash16(h); w.u32(0xDDCCBBAAu); w.u16(0x1234u); w.u32(1);
+      w.u8(0x82); w.u8(ed2k::server::tag::FT_FILENAME); w.string16("first");
+      co_await send_pkt(s, ed2k::server::op::SEARCHRESULT, w.take());
+    }
+    // 本文件的 read_frame() 返回原始 body(首字节为 opcode, 见 FrameHeader.size 注释), 而非
+    // Packet; QUERYMORERESULTS 无 payload, 故 body 应恰为 1 字节且等于该 opcode。
+    auto more = co_await read_frame(s);   // QUERYMORERESULTS(无 payload)
+    EXPECT_FALSE(more.empty());
+    if(!more.empty()) EXPECT_EQ(static_cast<std::uint8_t>(more[0]), ed2k::server::op::QUERYMORERESULTS);
+    { codec::ByteWriter w; w.u32(1);
+      auto h = *FileHash::from_hex("ffeeddccbbaa99887766554433221100");
+      w.hash16(h); w.u32(0xDDCCBBAAu); w.u16(0x1234u); w.u32(1);
+      w.u8(0x82); w.u8(ed2k::server::tag::FT_FILENAME); w.string16("second");
+      co_await send_pkt(s, ed2k::server::op::SEARCHRESULT, w.take());
+    }
+    co_await keep_alive(s);
+    co_return;
+  });
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_more_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir; cfg.per_server_timeout = 100ms;
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto lr = co_await session.connect_server(
+      ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()});
+    EXPECT_TRUE(lr.has_value());
+    if(!lr) co_return;
+    auto r1 = co_await session.search("foo", {});
+    EXPECT_TRUE(r1.has_value());
+    if(!r1 || r1->size()!=1u) co_return;
+    EXPECT_EQ((*r1)[0].name, "first");
+    auto r2 = co_await session.search_more();
+    EXPECT_TRUE(r2.has_value());
+    if(!r2 || r2->size()!=1u) co_return;
+    EXPECT_EQ((*r2)[0].name, "second");
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// 未连接时 search_more 与 search 同语义返回 connect_failed
+TEST(SessionSearch, SearchMoreNotConnectedReturnsError){
+  IoRuntime rt;
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_more_nc_test";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg; cfg.data_dir = tmp_dir;
+  Session session(rt, cfg);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto r = co_await session.search_more();
+    EXPECT_FALSE(r.has_value());
+    if(r) co_return;
+    EXPECT_EQ(r.error(), make_error_code(ed2k::errc::connect_failed));
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}

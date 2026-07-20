@@ -802,6 +802,19 @@ Session::search(const std::string& keyword, const SearchFilters& filters){
   co_return r;
 }
 
+asio::awaitable<tl::expected<std::vector<server::SearchResultItem>, std::error_code>>
+Session::search_more(){
+  auto weak = impl_->weak_from_this();
+  auto self = weak.lock();
+  if(!self || self->shutting_down || !self->login)
+    co_return tl::unexpected(make_error_code(errc::connect_failed));
+  const auto timeout = self->cfg.per_server_timeout;
+  auto r = co_await self->login->conn.search_more(timeout);
+  self = weak.lock();
+  if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));
+  co_return r;
+}
+
 Session::KadStatus Session::kad_status() const {
   return KadStatus{impl_->kad != nullptr,
                     impl_->kad ? impl_->kad->routing_table().size() : std::size_t{0}};
