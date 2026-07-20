@@ -69,6 +69,10 @@ class ServerConnection {
                                 std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
     search(const SearchExpr&, std::chrono::milliseconds timeout);
+  // 请求上一次 search 的后续批次结果(eMule OP_QUERY_MORE_RESULT)。
+  // 必须在同一连接上 search 成功之后串行调用; 服务器端到底时通常直接超时或回空列表。
+  boost::asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
+    search_more(std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<FoundSources,std::error_code>>
     get_sources(const FileHash&, std::uint64_t size, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::error_code>>

@@ -148,6 +148,16 @@ ServerConnection::search(const SearchExpr& expr, std::chrono::milliseconds timeo
   co_return decode_search_result(rp->payload);
 }
 
+asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
+ServerConnection::search_more(std::chrono::milliseconds timeout){
+  net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::QUERYMORERESULTS;
+  auto sr = co_await impl_->conn.send(req);
+  if(!sr) co_return tl::unexpected(sr.error());
+  auto rp = co_await impl_->pump_until(op::SEARCHRESULT, timeout);
+  if(!rp) co_return tl::unexpected(rp.error());
+  co_return decode_search_result(rp->payload);
+}
+
 asio::awaitable<tl::expected<FoundSources,std::error_code>>
 ServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono::milliseconds timeout){
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::GETSOURCES; req.payload = encode_get_sources(h, size);

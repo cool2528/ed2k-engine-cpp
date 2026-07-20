@@ -12,6 +12,7 @@ constexpr std::uint8_t OFFERFILES        = 0x15;
 constexpr std::uint8_t SEARCHREQUEST     = 0x16;
 constexpr std::uint8_t GETSOURCES        = 0x19;
 constexpr std::uint8_t CALLBACKREQUEST   = 0x1C;
+constexpr std::uint8_t QUERYMORERESULTS  = 0x21;  // 请求上一次搜索的下一批结果(无 payload)
 constexpr std::uint8_t SERVERLIST        = 0x32;
 constexpr std::uint8_t SEARCHRESULT      = 0x33;
 constexpr std::uint8_t SERVERSTATUS      = 0x34;
