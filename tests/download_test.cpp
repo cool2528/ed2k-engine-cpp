@@ -76,6 +76,24 @@ static asio::awaitable<std::pair<std::uint8_t,std::vector<std::byte>>> read_pkt(
   co_return std::pair<std::uint8_t,std::vector<std::byte>>{opcode, std::move(rest)};
 }
 static asio::awaitable<void> keep_alive(tcp::socket& s){ std::array<std::byte,1> t; auto [e,n]=co_await asio::async_read(s,asio::buffer(t),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return; }
+// Task 2: 下载侧握手现无条件跟进 eMule 扩展信息交换 (handshake_with_mule_info /
+// handshake_acceptor_with_mule_info), 故所有 serve_* mock peer 必须在 HELLO 之后正确消费并
+// 应答 EMULEINFO, 否则 pump_until 会把后续真实协议帧 (FILESTATUS 等) 当噪声悄悄吞掉, 导致
+// 整个会话错位。方向与 HELLO 一致: send_hello_first=true 的一方 (主动发 HELLO 的一方, 如
+// LowID 回调源) 也主动发 EMULEINFO 并等应答; 反之被动方等对端 EMULEINFO 再应答。
+static asio::awaitable<void> exchange_mule_mock(tcp::socket& s, bool send_hello_first,
+                                                std::uint16_t udp_port_answer = 4672){
+  using namespace ed2k::peer;
+  MuleInfo mine; mine.udp_port = udp_port_answer;
+  if(send_hello_first){
+    co_await send_pkt(s, op::EMULEINFO, encode_mule_info(mine), proto::eMule);
+    (void)co_await read_frame(s);                        // EMULEINFOANSWER (内容不校验)
+  } else {
+    (void)co_await read_frame(s);                        // EMULEINFO
+    co_await send_pkt(s, op::EMULEINFOANSWER, encode_mule_info(mine), proto::eMule);
+  }
+  co_return;
+}
 // mock peer 提供一个 2-part 文件,part 数据由 fill 决定
 struct MockFile { std::vector<std::byte> d0, d1; PartHash h0, h1; FileHash fhash; };
 static MockFile make_mock_file(std::uint8_t f0, std::uint8_t f1){
@@ -157,7 +175,7 @@ std::vector<AICHProofHash> recovery_for(const std::vector<std::byte>& full, std:
 // peer 响应 Download 的请求序列:HELLO→FILESTATUS→HASHSET→FILENAME→ACCEPT→
 // 循环处理 REQUESTPARTS:解析请求范围,回送对应字节切片 + OUTOFPARTREQS 终止多响应循环。
 // 请求范围 [s0,e0) 是 flat 整文件块, 可能跨越 part 边界: 从 full=d0||d1 切片即可。
-static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
+static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf, std::uint16_t udp_port_answer = 4672){
   using namespace ed2k::peer;
   std::vector<std::byte> full;
   full.insert(full.end(), mf.d0.begin(), mf.d0.end());
@@ -165,6 +183,7 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
   (void)co_await read_frame(s);                          // HELLO
   { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
     co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false, udp_port_answer);
   (void)co_await read_frame(s);                          // SETREQFILEID
   { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
     co_await send_pkt(s, op::FILESTATUS, w.take()); }
@@ -193,6 +212,46 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
   }
   co_await keep_alive(s); co_return;
 }
+// Task 2 graceful-degrade fixture: 纯 eDonkey 对端——回 HELLOANSWER 后收到 EMULEINFO 但不
+// 应答 (不支持 eMule 扩展, 也不认识该 opcode), 其余握手后流程与 serve_full_peer 完全一致。
+// 用于验证下载侧在 exchange_mule_info 超时/失败时仍能正常完成整个下载 (source_udp_port()
+// 退化为 0, 不影响握手/下载成功)。
+static asio::awaitable<void> serve_full_peer_no_mule_ext(tcp::socket s, const MockFile& mf){
+  using namespace ed2k::peer;
+  std::vector<std::byte> full;
+  full.insert(full.end(), mf.d0.begin(), mf.d0.end());
+  full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  (void)co_await read_frame(s);                          // EMULEINFO — 消费但不应答 (刻意不支持)
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
+    (void)r.hash16();                                    // 文件 hash
+    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
+    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
+    (void)s1;(void)s2;(void)e1;(void)e2;
+    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+    std::size_t off = static_cast<std::size_t>(s0);
+    std::size_t len = static_cast<std::size_t>(e0 - s0);
+    codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
+    w.blob(std::span<const std::byte>(full).subspan(off, len));
+    co_await send_pkt(s, op::SENDINGPART, w.take());
+  }
+  co_await keep_alive(s); co_return;
+}
 // 参数化重载: 服务指定 full 数据 + hashset(M3 LowID 回调路径与多源测试复用)。
 // 分派与 serve_full_peer(MockFile) 同款: HELLOANSWER/FILESTATUS/HASHSETANSWER/
 // FILENAMEANSWER/ACCEPTUPLOADREQ/SENDINGPART + OUTOFPARTREQS 终止多响应循环。
@@ -211,6 +270,7 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<st
     (void)co_await read_frame(s);                        // HELLO
     co_await send_pkt(s, op::HELLOANSWER, encode_hello(h));
   }
+  co_await exchange_mule_mock(s, send_hello_first);
   (void)co_await read_frame(s);                          // SETREQFILEID
   { codec::ByteWriter w; w.hash16(fhash);
     w.u16(static_cast<std::uint16_t>(parts.size()));
@@ -251,6 +311,7 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
   (void)co_await read_frame(s);   // HELLO
   { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
     co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false);
   (void)co_await read_frame(s);   // SETREQFILEID
   { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);
     co_await send_pkt(s, op::FILESTATUS, w.take()); }
@@ -333,6 +394,48 @@ TEST(Download, EndToEndSingleSource){
     auto r = co_await dl.run(5s);
     EXPECT_TRUE(r.has_value()); if(!r) co_return;
     // 校验文件
+    { PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1}); EXPECT_TRUE(pf.complete()); }
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+// Task 2 (a): 源在 mule-info 握手中通告 udp_port=X (EMULEINFOANSWER), 下载侧应捕获该值并
+// 通过 Download::source_udp_port() 暴露, 供未来 UDP reask 排队保活寻址 (Task 4)。
+TEST(Download, CapturesSourceUdpPortViaMuleInfoHandshake){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_udp_port"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  constexpr std::uint16_t kSourceUdpPort = 5678;   // 刻意不同于其它测试用的默认 4672, 证明确实捕获了该值
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_full_peer(std::move(s), mf, kSourceUdpPort); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x0100007Fu, peer.port()});
+    auto r = co_await dl.run(5s);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(dl.source_udp_port(), kSourceUdpPort);
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+// Task 2 (b): 对端不支持 eMule 扩展 (纯 eDonkey, 不回 EMULEINFOANSWER) 时, exchange_mule_info
+// 超时/失败必须优雅降级——不使整个握手/下载失败, 只是 source_udp_port() 退化为 0。
+// 使用较短超时(300ms)以避免真等满 exchange_mule_info 的完整超时窗口拖慢测试。
+TEST(Download, GracefullyDegradesWhenPeerLacksEmuleExtension){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_no_mule_ext"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_full_peer_no_mule_ext(std::move(s), mf); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x0100007Fu, peer.port()});
+    auto r = co_await dl.run(300ms);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    if(!r) co_return;
+    EXPECT_EQ(dl.source_udp_port(), 0u);
     { PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1}); EXPECT_TRUE(pf.complete()); }
     co_return;
   });
@@ -619,6 +722,7 @@ static asio::awaitable<void> serve_subset_peer(tcp::socket s, const std::vector<
     (void)co_await read_frame(s);
     co_await send_pkt(s, op::HELLOANSWER, encode_hello(h));
   }
+  co_await exchange_mule_mock(s, send_hello_first);
   (void)co_await read_frame(s);                          // SETREQFILEID
   { codec::ByteWriter w; w.hash16(fhash);
     w.u16(static_cast<std::uint16_t>(parts.size()));

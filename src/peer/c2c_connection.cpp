@@ -290,9 +290,12 @@ asio::awaitable<tl::expected<C2CHandshakeResult,std::error_code>>
 C2CConnection::handshake_with_mule_info(const HelloInfo& mine, const MuleInfo& mule_info, std::chrono::milliseconds timeout){
   auto hello = co_await handshake(mine, timeout);
   if(!hello) co_return tl::unexpected(hello.error());
+  // eMule 扩展信息交换是可选的: 纯 eDonkey 对端不支持 EMULEINFO/EMULEINFOANSWER, 交换会超时
+  // 或失败——这不应使已经成功的 HELLO 握手失败, 仅 mule_info 退化为默认值 (udp_port=0,
+  // Task 2: 下载侧据此退化为纯 TCP 被动等 ACCEPTUPLOADREQ, 不发 UDP reask)。
   auto mule = co_await exchange_mule_info(mule_info, timeout);
-  if(!mule) co_return tl::unexpected(mule.error());
-  co_return C2CHandshakeResult{std::move(*hello), std::move(*mule)};
+  if(mule) co_return C2CHandshakeResult{std::move(*hello), std::move(*mule)};
+  co_return C2CHandshakeResult{std::move(*hello), MuleInfo{}};
 }
 asio::awaitable<tl::expected<HelloInfo,std::error_code>>
 C2CConnection::handshake_acceptor(const HelloInfo& mine, std::chrono::milliseconds timeout){
@@ -318,13 +321,16 @@ C2CConnection::handshake_acceptor_with_mule_info(const HelloInfo& mine, const Mu
   auto sr = co_await impl_->send(ans);
   if(!sr) co_return tl::unexpected(sr.error());
 
+  // eMule 扩展信息交换是可选的 (对称于 handshake_with_mule_info): 对端 (回调拨入的源) 若是纯
+  // eDonkey 客户端, 不会主动发 EMULEINFO——等待超时或解码/应答失败均不应使已经成功的 HELLO
+  // 握手失败, 仅 mule_info 退化为默认值 (udp_port=0)。
   auto mule_req = co_await impl_->pump_until(op::EMULEINFO, timeout, ed2k::net::proto::eMule);
-  if(!mule_req) co_return tl::unexpected(mule_req.error());
+  if(!mule_req) co_return C2CHandshakeResult{std::move(*peer), MuleInfo{}};
   auto peer_mule = decode_mule_info(mule_req->payload);
-  if(!peer_mule) co_return tl::unexpected(peer_mule.error());
+  if(!peer_mule) co_return C2CHandshakeResult{std::move(*peer), MuleInfo{}};
   ed2k::net::Packet mule_ans; mule_ans.protocol=ed2k::net::proto::eMule; mule_ans.opcode=op::EMULEINFOANSWER; mule_ans.payload=encode_mule_info(mule_info);
   auto msr = co_await impl_->send(mule_ans);
-  if(!msr) co_return tl::unexpected(msr.error());
+  if(!msr) co_return C2CHandshakeResult{std::move(*peer), MuleInfo{}};
   co_return C2CHandshakeResult{std::move(*peer), std::move(*peer_mule)};
 }
 asio::awaitable<tl::expected<MuleInfo,std::error_code>>

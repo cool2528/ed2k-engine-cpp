@@ -340,6 +340,50 @@ TEST(C2CConnection, HandshakeWithMuleInfoUsesEmuleProtocolForOpcodeCollision){
   ASSERT_TRUE(captured_info.has_value());
   EXPECT_EQ(captured_info->mod_version, "local");
 }
+// Task 2 graceful degrade (active/dial 侧): 纯 eDonkey 对端回 HELLOANSWER 后不发
+// EMULEINFOANSWER (不认识该扩展)。exchange_mule_info 超时不应使已成功的 HELLO 握手失败——
+// 只是 mule_info 退化为默认值 (udp_port=0), 供下载侧据此退化为纯 TCP 被动等 (Task 5)。
+TEST(C2CConnection, HandshakeWithMuleInfoDegradesToZeroPortWhenPeerLacksEmuleExtension){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                       // 收 HELLO
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(peer_hello()));
+    co_await keep_alive(s); co_return;                  // 刻意不回 EMULEINFOANSWER
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    MuleInfo mine; mine.udp_port = 4662;
+    auto r = co_await c.handshake_with_mule_info(peer_hello(), mine, 150ms);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->hello.nickname, "peer");
+    EXPECT_EQ(r->mule_info.udp_port, 0u);
+    c.close(); co_return;
+  });
+}
+// Task 2 graceful degrade (acceptor 侧, 对称于上例): 对端(如 LowID 回调源)主动发 HELLO 后
+// 不发 EMULEINFO (纯 eDonkey)。我方(acceptor)应答 HELLOANSWER 后等 EMULEINFO 超时, 同样不应
+// 使已成功的 HELLO 握手失败。
+TEST(C2CConnection, HandshakeAcceptorWithMuleInfoDegradesToZeroPortWhenPeerLacksEmuleExtension){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([](tcp::socket s) -> asio::awaitable<void>{
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(peer_hello()));   // 主动发 HELLO(含前导0x10)
+    (void)co_await read_frame(s);                                        // 收 HELLOANSWER
+    co_await keep_alive(s); co_return;                                   // 刻意不发 EMULEINFO
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    MuleInfo mine; mine.udp_port = 4662;
+    auto r = co_await c.handshake_acceptor_with_mule_info(peer_hello(), mine, 150ms);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->hello.nickname, "peer");
+    EXPECT_EQ(r->mule_info.udp_port, 0u);
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, RequestFileStatus){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{

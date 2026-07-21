@@ -37,6 +37,10 @@ class Download {
            peer::ObfuscationPolicy policy, std::optional<UserHash> local_user_hash = std::nullopt);
   void set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level = 127);
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(std::chrono::milliseconds timeout);
+  // 源在 mule-info 握手中通告的 UDP 端口 (ET_UDPPORT); run() 成功前恒为 0。0 表示对端未
+  // 通告 (纯 eDonkey 客户端/交换失败, 见 handshake_with_mule_info 的优雅降级) ——
+  // 供未来的 UDP reask 排队保活寻址 (Task 4), 本任务只负责捕获与暴露。
+  std::uint16_t source_udp_port() const noexcept { return source_udp_port_; }
  private:
   ed2k::peer::C2CConnection conn_;
   std::filesystem::path out_;
@@ -47,6 +51,7 @@ class Download {
   std::optional<UserHash> local_user_hash_;
   std::shared_ptr<const infra::IPFilter> ip_filter_;
   std::uint8_t ip_filter_level_ = 127;
+  std::uint16_t source_udp_port_ = 0;
 };
 
 // R1-3 S2: Builder construction + injected references replace raw pointers. server/listener use

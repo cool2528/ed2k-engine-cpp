@@ -61,6 +61,14 @@ peer::HelloInfo default_hello(peer::ObfuscationPolicy policy = peer::Obfuscation
   return mine;
 }
 
+// 我方在 mule-info 握手中通告的信息。udp_port 保持默认值 0: 本引擎的上传/分享侧
+// (share::UploadSession) 尚未实现入站 UDP reask 应答 (设计文档 P2 的 A8), 在那之前如实
+// 通告"不可达", 避免让对端 (若把我方当上传源) 误判我方支持 UDP reask。其余字段沿用
+// MuleInfo 的默认值 (已是符合 aMule 惯例的协议标识)。
+peer::MuleInfo default_mule_info() {
+  return peer::MuleInfo{};
+}
+
 std::size_t data_part_count(std::uint64_t size) noexcept {
   return static_cast<std::size_t>((size + PART_SIZE - 1) / PART_SIZE);
 }
@@ -76,6 +84,7 @@ std::vector<bool> normalize_file_status_parts(std::vector<bool> parts, std::uint
 struct FileSetup {
   std::vector<PartHash> part_hashes;
   std::vector<bool> peer_parts;
+  std::uint16_t source_udp_port = 0;   // 源通告的 UDP 端口 (ET_UDPPORT); 0=未通告/纯 eDonkey
 };
 
 boost::asio::awaitable<tl::expected<FileSetup,std::error_code>>
@@ -172,10 +181,13 @@ Download::run(std::chrono::milliseconds timeout){
   conn_.set_ip_filter(ip_filter_, ip_filter_level_);
   auto cr = co_await conn_.connect(source_, obfuscation_policy_, timeout);
   if(!cr) co_return tl::unexpected(cr.error());
-  auto hr = co_await conn_.handshake(default_hello(obfuscation_policy_, local_user_hash_), timeout);
+  auto hr = co_await conn_.handshake_with_mule_info(default_hello(obfuscation_policy_, local_user_hash_),
+                                                    default_mule_info(), timeout);
   if(!hr) co_return tl::unexpected(hr.error());
+  source_udp_port_ = hr->mule_info.udp_port;
   auto setup = co_await fetch_hashset_phase(conn_, hash_, size_, timeout);
   if(!setup) co_return tl::unexpected(setup.error());
+  setup->source_udp_port = source_udp_port_;
   PartFile pf(out_, size_, hash_, std::move(setup->part_hashes));
   auto upload = co_await start_upload_phase(conn_, hash_, timeout);
   if(!upload) co_return tl::unexpected(upload.error());
@@ -294,6 +306,7 @@ struct FetchResult {
   std::vector<PartHash> part_hashes;
   std::vector<bool> fs_parts;                     // 对端 part 可用位图 (FILESTATUS)
   std::optional<ed2k::peer::C2CConnection> conn;  // setup 连接, 复用给该源 worker
+  std::uint16_t source_udp_port = 0;              // 源通告的 UDP 端口; 0=未通告/纯 eDonkey
 };
 static boost::asio::awaitable<tl::expected<FetchResult,std::error_code>>
 fetch_hashset(boost::asio::any_io_executor ex,
@@ -325,11 +338,11 @@ fetch_hashset(boost::asio::any_io_executor ex,
     conn_opt.emplace(std::move(c));
     accepted = false;
   }
-  tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
-  if(accepted) hr = co_await conn_opt->handshake_acceptor(
-      default_hello(obfuscation_policy, local_user_hash), timeout);
-  else         hr = co_await conn_opt->handshake(
-      default_hello(obfuscation_policy, local_user_hash), timeout);
+  tl::expected<ed2k::peer::C2CHandshakeResult,std::error_code> hr;
+  if(accepted) hr = co_await conn_opt->handshake_acceptor_with_mule_info(
+      default_hello(obfuscation_policy, local_user_hash), default_mule_info(), timeout);
+  else         hr = co_await conn_opt->handshake_with_mule_info(
+      default_hello(obfuscation_policy, local_user_hash), default_mule_info(), timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
@@ -347,6 +360,7 @@ fetch_hashset(boost::asio::any_io_executor ex,
   r.part_hashes = std::move(part_hashes);
   r.fs_parts = std::move(fs->parts);
   r.conn = std::move(conn_opt);
+  r.source_udp_port = hr->mule_info.udp_port;
   co_return r;
 }
 
@@ -400,6 +414,7 @@ using ResultCh = boost::asio::experimental::channel<void(boost::system::error_co
 struct PeerSetup {
   ed2k::peer::C2CConnection conn;
   std::vector<bool> fs_parts;
+  std::uint16_t source_udp_port = 0;   // 源通告的 UDP 端口; 0=未通告/纯 eDonkey (供 Task 4 reask 寻址)
 };
 
 static boost::asio::awaitable<tl::expected<PeerSetup,std::error_code>>
@@ -407,6 +422,7 @@ setup_source_phase(boost::asio::any_io_executor ex,
                    const ed2k::peer::PeerIdentity& source,
                    std::optional<ed2k::peer::C2CConnection> pre_conn,
                    std::vector<bool> pre_parts,
+                   std::uint16_t pre_udp_port,
                    const FileHash& hash,
                    std::uint64_t size,
                    std::chrono::milliseconds timeout,
@@ -417,8 +433,9 @@ setup_source_phase(boost::asio::any_io_executor ex,
                    ed2k::peer::ObfuscationPolicy obfuscation_policy,
                    std::optional<UserHash> local_user_hash) {
   if(pre_conn.has_value()){
-    // 复用 setup 连接 (已 HELLO+SETREQFILEID; 多 part 还含 HASHSETREQUEST); 直接进 REQUESTFILENAME。
-    co_return PeerSetup{std::move(*pre_conn), std::move(pre_parts)};
+    // 复用 setup 连接 (已 HELLO+EMULEINFO+SETREQFILEID; 多 part 还含 HASHSETREQUEST); 直接进
+    // REQUESTFILENAME。udp_port 沿用 fetch_hashset 阶段已捕获的值, 不重新握手。
+    co_return PeerSetup{std::move(*pre_conn), std::move(pre_parts), pre_udp_port};
   }
 
   bool accepted = false;
@@ -441,11 +458,11 @@ setup_source_phase(boost::asio::any_io_executor ex,
     accepted = false;
   }
 
-  tl::expected<ed2k::peer::HelloInfo,std::error_code> hr;
-  if(accepted) hr = co_await conn_opt->handshake_acceptor(
-      default_hello(obfuscation_policy, local_user_hash), timeout);
-  else         hr = co_await conn_opt->handshake(
-      default_hello(obfuscation_policy, local_user_hash), timeout);
+  tl::expected<ed2k::peer::C2CHandshakeResult,std::error_code> hr;
+  if(accepted) hr = co_await conn_opt->handshake_acceptor_with_mule_info(
+      default_hello(obfuscation_policy, local_user_hash), default_mule_info(), timeout);
+  else         hr = co_await conn_opt->handshake_with_mule_info(
+      default_hello(obfuscation_policy, local_user_hash), default_mule_info(), timeout);
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
@@ -454,7 +471,7 @@ setup_source_phase(boost::asio::any_io_executor ex,
     auto hs = co_await conn_opt->request_hashset(hash, timeout);
     if(!hs) co_return tl::unexpected(hs.error());
   }
-  co_return PeerSetup{std::move(*conn_opt), std::move(fs->parts)};
+  co_return PeerSetup{std::move(*conn_opt), std::move(fs->parts), hr->mule_info.udp_port};
 }
 
 static boost::asio::awaitable<bool>
@@ -546,6 +563,7 @@ peer_worker(boost::asio::any_io_executor ex,
             const ed2k::peer::PeerIdentity& source,
             std::optional<ed2k::peer::C2CConnection> pre_conn,
             std::vector<bool> pre_parts,
+            std::uint16_t pre_udp_port,
             SharedState& st,
             std::chrono::milliseconds timeout, std::size_t max_retries,
             std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn,
@@ -562,7 +580,7 @@ peer_worker(boost::asio::any_io_executor ex,
   };
 
   auto setup = co_await setup_source_phase(ex, source, std::move(pre_conn), std::move(pre_parts),
-                                           st.hash, st.size, timeout, server_conn, listener,
+                                           pre_udp_port, st.hash, st.size, timeout, server_conn, listener,
                                            std::move(ip_filter), ip_filter_level,
                                            obfuscation_policy, std::move(local_user_hash));
   if(!setup){ finish(setup.error()); co_return; }
@@ -635,9 +653,12 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   for(std::size_t i = setup_idx; i < self.sources.size(); ++i){
     std::optional<ed2k::peer::C2CConnection> pre_conn;
     std::vector<bool> pre_parts;
-    if(i == setup_idx){ pre_conn = std::move(fr.conn); pre_parts = std::move(fr.fs_parts); }
+    std::uint16_t pre_udp_port = 0;
+    if(i == setup_idx){
+      pre_conn = std::move(fr.conn); pre_parts = std::move(fr.fs_parts); pre_udp_port = fr.source_udp_port;
+    }
     boost::asio::co_spawn(self.ex,
-      peer_worker(self.ex, self.sources[i], std::move(pre_conn), std::move(pre_parts), st,
+      peer_worker(self.ex, self.sources[i], std::move(pre_conn), std::move(pre_parts), pre_udp_port, st,
                   total_timeout, max_retries, self.server_conn, self.listener,
                   self.ip_filter, self.ip_filter_level, self.obfuscation_policy,
                   self.local_user_hash, done_ch),

@@ -74,8 +74,8 @@ static ed2k::kad::KadSearchEntry kad_source_entry(const char* source_hex,
     },
   };
 }
-static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t op, std::span<const std::byte> pl){
-  Packet p; p.protocol=proto::eDonkey; p.opcode=op; p.payload.assign(pl.begin(),pl.end());
+static asio::awaitable<void> send_pkt(tcp::socket& s, std::uint8_t op, std::span<const std::byte> pl, std::uint8_t proto_val = proto::eDonkey){
+  Packet p; p.protocol=proto_val; p.opcode=op; p.payload.assign(pl.begin(),pl.end());
   auto fr=encode_frame(p); auto [e,n]=co_await asio::async_write(s,asio::buffer(fr),asio::as_tuple(asio::use_awaitable)); (void)e;(void)n; co_return;
 }
 static asio::awaitable<std::vector<std::byte>> read_frame(tcp::socket& s){
@@ -107,7 +107,8 @@ static MockFile make_mock_file(std::uint8_t f0, std::uint8_t f1){
 // peer 响应 Download 的请求序列:HELLO→FILESTATUS→HASHSET→FILENAME→ACCEPT→
 // 循环处理 REQUESTPARTS:解析请求范围,回送对应字节切片 + OUTOFPARTREQS 终止多响应循环。
 // 请求范围 [s0,e0) 是 flat 整文件块, 可能跨越 part 边界: 从 full=d0||d1 切片即可。
-// (Verbatim pattern from tests/download_test.cpp::serve_full_peer — authoritative per task brief.)
+// (Verbatim pattern from tests/download_test.cpp::serve_full_peer — authoritative per task brief.
+//  Task 2 加了 EMULEINFO/EMULEINFOANSWER 交换, 与 download_test.cpp 的版本保持同步。)
 static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
   using namespace ed2k::peer;
   std::vector<std::byte> full;
@@ -116,6 +117,10 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
   (void)co_await read_frame(s);                          // HELLO
   { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
     co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  // Task 2: 下载侧握手现无条件跟进 EMULEINFO/EMULEINFOANSWER 交换, mock 必须正确应答,
+  // 否则后续真实协议帧会被 pump_until 当噪声吞掉导致会话错位 (verbatim from download_test.cpp)。
+  (void)co_await read_frame(s);                          // EMULEINFO
+  { MuleInfo mi; mi.udp_port = 4672; co_await send_pkt(s, op::EMULEINFOANSWER, encode_mule_info(mi), proto::eMule); }
   (void)co_await read_frame(s);                          // SETREQFILEID
   { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
     co_await send_pkt(s, op::FILESTATUS, w.take()); }
