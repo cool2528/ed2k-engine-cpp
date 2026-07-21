@@ -181,6 +181,11 @@ struct C2CConnection::Impl {
   asio::awaitable<tl::expected<ed2k::net::Packet,std::error_code>>
     pump_until(std::uint8_t want, std::chrono::milliseconds budget,
                std::optional<std::uint8_t> protocol = std::nullopt);
+  // start_upload 专用等待: 与 pump_until 不同, QUEUERANKING 在此不是致命错误——对端排队时
+  // 解出 rank 并作为 UploadQueued{rank} 成功返回, 由调用方决定是否继续等待。仅 start_upload
+  // 使用此路径; pump_until 对其余调用方(handshake/hashset 等)的 QUEUERANKING 语义保持不变。
+  asio::awaitable<tl::expected<UploadOutcome,std::error_code>>
+    pump_until_upload_result(std::chrono::milliseconds budget);
 
   asio::any_io_executor ex;
   std::optional<IPv4> remote;
@@ -272,6 +277,26 @@ C2CConnection::Impl::pump_until(std::uint8_t want, std::chrono::milliseconds bud
     auto pkt = std::move(*rp);
     if(pkt.opcode == want && (!protocol || pkt.protocol == *protocol)) co_return std::move(pkt);
     if(pkt.opcode == ed2k::peer::op::QUEUERANKING) co_return tl::unexpected(make_error_code(errc::upload_queued));
+    if(pkt.opcode == ed2k::peer::op::FILEREQANSNOFIL) co_return tl::unexpected(make_error_code(errc::file_not_found));
+    continue;
+  }
+}
+
+asio::awaitable<tl::expected<UploadOutcome,std::error_code>>
+C2CConnection::Impl::pump_until_upload_result(std::chrono::milliseconds budget){
+  auto deadline = clock_type::now() + budget;
+  while(true){
+    auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
+    if(rem.count() <= 0) co_return tl::unexpected(make_error_code(errc::timed_out));
+    auto rp = co_await recv(rem);
+    if(!rp) co_return tl::unexpected(rp.error());
+    auto pkt = std::move(*rp);
+    if(pkt.opcode == ed2k::peer::op::ACCEPTUPLOADREQ) co_return UploadOutcome{UploadAccepted{}};
+    if(pkt.opcode == ed2k::peer::op::QUEUERANKING){
+      auto rank = decode_queue_ranking(pkt.payload);
+      if(!rank) co_return tl::unexpected(rank.error());
+      co_return UploadOutcome{UploadQueued{*rank}};
+    }
     if(pkt.opcode == ed2k::peer::op::FILEREQANSNOFIL) co_return tl::unexpected(make_error_code(errc::file_not_found));
     continue;
   }
@@ -371,14 +396,12 @@ C2CConnection::request_filename(const FileHash& h, std::chrono::milliseconds tim
   if(!a) co_return tl::unexpected(a.error());
   co_return std::move(a->name);
 }
-asio::awaitable<tl::expected<void,std::error_code>>
+asio::awaitable<tl::expected<UploadOutcome,std::error_code>>
 C2CConnection::start_upload(const FileHash& h, std::chrono::milliseconds timeout){
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::STARTUPLOADREQ; req.payload=encode_start_upload(h);
   auto sr = co_await impl_->send(req);
   if(!sr) co_return tl::unexpected(sr.error());
-  auto rp = co_await impl_->pump_until(op::ACCEPTUPLOADREQ, timeout);
-  if(!rp) co_return tl::unexpected(rp.error());
-  co_return tl::expected<void,std::error_code>{};
+  co_return co_await impl_->pump_until_upload_result(timeout);
 }
 asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
 C2CConnection::request_blocks(const FileHash& h, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout){

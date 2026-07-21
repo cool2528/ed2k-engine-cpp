@@ -5,6 +5,7 @@
 #include <initializer_list>
 #include <memory>
 #include <utility>
+#include <variant>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -446,7 +447,8 @@ TEST(C2CConnection, StartUploadAccepted){
     (void)co_await c.request_file(h, 2s);
     (void)co_await c.request_hashset(h, 2s);
     auto r = co_await c.start_upload(h, 2s);
-    EXPECT_TRUE(r.has_value());
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_TRUE(std::holds_alternative<UploadAccepted>(*r));
     c.close(); co_return;
   });
 }
@@ -472,8 +474,10 @@ TEST(C2CConnection, StartUploadQueued){
     auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
     (void)co_await c.request_file(h, 2s); (void)co_await c.request_hashset(h, 2s);
     auto r = co_await c.start_upload(h, 2s);
-    EXPECT_FALSE(r.has_value());
-    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::upload_queued));
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    auto* queued = std::get_if<UploadQueued>(&*r);
+    EXPECT_NE(queued, nullptr); if(!queued) co_return;
+    EXPECT_EQ(queued->rank, 5u);
     c.close(); co_return;
   });
 }

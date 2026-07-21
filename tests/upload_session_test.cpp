@@ -7,6 +7,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <variant>
 #include <vector>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
@@ -718,10 +719,13 @@ TEST(UploadSession, AcceptsQueuedPeerAfterSlotReleaseOnReask){
     EXPECT_TRUE(cr2.has_value()); if(!cr2) co_return;
     auto hs2 = co_await c2.handshake(hello_with_hash("client-2", "22222222222222222222222222222222"), 2s);
     EXPECT_TRUE(hs2.has_value()); if(!hs2) co_return;
+    // QUEUERANKING 现在是 start_upload 的成功结果(UploadQueued{rank}), 不再是致命错误——
+    // 排队是 eD2k 协议的正常路径; c1 占用了唯一的槽位, c2 应排在队列第 1 位。
     auto queued = co_await c2.start_upload(f.hash, 2s);
-    EXPECT_FALSE(queued.has_value());
-    if(queued) co_return;
-    EXPECT_EQ(queued.error(), make_error_code(errc::upload_queued));
+    EXPECT_TRUE(queued.has_value()); if(!queued) co_return;
+    auto* rank = std::get_if<UploadQueued>(&*queued);
+    EXPECT_NE(rank, nullptr); if(!rank) co_return;
+    EXPECT_EQ(rank->rank, 1u);
 
     c1.close();
     asio::steady_timer t(rt.context());

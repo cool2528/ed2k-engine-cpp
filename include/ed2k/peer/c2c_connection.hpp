@@ -6,6 +6,7 @@
 #include <optional>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 #include <tl/expected.hpp>
 #include <boost/asio/any_io_executor.hpp>
@@ -36,6 +37,14 @@ struct C2CHandshakeResult {
   HelloInfo hello;
   MuleInfo mule_info;
 };
+
+// start_upload 的结果: 对端立即接受(ACCEPTUPLOADREQ)为 UploadAccepted; 对端把我方放入上传队列
+// (QUEUERANKING)为 UploadQueued{rank}, 携带队列名次。排队是 eD2k 协议的正常路径(非致命错误)——
+// 调用方应保持连接、按需等待/重新询问(UDP reask, 见后续任务), 而非像旧行为那样把 QUEUERANKING
+// 当作失败放弃该源。
+struct UploadAccepted {};
+struct UploadQueued { std::uint16_t rank; };
+using UploadOutcome = std::variant<UploadAccepted, UploadQueued>;
 
 class C2CConnection {
  public:
@@ -74,7 +83,7 @@ class C2CConnection {
     request_hashset(const FileHash&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::string,std::error_code>>
     request_filename(const FileHash&, std::chrono::milliseconds timeout);
-  boost::asio::awaitable<tl::expected<void,std::error_code>>
+  boost::asio::awaitable<tl::expected<UploadOutcome,std::error_code>>
     start_upload(const FileHash&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
     request_blocks(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout);
