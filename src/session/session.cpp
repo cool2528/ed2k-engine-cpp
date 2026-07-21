@@ -850,7 +850,9 @@ Session::search(const std::string& keyword, const SearchFilters& filters){
   if(!self || self->shutting_down || !self->login)
     co_return tl::unexpected(make_error_code(errc::connect_failed));
   // 按 filters 逐项用 operator& 组合进 SearchExpr; 只在非默认值时才追加对应子表达式。
-  server::SearchExpr expr = server::Keyword{keyword};
+  // 关键词先分词再 AND(见 parse_keyword_query)：整串作单 Keyword 时多词/带下划线查询
+  // 无法命中服务器按 token 匹配的文件名索引。
+  server::SearchExpr expr = server::parse_keyword_query(keyword);
   if(filters.type != server::FileType::Any)
     expr = std::move(expr) & server::SearchExpr(server::TypeIs{filters.type});
   if(filters.min_size > 0)

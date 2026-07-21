@@ -50,3 +50,28 @@ TEST(SearchQuery, NestedTree){
            0x00,0x00, 0x01,0x01,0x00,'a', 0x01,0x01,0x00,'b',  // AND(a,b)
            0x01,0x01,0x00,'c'}));                  // keyword c
 }
+TEST(SearchQuery, ParseSingleKeyword){
+  // 单 token: 与直接构造 Keyword 序列化一致
+  EXPECT_EQ(serialize_search(parse_keyword_query("windows")),
+            serialize_search(SearchExpr(Keyword{"windows"})));
+}
+TEST(SearchQuery, ParseSpaceSeparatedAnds){
+  // "windows 10" -> Keyword(windows) AND Keyword(10)
+  EXPECT_EQ(serialize_search(parse_keyword_query("windows 10")),
+            bytes({0x00,0x00, 0x01,0x07,0x00,'w','i','n','d','o','w','s', 0x01,0x02,0x00,'1','0'}));
+}
+TEST(SearchQuery, ParseUnderscoreSeparated){
+  // 下划线同样是分隔符: "windows_10" 与 "windows 10" 等价
+  EXPECT_EQ(serialize_search(parse_keyword_query("windows_10")),
+            serialize_search(parse_keyword_query("windows 10")));
+}
+TEST(SearchQuery, ParseCollapsesConsecutiveDelims){
+  // 连续/首尾分隔符不产生空 token
+  EXPECT_EQ(serialize_search(parse_keyword_query("  a . b  ")),
+            bytes({0x00,0x00, 0x01,0x01,0x00,'a', 0x01,0x01,0x00,'b'}));
+}
+TEST(SearchQuery, ParseAllDelimsFallsBackToWholeString){
+  // 全是分隔符(无有效 token): 回退为整串单 Keyword, 不抛异常/不产生空表达式
+  EXPECT_EQ(serialize_search(parse_keyword_query("___")),
+            serialize_search(SearchExpr(Keyword{"___"})));
+}

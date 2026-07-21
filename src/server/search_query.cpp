@@ -34,6 +34,25 @@ std::vector<std::byte> serialize_search(const SearchExpr& expr){
   return w.take();
 }
 
+SearchExpr parse_keyword_query(const std::string& text){
+  // eDonkey 关键词分隔符：空白 + 常见标点/括号(与服务器端文件名分词口径对齐)。
+  static const std::string delims = " \t\n\r._-,;:()[]{}+/\\&'\"";
+  std::vector<std::string> tokens;
+  std::size_t i = 0;
+  while(i < text.size()){
+    std::size_t j = text.find_first_of(delims, i);
+    if(j == std::string::npos) j = text.size();
+    if(j > i) tokens.push_back(text.substr(i, j - i));
+    i = j + 1;
+  }
+  // 无有效 token(空串或全是分隔符)：回退为整串单 Keyword，保持既有行为不抛异常。
+  if(tokens.empty()) return Keyword{text};
+  SearchExpr expr = Keyword{tokens[0]};
+  for(std::size_t t = 1; t < tokens.size(); ++t)
+    expr = std::move(expr) & SearchExpr(Keyword{tokens[t]});
+  return expr;
+}
+
 SearchExpr operator&(SearchExpr lhs, SearchExpr rhs){
   SearchExpr e; e.template emplace<Box<And>>(std::make_unique<And>(And{std::move(lhs), std::move(rhs)}));
   return e;

@@ -593,7 +593,8 @@ int main(int argc,char** argv){
         std::chrono::milliseconds(startup_prefs->connect_timeout_ms),
         globals.proxy, *global_filter, startup_prefs->ip_filter_level);
       if(!lg){ std::printf("error: %s\n", lg.error().message().c_str()); rc=1; rt.stop(); co_return; }
-      auto sr = co_await lg->conn.search(ed2k::server::Keyword{kw}, std::chrono::milliseconds(15000));
+      auto sr = co_await lg->conn.search(ed2k::server::parse_keyword_query(kw),
+                                         std::chrono::milliseconds(15000));
       if(!sr){ std::printf("error: %s\n", sr.error().message().c_str()); rc=1; rt.stop(); co_return; }
       for(const auto& it : *sr)
         std::printf("%s  %12llu  %s\n", it.hash.to_hex().c_str(), (unsigned long long)it.size, it.name.c_str());
