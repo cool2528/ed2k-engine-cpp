@@ -762,7 +762,9 @@ int main(int argc,char** argv){
     if(argc<4) return usage();
     auto contacts = load_kad_nodes(argv[2]);
     if(!contacts){ std::printf("error: %s\n", contacts.error().message().c_str()); return 1; }
-    const auto key = ed2k::kad::keyword_id(argv[3]);
+    // 多词: 最长词定位 + 其余词本地过滤(与 Session::kad_search 同口径)
+    const auto query = ed2k::kad::build_keyword_query(argv[3]);
+    const auto key = query.valid ? query.target : ed2k::kad::keyword_id(argv[3]);
     auto global_filter = load_cli_ip_filter(globals, *startup_prefs);
     if(!global_filter){ std::printf("error: %s\n", global_filter.error().message().c_str()); return 1; }
     ed2k::net::IoRuntime rt; int rc=0;
@@ -779,10 +781,15 @@ int main(int argc,char** argv){
       auto results = co_await network.search_keyword(peers, key, k_kad_request_timeout);
       if(!results){ std::printf("error: %s\n", results.error().message().c_str()); rc=1; }
       else {
-        for(const auto& entry : *results)
+        std::size_t shown = 0;
+        for(const auto& entry : *results){
+          if(query.valid && !ed2k::kad::name_contains_all(ed2k::kad::file_name(entry), query.filters))
+            continue;
           std::printf("%s  %12llu  %s\n", entry.answer_id.to_hex().c_str(),
             (unsigned long long)ed2k::kad::file_size(entry), ed2k::kad::file_name(entry).c_str());
-        std::printf("(%zu results)\n", results->size());
+          ++shown;
+        }
+        std::printf("(%zu results)\n", shown);
       }
       network.close();
       rt.stop(); co_return;

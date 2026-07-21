@@ -906,12 +906,22 @@ Session::kad_search(const std::string& keyword){
   opts.version = kad::kad2_version;
   opts.user_hash = kad::KadID::from_bytes(user_hash.bytes());
   kad::KadNetwork query_node(self->rt.executor(), std::move(opts));
-  const auto key = kad::keyword_id(keyword);
+  // 多词查询: 用最长词的 keyword_id 定位(整串哈希会落到无索引的 DHT 位置而超时),
+  // 其余词留作本地过滤; 无有效词(全 <3 字符)时回退整串。
+  const auto query = kad::build_keyword_query(keyword);
+  const auto key = query.valid ? query.target : kad::keyword_id(keyword);
   const auto timeout = self->cfg.per_server_timeout;
   auto r = co_await query_node.search_keyword(peers, key, timeout);
   // co_await 期间 Session 可能被销毁: 再 lock 一次才能安全返回(query_node 是本协程栈上局部, 仍存活)。
   self = weak.lock();
   if(!self) co_return tl::unexpected(make_error_code(errc::cancelled));
+  if(r && query.valid && !query.filters.empty()){
+    // 本地按其余词过滤结果名(定位词只保证结果含该词, 多词需逐 entry 校验全部命中)。
+    auto& entries = r.value();
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const kad::KadSearchEntry& e){
+      return !kad::name_contains_all(kad::file_name(e), query.filters);
+    }), entries.end());
+  }
   co_return r;
 }
 
