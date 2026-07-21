@@ -120,6 +120,10 @@ tl::expected<FileStatus,std::error_code>         decode_file_status(std::span<co
 tl::expected<std::vector<PartHash>,std::error_code> decode_hashset_answer(const FileHash& expected, std::span<const std::byte>);
 tl::expected<FileNameAnswer,std::error_code>     decode_req_filename_answer(std::span<const std::byte>);
 tl::expected<std::uint16_t,std::error_code>      decode_queue_ranking(std::span<const std::byte>);
+// UDP REASKFILEPING(0x90) payload = 裸 16 字节文件 hash,与 decode_file_hash_request 逐位相同。
+// QUEUEFULL(0x93) 无 body,不需要解码函数——UDP 分发处直接比较 datagram.opcode == op::QUEUEFULL 即可
+// (与既有 pkt.opcode == op::QUEUERANKING 判定同一模式,见 c2c_connection.cpp)。
+tl::expected<FileHash,std::error_code>           decode_reask_file_ping(std::span<const std::byte>);
 tl::expected<Block,std::error_code>              decode_sending_part(std::span<const std::byte>);
 tl::expected<CompressedPartSegment,std::error_code> decode_compressed_part_segment(std::span<const std::byte>);
 tl::expected<Block,std::error_code>              inflate_compressed_part_segment(const CompressedPartSegment&);

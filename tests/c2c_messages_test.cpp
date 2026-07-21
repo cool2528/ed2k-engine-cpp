@@ -242,6 +242,22 @@ TEST(C2CMessages, EncodeUdpReaskAck){
   auto out=encode_reask_ack(42);
   EXPECT_EQ(out, bytes({42,0}));
 }
+TEST(C2CMessages, DecodeUdpReaskFilePingRoundTrip){
+  auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out=decode_reask_file_ping(encode_reask_file_ping(h));
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(*out, h);
+}
+TEST(C2CMessages, DecodeUdpReaskFilePingTooShortIsBufferUnderflow){
+  auto out=decode_reask_file_ping(bytes({1,2,3}));
+  ASSERT_FALSE(out.has_value());
+  EXPECT_EQ(out.error(), make_error_code(errc::buffer_underflow));
+}
+TEST(C2CMessages, DecodeUdpReaskAckRoundTripsThroughQueueRanking){
+  auto out=decode_queue_ranking(encode_reask_ack(42));
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(*out, 42u);
+}
 TEST(C2CMessages, EncodeSharedFilesAnswer){
   auto h=*FileHash::from_hex("00112233445566778899aabbccddeeff");
   SharedFileEntry entry{h, 0x0100007Fu, 4662};

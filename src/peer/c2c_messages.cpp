@@ -363,6 +363,10 @@ tl::expected<std::uint16_t,std::error_code> decode_queue_ranking(std::span<const
   if(!r.ok()) return tl::unexpected(make_error_code(errc::buffer_underflow));
   return rank;
 }
+tl::expected<FileHash,std::error_code> decode_reask_file_ping(std::span<const std::byte> data){
+  // REASKFILEPING(UDP 0x90) payload 与 decode_file_hash_request 解出的裸 16 字节 hash 位级相同,直接复用。
+  return decode_file_hash_request(data);
+}
 tl::expected<Block,std::error_code> decode_sending_part(std::span<const std::byte> data){
   ByteReader r(data);
   Block b; b.hash = r.hash16(); b.start = r.u32(); b.end = r.u32();
