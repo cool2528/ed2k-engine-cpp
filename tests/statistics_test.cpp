@@ -4,6 +4,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <latch>
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -95,10 +96,16 @@ TEST(Statistics, AsyncFlushDoesNotBlockNetworkExecutor) {
     const auto path = temp_path("ed2k_statistics_async.dat");
     bool timer_fired = false;
 
+    // 闸门先占住单线程磁盘池,flush 的磁盘任务只能排在其后;定时器触发后才放行,
+    // 使"flush 挂起期间网络 executor 仍在跑 handler"不依赖磁盘快慢,消除竞态。
+    std::latch gate{1};
+    asio::post(rt.disk_executor(), [&] { gate.wait(); });
+
     asio::steady_timer timer(rt.context(), 0ms);
     asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void> {
       co_await timer.async_wait(asio::use_awaitable);
       timer_fired = true;
+      gate.count_down();
       co_return;
     }, asio::detached);
 
