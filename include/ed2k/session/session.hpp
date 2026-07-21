@@ -43,7 +43,16 @@ struct SessionConfig {
   std::optional<UserHash> user_hash;
   std::optional<app::ServerTarget> server_override;  // 测试/设置注入的优先服务器
   std::chrono::milliseconds per_server_timeout = std::chrono::seconds(30);
-  std::chrono::milliseconds task_io_timeout = std::chrono::seconds(60);  // 每次网络操作超时(非总时长)
+  // 每次网络操作超时(非总时长); 即 per-op timeout, 用于握手/hashset/block/AICH 等 RPC 的单次
+  // 快超时。P0 排队等待重构引入三层超时架构, 以下两类子步骤刻意不复用本值(与其解耦), 沿用
+  // 本字段名不改(避免影响已消费该字段的外部调用方, 如 GDownload 侧的 overlay 集成):
+  //   ① mule 扩展信息交换子步(握手内)固定用更短的独立值 peer::kMuleHandshakeTimeout(≈5s,
+  //      见 c2c_connection.hpp), 不占用本值——纯 eDonkey 对端(不支持该扩展)原本要拖到整个
+  //      per-op 预算才优雅降级, 现在把这一步的等待上限单独收紧。
+  //   ② 上传排队等待(源发 QUEUERANKING 后, 见 peer_worker/queue_wait_phase, download.cpp)用
+  //      独立的存活上限(≈30min, 随任何 inbound 刷新, st.stop/取消可提前退出), 不计入本值——
+  //      排队是正常协议流程, 不应被这个"单次 RPC"超时打断。
+  std::chrono::milliseconds task_io_timeout = std::chrono::seconds(60);
   // 启用 Kad(DHT) 子系统: 用 data_dir/nodes.dat 做种子引导, 维护路由表并可被其它 Kad 节点发现,
   // shutdown 时把当前路由表落盘回 nodes.dat。当前不接入下载增源(find_sources) ——
   // 该功能会与 Kad 常驻的单读者 socket 争抢同一连接, 留待后续专项任务实现; 见 kad_status()。

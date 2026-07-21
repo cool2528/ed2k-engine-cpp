@@ -385,6 +385,35 @@ TEST(C2CConnection, HandshakeAcceptorWithMuleInfoDegradesToZeroPortWhenPeerLacks
     c.close(); co_return;
   });
 }
+// P0 排队等待重构架构决策#2(Task 2 carry-forward): mule 扩展信息交换子步必须用独立短超时
+// kMuleHandshakeTimeout, 不占用调用方传入的更大 per-op 预算——纯 eDonkey 对端(收到 EMULEINFO
+// 但从不应答)应在约 kMuleHandshakeTimeout 内降级, 而不是拖到调用方允许的完整超时才降级。这里
+// 故意传一个远大于 kMuleHandshakeTimeout 的 timeout(20s), 用耗时上界证明确实是子步自己的短超时
+// 在生效, 而不是恰好复用了调用方传入的值。
+TEST(C2CConnection, HandshakeWithMuleInfoCapsMuleSubStepIndependentlyOfLargerCallerTimeout){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                       // HELLO
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(peer_hello()));
+    (void)co_await read_frame(s);                        // EMULEINFO — 收到但刻意不应答
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    MuleInfo mine; mine.udp_port = 4662;
+    const auto started = std::chrono::steady_clock::now();
+    auto r = co_await c.handshake_with_mule_info(peer_hello(), mine, 20s);   // 调用方允许 20s
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->mule_info.udp_port, 0u);
+    // 应在 kMuleHandshakeTimeout 附近降级, 远小于调用方传入的 20s——留充裕余量避免对精确调度延迟
+    // 做脆弱的紧公差断言, 但足以证明确实被子步自己的短超时截断, 而非等满调用方的 20s。
+    EXPECT_LT(elapsed, 10s);
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, RequestFileStatus){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{

@@ -4,18 +4,23 @@
 #include "ed2k/download/aich_checker.hpp"
 #include "ed2k/kad/network.hpp"
 #include "ed2k/peer/c2c_connection.hpp"
+#include "ed2k/peer/peer_reask.hpp"
+#include "ed2k/net/udp_socket.hpp"
 #include "ed2k/util/error.hpp"
 #include <optional>
 #include <cassert>
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/experimental/channel.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/ip/udp.hpp>
 namespace ed2k::download {
 namespace {
 kad::KadID kad_id_from_hash(const FileHash& hash) {
@@ -104,14 +109,16 @@ fetch_hashset_phase(peer::C2CConnection& conn,
   co_return FileSetup{std::move(part_hashes), normalize_file_status_parts(std::move(fs->parts), size)};
 }
 
-boost::asio::awaitable<tl::expected<void,std::error_code>>
+// P0 架构决策#3: 返回 UploadOutcome(而非过去丢弃结果的 void)——Accepted/Queued{rank} 均是
+// eD2k 协议的正常路径, 由调用方(peer_worker)决定是否需要进入排队等待循环。Download::run()
+// (单源, 非 raccoon 路径) 目前仍只检查 !upload 而不消费具体结果, 保留其既有行为不变
+// (该单源路径不在本任务范围, 见 task-5 report 的 Concerns)。
+boost::asio::awaitable<tl::expected<peer::UploadOutcome,std::error_code>>
 start_upload_phase(peer::C2CConnection& conn,
                    const FileHash& hash,
                    std::chrono::milliseconds timeout) {
   (void)co_await conn.request_filename(hash, timeout);   // 文件名可选,忽略失败
-  auto up = co_await conn.start_upload(hash, timeout);
-  if(!up) co_return tl::unexpected(up.error());
-  co_return tl::expected<void,std::error_code>{};
+  co_return co_await conn.start_upload(hash, timeout);
 }
 
 boost::asio::awaitable<tl::expected<void,std::error_code>>
@@ -364,6 +371,43 @@ fetch_hashset(boost::asio::any_io_executor ex,
   co_return r;
 }
 
+// === P0 排队等待重构: 排队等待用的常量与共享 UDP reask 基础设施 ===
+// 排队存活总上限(架构决策#2 第③层): 独立于 per-op 快超时, 只要有 inbound(REASKACK/QUEUERANKING/
+// 任何帧)就在 queue_wait_phase 里刷新; 只有连接真正沉默/死掉才会触发。可被 st.stop/取消提前打断。
+inline constexpr std::chrono::minutes kQueueWaitMax{30};
+// 单次 reask 的往返预算(短, 与 kReaskInterval=60s 的排队间隔解耦, 见 peer_reask.hpp 顶部注释与
+// 架构决策#1): 让串行化的调用不会拖得比间隔还长。
+inline constexpr std::chrono::milliseconds kReaskCallTimeout{3000};
+// queue_wait_phase 里"继续监听 TCP 同时做一次 reask"的竞速(见该函数注释)中, TCP 侧的预算比
+// kReaskCallTimeout 多出的余量——保证 reask 自身的超时总是先于这个 TCP 预算到期, 使 TCP 分支
+// 只可能因为"确实收到了新帧"而提前赢得竞速, 不会因为自己的超时抢先(令 reask 的结果被白白丢弃)。
+inline constexpr std::chrono::milliseconds kReaskRaceMargin{500};
+
+// 排队等待 UDP reask 的串行化门闸(架构决策#1): net::UdpSocket::recv_datagram 是裸
+// async_receive_from, 不支持多路等待者(peer_reask.hpp 顶部注释已详述该限制)。用容量=1 的
+// channel 当二元信号量: 取到令牌(recv 成功)= 获得排他使用权; try_send 放回令牌 = 释放。
+// 一个共享 UdpSocket + 一个共享 ReaskGate 活在 SharedState 一级, 所有 peer_worker 的排队等待
+// 循环共用同一份, 保证同一时刻至多一个 reask_source 调用在等待该 socket 的 recv。
+using ReaskGate = boost::asio::experimental::channel<void(boost::system::error_code)>;
+
+// 持有 ReaskGate 令牌期间的 RAII: 析构时放回令牌, 覆盖"正常用完"与"被 || 取消, 协程收尾"两种
+// 路径(awaitable_operators 的 wait_for_one_success 保证输家协程会跑完自己的收尾逻辑, 而不是被
+// 直接销毁——析构函数因此总会被调用, 见 queue_wait_phase 里的使用)。只能通过 reask_gate_acquire
+// 构造(已获得令牌后才允许持有本对象)。
+struct ReaskGateGuard {
+  ReaskGate* gate;
+  explicit ReaskGateGuard(ReaskGate& g) : gate(&g) {}
+  ~ReaskGateGuard(){ if(gate) gate->try_send(boost::system::error_code{}); }
+  ReaskGateGuard(const ReaskGateGuard&) = delete;
+  ReaskGateGuard& operator=(const ReaskGateGuard&) = delete;
+  ReaskGateGuard(ReaskGateGuard&& other) noexcept : gate(other.gate) { other.gate = nullptr; }
+  ReaskGateGuard& operator=(ReaskGateGuard&&) = delete;
+};
+boost::asio::awaitable<ReaskGateGuard> reask_gate_acquire(ReaskGate& gate){
+  co_await gate.async_receive(boost::asio::use_awaitable);   // 容量1: 拿不到令牌就在此挂起等释放
+  co_return ReaskGateGuard(gate);
+}
+
 // 共享状态 (仅网络线程访问 → 无锁)。PartFile/BlockAllocator 跨 worker 共享; AICHChecker
 // 无状态, setup 后构造一次共享; aich_active 为 per-worker (每 worker 与己方 peer 协商 master)。
 struct SharedState {
@@ -374,6 +418,8 @@ struct SharedState {
   FileHash hash;
   std::uint64_t size;
   boost::asio::any_io_executor disk_ex;   // M3: PartFile::write_block_async 卸载用
+  net::UdpSocket reask_sock;              // 排队等待 UDP reask 共享 socket (架构决策#1)
+  ReaskGate reask_gate;                   // 上述 socket 的串行化门闸; 构造后立即塞一个令牌(见 run())
   bool complete = false;
   std::size_t active_workers = 0;
   std::optional<std::error_code> first_err;
@@ -554,10 +600,88 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
   co_return tl::expected<void,std::error_code>{};
 }
 
-// raccoon worker: 连接 source → (复用 setup 连接或全新连接) → start_upload → AICH master
-// 协商 (per-worker) → 按 next_block_for_parts(has_part) 取块 (仅请求对端有该 part 的块) →
-// request_blocks → AICH verify (若启用) → write_block → mark_done。源耗尽 (无对端可服务块)
-// 或失败 → finally_send 退出; 整文件完成由 st.complete 判定 (最后一块 mark_done 置位)。
+// P0 架构决策#3: 排队等待循环。start_upload/accumulate_blocks 中途都可能得到 UploadQueued/
+// errc::upload_queued(见 c2c_connection.cpp 的 accumulate_blocks 中途降级, 架构决策#4)——本函数
+// 统一处理"保持 TCP 连接、等到真正被接受(或彻底放弃)为止"这一段。
+//
+// 每轮循环并发等待两类事件之一(architecture decision #3 的"TWO events"): (a) TCP 帧: 用
+// conn.wait_upload_outcome(kReaskInterval) 等到下一个 ACCEPTUPLOADREQ/新 QUEUERANKING/错误,
+// 或干等满 kReaskInterval 收不到任何东西(超时)。(b) 若 (a) 超时且源通告了 UDP 端口
+// (source_udp_port!=0), 串行化(架构决策#1, 经 ReaskGate)发起一次 reask_source, 同时不放弃 TCP
+// 监听——用 awaitable_operators 的 || 竞速"继续等 TCP"和"这次 reask", 让 ACCEPTUPLOADREQ 若恰好
+// 在 reask 往返期间到达也能被立刻捕捉; reask 自身的预算(kReaskCallTimeout)严格小于竞速中 TCP
+// 侧的预算(kReaskCallTimeout+kReaskRaceMargin), 故 TCP 分支只可能因为"真收到帧"胜出, 不会因自己
+// 的超时抢先吃掉 reask 的结果(见 kReaskRaceMargin 注释)。source_udp_port==0(纯 eDonkey 对端/
+// mule 扩展协商失败, 见 Task 2)时无法探活, 只能纯被动继续等 TCP。
+//
+// 存活总上限 kQueueWaitMax(架构决策#2 第③层)独立于 per-op 快超时, 每当任何 inbound(新排名/
+// reask 有响应)到来就刷新——只有连接真正沉默/死掉才会触发, 返回 errc::timed_out。
+// st.stop/取消在每轮循环边界检查(与既有 pull_blocks_phase/run_task 的协作式取消模型一致, 见
+// download.cpp/session.cpp 现有 st.stopped() 用法), 返回 errc::cancelled(不是 timed_out)。
+//
+// 退出条件汇总: ACCEPTUPLOADREQ → 成功返回(调用方转下载); QUEUEFULL(TCP 侧或 reask 侧) →
+// 放弃该源(errc::upload_queued, 瞬时性, Task 6 可重试); kQueueWaitMax 耗尽 → errc::timed_out;
+// st.stop/取消 → errc::cancelled; 连接层面真实错误(如 connection_closed) → 原样放弃该源。
+static boost::asio::awaitable<tl::expected<void,std::error_code>>
+queue_wait_phase(ed2k::peer::C2CConnection& conn, SharedState& st,
+                 std::uint16_t source_udp_port, IPv4 source_ip) {
+  using namespace boost::asio::experimental::awaitable_operators;
+  using clock_type = std::chrono::steady_clock;
+  auto liveness_deadline = clock_type::now() + kQueueWaitMax;
+  const auto reask_ep = boost::asio::ip::udp::endpoint(
+      boost::asio::ip::address_v4(source_ip.host()), source_udp_port);
+
+  // 分类一次 UploadOutcome 结果: Accepted → 有定论(成功); Queued → 刷新存活期, 无定论(继续等);
+  // 错误且为 timed_out → 无定论(本轮静默, 交给调用方决定下一步); 其它错误 → 有定论(放弃该源)。
+  auto classify = [&](tl::expected<ed2k::peer::UploadOutcome,std::error_code>& outcome)
+      -> std::optional<tl::expected<void,std::error_code>> {
+    if(!outcome){
+      if(outcome.error() == make_error_code(errc::timed_out)) return std::nullopt;
+      return tl::unexpected(outcome.error());
+    }
+    if(std::holds_alternative<ed2k::peer::UploadAccepted>(*outcome))
+      return tl::expected<void,std::error_code>{};
+    liveness_deadline = clock_type::now() + kQueueWaitMax;   // Queued: 收到新排名, 刷新存活期
+    return std::nullopt;
+  };
+
+  for(;;){
+    if(st.stopped()) co_return tl::unexpected(make_error_code(errc::cancelled));
+    if(clock_type::now() >= liveness_deadline) co_return tl::unexpected(make_error_code(errc::timed_out));
+
+    auto tcp_result = co_await conn.wait_upload_outcome(peer::kReaskInterval);
+    if(auto done = classify(tcp_result)) co_return *done;
+    if(tcp_result) continue;                 // Queued(已刷新存活期): 直接下一轮, 不必 reask
+    // 走到这里 = 本轮 kReaskInterval 内 TCP 静默无新帧(tcp_result 持有 timed_out)。
+    if(source_udp_port == 0) continue;        // 纯 TCP 被动: 无法探活, 只能继续等下一个 kReaskInterval
+
+    auto guard = co_await reask_gate_acquire(st.reask_gate);   // 架构决策#1: 串行化
+    auto race = co_await (conn.wait_upload_outcome(kReaskCallTimeout + kReaskRaceMargin)
+                       || peer::reask_source(st.reask_sock, reask_ep, st.hash, kReaskCallTimeout));
+    (void)guard;   // 仅靠析构释放令牌, 变量本身不再读取
+
+    if(race.index() == 0){
+      auto& tcp2 = std::get<0>(race);
+      if(auto done = classify(tcp2)) co_return *done;
+      continue;   // Queued(已刷新)或理论不可达的 timed_out(见上方竞速预算注释)——继续下一轮
+    }
+    auto& reask_outcome = std::get<1>(race);
+    if(std::holds_alternative<peer::ReaskRank>(reask_outcome)){
+      liveness_deadline = clock_type::now() + kQueueWaitMax;   // 收到 REASKACK: 刷新存活期
+      continue;
+    }
+    if(std::holds_alternative<peer::ReaskQueueFull>(reask_outcome))
+      co_return tl::unexpected(make_error_code(errc::upload_queued));   // 队列已满: 放弃该源
+    // ReaskUnavailable: 非致命, 未证实源仍存活, 不刷新存活期, 继续被动等待。
+  }
+}
+
+// raccoon worker: 连接 source → (复用 setup 连接或全新连接) → start_upload → (若 Queued, 排队
+// 等待直到被接受或放弃, 见 queue_wait_phase) → AICH master 协商 (per-worker) → 按
+// next_block_for_parts(has_part) 取块 (仅请求对端有该 part 的块) → request_blocks → AICH verify
+// (若启用) → write_block → mark_done; 若中途被源重新打回排队(errc::upload_queued, 架构决策#4),
+// 回到排队等待循环而不是判该源失败。源耗尽 (无对端可服务块) 或失败 → finally_send 退出; 整文件
+// 完成由 st.complete 判定 (最后一块 mark_done 置位)。
 static boost::asio::awaitable<void>
 peer_worker(boost::asio::any_io_executor ex,
             const ed2k::peer::PeerIdentity& source,
@@ -584,12 +708,30 @@ peer_worker(boost::asio::any_io_executor ex,
                                            std::move(ip_filter), ip_filter_level,
                                            obfuscation_policy, std::move(local_user_hash));
   if(!setup){ finish(setup.error()); co_return; }
+
+  const IPv4 source_ip = IPv4::from_wire(source.endpoint.id);
   auto upload = co_await start_upload_phase(setup->conn, st.hash, timeout);
   if(!upload){ finish(upload.error()); co_return; }
+  if(std::holds_alternative<peer::UploadQueued>(*upload)){
+    auto waited = co_await queue_wait_phase(setup->conn, st, setup->source_udp_port, source_ip);
+    if(!waited){ finish(waited.error()); co_return; }
+  }
+
   const bool aich_active = co_await negotiate_aich_phase(setup->conn, st, timeout);
-  auto pulled = co_await pull_blocks_phase(setup->conn, st, std::move(setup->fs_parts),
-                                           aich_active, timeout, max_retries);
-  finish(pulled ? std::error_code{} : pulled.error());
+  for(;;){
+    // fs_parts 不 move: 中途被打回排队后, 循环回来还要再用同一份初始 FILESTATUS 位图重新构建
+    // servable(见 pull_blocks_phase 内 normalize_file_status_parts); 值拷贝成本低(bool 位图)。
+    auto pulled = co_await pull_blocks_phase(setup->conn, st, setup->fs_parts,
+                                             aich_active, timeout, max_retries);
+    if(pulled){ finish(std::error_code{}); co_return; }
+    if(pulled.error() != make_error_code(errc::upload_queued)){ finish(pulled.error()); co_return; }
+    // 中途被源打回排队 (架构决策#4, accumulate_blocks 新识别的信号): 回排队等待循环而非直接放弃
+    // 该源。此路径未解出具体新排名(保持 accumulate_blocks 改动最小化), queue_wait_phase 不需要
+    // 排名输入, 无影响。
+    auto requeued = co_await queue_wait_phase(setup->conn, st, setup->source_udp_port, source_ip);
+    if(!requeued){ finish(requeued.error()); co_return; }
+    // 重新被接受: 循环回去继续 pull_blocks_phase(同一连接/文件, aich_active 不变无需重新协商)。
+  }
 }
 
 boost::asio::awaitable<tl::expected<void,std::error_code>>
@@ -640,11 +782,13 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   BlockAllocator alloc(self.size, fr.part_hashes, self.aich, pf);
   std::size_t n_workers = self.sources.size() - setup_idx;
   SharedState st{std::move(pf), std::move(alloc), std::nullopt, self.aich, self.hash, self.size,
-                 self.disk_ex, false, n_workers, std::nullopt};
+                 self.disk_ex, net::UdpSocket(self.ex), ReaskGate(self.ex, 1),
+                 false, n_workers, std::nullopt};
   // 聚合初始化后补显式赋值: SharedState 尾部含 NDEBUG 条件成员, 位置初始化脆弱, 显式赋值更安全。
   st.bytes_done = initial_done;
   st.on_progress = self.on_progress;
   st.stop = self.stop;
+  st.reask_gate.try_send(boost::system::error_code{});   // 初始塞一个令牌: 门闸起始态="空闲可用"
   if(st.on_progress) st.on_progress(st.bytes_done, st.size);   // 初始进度(续传时非 0)
   if(self.aich) st.checker.emplace(*self.aich, self.size);
 

@@ -497,6 +497,180 @@ TEST(Download, BlockLevelSingleSource){
   std::filesystem::remove_all(dir);
 }
 
+// === Task 5: peer_worker 排队等待集成 (P0) ===
+// 单 block/单 part 极简文件(1000 字节, 远小于 AICH_BLOCK_SIZE/PART_SIZE), 跳过 hashset(size<=
+// PART_SIZE)。EMULEINFO 故意不应答 -> source_udp_port()==0, 使排队等待循环走"纯 TCP 被动"分支
+// (架构决策#3 else 分支), 无需搭建共享 UdpSocket 场景。
+static constexpr std::uint64_t kQueueTestFileSize = 1000;
+
+TEST(Download, WaitsInUploadQueueThenAcceptsAndDownloads){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_queue_accept"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+  std::vector<std::byte> data(kQueueTestFileSize, std::byte(0x7A));
+  crypto::MD4 m; m.update(data);
+  auto fhash = FileHash::from_bytes(m.finish());
+
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  bool premature_request_seen = false;   // 排队期间(收到 QUEUERANKING 之后, ACCEPTUPLOADREQ 之前)
+                                          // 是否提前收到了 REQUESTPARTS —— 若有, 说明客户端没有真的
+                                          // 在队列里等待(旧行为: 忽略 UploadQueued 直冲 block-dispatch)。
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                          // HELLO
+    { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+      co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+    co_await exchange_mule_mock(s, false, 0);              // 应答 udp_port=0 -> 排队等待走纯 TCP 被动分支
+    (void)co_await read_frame(s);                          // SETREQFILEID
+    { codec::ByteWriter w; w.hash16(fhash); w.u16(0);       // count=0: 对完整共享单 part 文件的既有约定
+      co_await send_pkt(s, op::FILESTATUS, w.take()); }
+    (void)co_await read_frame(s);                          // REQUESTFILENAME
+    { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+      co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+    (void)co_await read_frame(s);                          // STARTUPLOADREQ
+    co_await send_pkt(s, op::QUEUERANKING, encode_queue_ranking(3));
+
+    // 观察窗口: 短超时探测客户端在 ACCEPTUPLOADREQ 之前是否提前发来 REQUESTPARTS。無論是否命中都
+    // 照常处理该帧(供块), 避免旧(有 bug)实现让本协程卡在等一个不会再来的 REQUESTPARTS 上——
+    // RED 阶段要能干净失败, 而不是超时挂起。
+    std::optional<std::vector<std::byte>> pending;
+    {
+      std::array<std::byte,5> hdr;
+      auto [e1,n1] = co_await asio::async_read(s, asio::buffer(hdr),
+          asio::cancel_after(100ms, asio::as_tuple(asio::use_awaitable)));
+      (void)n1;
+      if(!e1){
+        auto h = parse_header(hdr);
+        if(h){
+          std::vector<std::byte> body(h->size);
+          auto [e2,n2] = co_await asio::async_read(s, asio::buffer(body), asio::as_tuple(asio::use_awaitable));
+          (void)n2;
+          if(!e2){ premature_request_seen = true; pending = std::move(body); }
+        }
+      }
+    }
+    co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});
+
+    auto serve_one = [&](const std::vector<std::byte>& body) -> asio::awaitable<void> {
+      if(body.empty()) co_return;
+      codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
+      (void)r.hash16();
+      std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
+      std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
+      (void)s1;(void)s2;(void)e1;(void)e2;
+      if(s0==0 && e0==0) co_return;
+      std::size_t off = s0, len = e0 - s0;
+      codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
+      w.blob(std::span<const std::byte>(data).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    };
+    if(pending) co_await serve_one(*pending);   // 若确实提前收到(旧 bug 路径), 仍照常回块避免卡死
+    for(;;){
+      auto body = co_await read_frame(s);
+      if(body.empty()){ co_await keep_alive(s); co_return; }
+      co_await serve_one(body);
+    }
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(fhash).size(kQueueTestFileSize).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peer.port()}}).build();
+    auto r = co_await dl.run(5s, 3);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, kQueueTestFileSize, fhash, {});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  EXPECT_FALSE(premature_request_seen)
+      << "client must hold off REQUESTPARTS until actually accepted (ACCEPTUPLOADREQ), not proceed while still queued";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(Download, CancelWhileQueuedExitsPromptlyAsCancelledNotTimedOut){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_queue_cancel"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+  std::vector<std::byte> data(kQueueTestFileSize, std::byte(0x7A));
+  crypto::MD4 m; m.update(data);
+  auto fhash = FileHash::from_bytes(m.finish());
+  auto stop = std::make_shared<bool>(false);
+
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                          // HELLO
+    { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+      co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+    co_await exchange_mule_mock(s, false, 0);              // 应答 udp_port=0 -> 排队等待走纯 TCP 被动分支
+    (void)co_await read_frame(s);                          // SETREQFILEID
+    { codec::ByteWriter w; w.hash16(fhash); w.u16(0);
+      co_await send_pkt(s, op::FILESTATUS, w.take()); }
+    (void)co_await read_frame(s);                          // REQUESTFILENAME
+    { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+      co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+    (void)co_await read_frame(s);                          // STARTUPLOADREQ
+    co_await send_pkt(s, op::QUEUERANKING, encode_queue_ranking(3));
+
+    // 关键: 用与"queue-then-accept"测试同款的观察窗口先判定客户端是否提前发了 REQUESTPARTS
+    // (旧/有 bug 实现的特征)。这一步是让本测试在两种实现下都"确定性"而非"侥幸"通过/失败的核心——
+    // 若只是简单地紧跟着发第二条 QUEUERANKING 再置位 stop, 旧实现恰好也可能在
+    // pull_blocks_phase(既有代码, 循环顶部检查 st.stopped())第一次检查时就侥幸看到 stop 已置位而
+    // "凑巧"快速退出, 使这条测试对本任务要实现的排队等待循环失去区分力。
+    // 正确处理: 若确实提前收到(旧 bug 路径), 故意不回块——让客户端困在 accumulate_blocks 的阻塞
+    // recv 里, 直到该请求自身的 per-op timeout(3s)才会因超时被动退出, 从而让下面的 elapsed 断言
+    // 可靠地抓到这条旧路径(不看运气)。若没提前收到(新实现的排队等待, 纯 TCP 被动不会发送任何
+    // 东西), 则走"发 stop 后再发一条 QUEUERANKING"的 happens-before 论证(见下)促使排队等待循环
+    // 尽快检测到 stop。
+    std::optional<std::vector<std::byte>> pending;
+    {
+      std::array<std::byte,5> hdr;
+      auto [e1,n1] = co_await asio::async_read(s, asio::buffer(hdr),
+          asio::cancel_after(100ms, asio::as_tuple(asio::use_awaitable)));
+      (void)n1;
+      if(!e1){
+        auto h = parse_header(hdr);
+        if(h){
+          std::vector<std::byte> body(h->size);
+          auto [e2,n2] = co_await asio::async_read(s, asio::buffer(body), asio::as_tuple(asio::use_awaitable));
+          (void)n2;
+          if(!e2) pending = std::move(body);
+        }
+      }
+    }
+    *stop = true;
+    if(pending){
+      // 旧 bug 路径: 客户端已经卡在等这条 REQUESTPARTS 的回应——故意不回块, 让它只能靠自身
+      // per-op timeout 退出, elapsed 断言据此戳穿。
+      co_await keep_alive(s); co_return;
+    }
+    // 新实现路径: 客户端仍在排队等待循环里被动监听 TCP, 再发一条 QUEUERANKING 促使它下一轮循环时
+    // 检查到 stop(单线程协作式调度下的 happens-before: 客户端只可能在处理完这条帧、循环回排队等待
+    // 顶部检查 stop 时看到它, 而这必然发生在 *stop=true 已执行之后)。
+    co_await send_pkt(s, op::QUEUERANKING, encode_queue_ranking(2));
+    co_await keep_alive(s); co_return;                     // 从不接受
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(fhash).size(kQueueTestFileSize).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peer.port()}})
+                .stop_flag(stop)
+                .build();
+    const auto started = std::chrono::steady_clock::now();
+    auto r = co_await dl.run(3s, 3);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_FALSE(r.has_value());
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::cancelled));
+    // 关键区分点: 正确实现应在排队等待循环边界很快发现 stop 并退出(毫秒级), 而不是像旧行为那样
+    // 忽略 UploadQueued 直冲 block-dispatch, 靠该请求自身的 per-op timeout(3s)才"凑巧"报 cancelled
+    // (MultiSourceDownload::run 末尾的 st.stopped() 兜底会掩盖真实原因, 见 run_task 同款收尾逻辑)。
+    // 用耗时上界戳穿这种"凑巧过"。
+    EXPECT_LT(elapsed, 1s);
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
 TEST(Download, RequiredObfuscationWithoutPeerHashFailsBeforeTcpDial) {
   IoRuntime rt;
   tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));

@@ -46,6 +46,16 @@ struct UploadAccepted {};
 struct UploadQueued { std::uint16_t rank; };
 using UploadOutcome = std::variant<UploadAccepted, UploadQueued>;
 
+// mule 扩展信息交换子步(握手内)的独立短超时(P0 排队等待重构, 三层超时架构第②层)——不复用
+// 调用方传入的完整 per-op timeout(生产环境 SessionConfig::task_io_timeout 默认 60s)。纯 eDonkey
+// 对端(不支持该扩展, 不会回 EMULEINFOANSWER)原本要拖到整个 per-op 预算耗尽才优雅降级
+// (mule_info 退化为默认值/udp_port=0, 见 Task 2), 现改为只等这个更短的值就降级, 把"纯 eDonkey
+// 税"控制在可预期的小范围内。HELLO 子步不受影响, 仍使用调用方传入的完整 timeout(HELLO 失败
+// 仍是硬失败)。handshake_with_mule_info/handshake_acceptor_with_mule_info 内部对 mule 子步实际
+// 使用 std::min(timeout, kMuleHandshakeTimeout)——调用方本就传入更短 timeout 时(如测试)不会被
+// 本值拉长。
+inline constexpr std::chrono::milliseconds kMuleHandshakeTimeout{5000};
+
 class C2CConnection {
  public:
   explicit C2CConnection(boost::asio::any_io_executor ex);
@@ -85,6 +95,12 @@ class C2CConnection {
     request_filename(const FileHash&, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<UploadOutcome,std::error_code>>
     start_upload(const FileHash&, std::chrono::milliseconds timeout);
+  // 排队等待状态机(peer_worker, 见 download.cpp)专用: 在 start_upload 已经得到 UploadQueued 之后,
+  // 继续等待对端的下一个分类结果(ACCEPTUPLOADREQ/新的 QUEUERANKING/错误), 不重发 STARTUPLOADREQ。
+  // 分类语义与 start_upload 内部完全一致(复用同一个 Impl::pump_until_upload_result), 唯一区别是
+  // 不发送请求帧——纯粹的"继续等待"。
+  boost::asio::awaitable<tl::expected<UploadOutcome,std::error_code>>
+    wait_upload_outcome(std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
     request_blocks(const FileHash&, std::array<std::uint32_t,3> starts, std::array<std::uint32_t,3> ends, std::chrono::milliseconds timeout);
   boost::asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>

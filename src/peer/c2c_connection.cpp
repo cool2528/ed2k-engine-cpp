@@ -92,7 +92,15 @@ accumulate_blocks(Stream& conn, const FileHash& h,
     auto& pkt = *rp;
     if (pkt.opcode == op::OUTOFPARTREQS) break;                 // 对端不再供块: 提前结束
     if (pkt.opcode == op::FILEREQANSNOFIL) co_return tl::unexpected(make_error_code(errc::file_not_found));
-    if (pkt.opcode != op_sending && pkt.opcode != op_compressed) continue;  // 其他帧(QUEUERANKING 等)忽略
+    // P0 架构决策#4: 中途(已被接受、正在传输块的过程中)收到 QUEUERANKING = 源把上传槽回收,
+    // 把我方重新打回排队(eD2k 协议允许的正常事件, 不是错误)。旧行为在此静默 continue 忽略,
+    // 调用方(pull_blocks_phase)会继续傻等一个不会再来的块直到自己的 per-op timeout——表现为
+    // 一次"沉默死亡"。改为显式识别并向上抛出一个调用方能映射回"回到排队等待"的信号——复用
+    // errc::upload_queued(与 pump_until 对其余调用方的既有 QUEUERANKING 语义同一个错误码,
+    // 同属"遇到了 QUEUERANKING"这一概念, 只是这里发生在块传输过程中)。让 peer_worker 据此
+    // 回到 queue_wait_phase 而不是把该源判死。
+    if (pkt.opcode == op::QUEUERANKING) co_return tl::unexpected(make_error_code(errc::upload_queued));
+    if (pkt.opcode != op_sending && pkt.opcode != op_compressed) continue;  // 其他帧忽略
     if (pkt.opcode == op_sending) {
       auto b = decode_sending_part(pkt.payload);
       if (!b) co_return tl::unexpected(b.error());
@@ -318,7 +326,9 @@ C2CConnection::handshake_with_mule_info(const HelloInfo& mine, const MuleInfo& m
   // eMule 扩展信息交换是可选的: 纯 eDonkey 对端不支持 EMULEINFO/EMULEINFOANSWER, 交换会超时
   // 或失败——这不应使已经成功的 HELLO 握手失败, 仅 mule_info 退化为默认值 (udp_port=0,
   // Task 2: 下载侧据此退化为纯 TCP 被动等 ACCEPTUPLOADREQ, 不发 UDP reask)。
-  auto mule = co_await exchange_mule_info(mule_info, timeout);
+  // P0 架构决策#2: 该子步只等 min(timeout, kMuleHandshakeTimeout), 不占用调用方传入的完整
+  // per-op 预算——把"纯 eDonkey 税"控制在小范围内 (调用方本就传入更短 timeout 时不受影响)。
+  auto mule = co_await exchange_mule_info(mule_info, std::min(timeout, kMuleHandshakeTimeout));
   if(mule) co_return C2CHandshakeResult{std::move(*hello), std::move(*mule)};
   co_return C2CHandshakeResult{std::move(*hello), MuleInfo{}};
 }
@@ -349,7 +359,9 @@ C2CConnection::handshake_acceptor_with_mule_info(const HelloInfo& mine, const Mu
   // eMule 扩展信息交换是可选的 (对称于 handshake_with_mule_info): 对端 (回调拨入的源) 若是纯
   // eDonkey 客户端, 不会主动发 EMULEINFO——等待超时或解码/应答失败均不应使已经成功的 HELLO
   // 握手失败, 仅 mule_info 退化为默认值 (udp_port=0)。
-  auto mule_req = co_await impl_->pump_until(op::EMULEINFO, timeout, ed2k::net::proto::eMule);
+  // P0 架构决策#2: 同 handshake_with_mule_info, 该子步只等 min(timeout, kMuleHandshakeTimeout)。
+  auto mule_req = co_await impl_->pump_until(op::EMULEINFO, std::min(timeout, kMuleHandshakeTimeout),
+                                             ed2k::net::proto::eMule);
   if(!mule_req) co_return C2CHandshakeResult{std::move(*peer), MuleInfo{}};
   auto peer_mule = decode_mule_info(mule_req->payload);
   if(!peer_mule) co_return C2CHandshakeResult{std::move(*peer), MuleInfo{}};
@@ -401,6 +413,10 @@ C2CConnection::start_upload(const FileHash& h, std::chrono::milliseconds timeout
   ed2k::net::Packet req; req.protocol=ed2k::net::proto::eDonkey; req.opcode=op::STARTUPLOADREQ; req.payload=encode_start_upload(h);
   auto sr = co_await impl_->send(req);
   if(!sr) co_return tl::unexpected(sr.error());
+  co_return co_await impl_->pump_until_upload_result(timeout);
+}
+asio::awaitable<tl::expected<UploadOutcome,std::error_code>>
+C2CConnection::wait_upload_outcome(std::chrono::milliseconds timeout){
   co_return co_await impl_->pump_until_upload_result(timeout);
 }
 asio::awaitable<tl::expected<std::vector<Block>,std::error_code>>
