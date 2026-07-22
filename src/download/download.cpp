@@ -31,6 +31,12 @@ namespace {
 // 每 3*AICH_BLOCK_SIZE≈540KiB 一次 RTT, 而非每 AICH_BLOCK_SIZE≈180KiB 一次)。dispatch_blocks_phase
 // (单源 legacy 路径) 与 pull_blocks_phase (raccoon 多源路径) 共用同一深度。
 inline constexpr std::size_t kPipelineDepth = 3;
+// 审计 C7: dispatch_blocks_phase(单源 legacy 路径) 对"批次内区间被源拒绝"(OUTOFPARTREQS 提前
+// 结束, 或返回里缺少某些请求区间)的有界重试上限——超过此数仍未服务完的区间放弃重试, 交由
+// Download::run() 末尾的 pf.complete() 门兜底判定未完成(保守: 不误报成功), 而不是对着永久
+// 拒绝的源死循环。取值与 pull_blocks_phase/MultiSourceDownload::run() 的 max_retries 默认值(3)
+// 同一约定("N 次重试" = 最初一次 + N 次重试)。
+inline constexpr std::size_t kMaxUnservedRetries = 3;
 
 kad::KadID kad_id_from_hash(const FileHash& hash) {
   return kad::KadID::from_bytes(hash.bytes());
@@ -206,6 +212,11 @@ dispatch_blocks_phase(peer::C2CConnection& conn,
     return std::nullopt;
   };
 
+  // 审计 C7 (被 C6 3-block 流水线暴露): 单次 REQUESTPARTS 的 3 个槽位, 源可能只服务其中一部分
+  // 就 OUTOFPARTREQS(如上传槽中途被抢占)——若放任游标越过被拒绝的区间, 它们将永远不被重新
+  // 请求(本函数修复前的行为, 见 git 历史)。这里按 (start,end) 精确匹配已服务区间(与
+  // pull_blocks_phase 的 requeue 手法同一思路, 不依赖返回顺序与批次顺序一致), 把未匹配到的
+  // 区间收进下一轮重试, 有界(kMaxUnservedRetries)以避免对永久拒绝的源死循环。
   for(;;){
     std::vector<std::tuple<std::size_t,std::size_t,std::uint64_t,std::uint64_t>> batch;
     batch.reserve(kPipelineDepth);
@@ -216,35 +227,47 @@ dispatch_blocks_phase(peer::C2CConnection& conn,
     }
     if(batch.empty()) break;   // 该 part 位图内全部块均已下载完成
 
-    std::array<std::uint64_t,3> starts64{0,0,0}, ends64{0,0,0};
-    for(std::size_t i=0;i<batch.size();++i){
-      starts64[i] = std::get<2>(batch[i]);
-      ends64[i] = std::get<3>(batch[i]);
-    }
-
-    std::vector<peer::Block> blocks_vec;
-    if(large_file){
-      auto blocks = co_await conn.request_blocks_i64(hash, starts64, ends64, timeout);
-      if(!blocks) co_return tl::unexpected(blocks.error());
-      blocks_vec = std::move(*blocks);
-    } else {
-      std::array<std::uint32_t,3> starts32{0,0,0}, ends32{0,0,0};
-      for(std::size_t i=0;i<3;++i){
-        starts32[i] = static_cast<std::uint32_t>(starts64[i]);
-        ends32[i] = static_cast<std::uint32_t>(ends64[i]);
+    for(std::size_t attempt = 0;;){
+      std::array<std::uint64_t,3> starts64{0,0,0}, ends64{0,0,0};
+      for(std::size_t i=0;i<batch.size();++i){
+        starts64[i] = std::get<2>(batch[i]);
+        ends64[i] = std::get<3>(batch[i]);
       }
-      auto blocks = co_await conn.request_blocks(hash, starts32, ends32, timeout);
-      if(!blocks) co_return tl::unexpected(blocks.error());
-      blocks_vec = std::move(*blocks);
-    }
-    if(blocks_vec.empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
-    // 审计 C7 concern(留后续任务处理, 本任务只需不崩溃): 本路径没有 BlockAllocator 式的重排队列,
-    // 若源只服务了批次中的一部分区间(如提前 OUTOFPARTREQS), 未被服务的区间在此被静默跳过、
-    // 不再重试 —— 与本函数修复前"任何空响应即 io_error 硬失败"一样保守(不会误报成功: 该区间
-    // 的字节永远不会写入, pf.complete() 最终会如实反映未完成)。真正的重排/换源重试是 C7 范围。
-    for(auto& b2 : blocks_vec){
-      auto w = pf.write_block(b2.start, b2.end, b2.data);
-      if(!w) co_return tl::unexpected(w.error());
+
+      tl::expected<std::vector<peer::Block>,std::error_code> result;
+      if(large_file){
+        result = co_await conn.request_blocks_i64(hash, starts64, ends64, timeout);
+      } else {
+        std::array<std::uint32_t,3> starts32{0,0,0}, ends32{0,0,0};
+        for(std::size_t i=0;i<3;++i){
+          starts32[i] = static_cast<std::uint32_t>(starts64[i]);
+          ends32[i] = static_cast<std::uint32_t>(ends64[i]);
+        }
+        result = co_await conn.request_blocks(hash, starts32, ends32, timeout);
+      }
+
+      if(!result){
+        // accumulate_blocks 把"本轮批次内一个区间都没服务"(如立即 OUTOFPARTREQS)映射为
+        // errc::io_error —— 这是"这轮被拒绝, 可重试"的唯一信号; 其它错误码(超时/连接断开/
+        // 解码失败等)是真正的硬错误, 原样向上传播, 不重试(与本函数修复前行为一致)。
+        if(result.error() != make_error_code(errc::io_error)) co_return tl::unexpected(result.error());
+        if(++attempt > kMaxUnservedRetries) break;   // 放弃本批, 交由 pf.complete() 兜底判定未完成
+        continue;                                    // 整批本轮无一服务, 原样重新请求
+      }
+
+      // 已匹配到的区间立即写盘; 未匹配到的(源本轮未服务)收进 unserved 准备重试。
+      std::vector<std::tuple<std::size_t,std::size_t,std::uint64_t,std::uint64_t>> unserved;
+      for(auto& pb : batch){
+        auto it = std::find_if(result->begin(), result->end(), [&](const peer::Block& b){
+          return b.start == std::get<2>(pb) && b.end == std::get<3>(pb);
+        });
+        if(it == result->end()){ unserved.push_back(pb); continue; }
+        auto w = pf.write_block(it->start, it->end, it->data);
+        if(!w) co_return tl::unexpected(w.error());
+      }
+      if(unserved.empty()) break;                    // 本批全部服务完毕
+      if(++attempt > kMaxUnservedRetries) break;      // 放弃剩余未服务区间, 同上交给 pf.complete() 兜底
+      batch = std::move(unserved);                    // 仅重新请求未被服务的区间
     }
   }
   co_return tl::expected<void,std::error_code>{};
@@ -293,11 +316,13 @@ Download::run(std::chrono::milliseconds timeout){
   auto dispatched = co_await dispatch_blocks_phase(conn_, pf, hash_, size_,
                                                    std::move(setup->peer_parts), timeout);
   if(!dispatched) co_return tl::unexpected(dispatched.error());
-  // 关键安全网(C6 后): dispatch_blocks_phase 采用 3 块流水线批处理后, 若源中途只服务了部分块
-  // (如 1-of-3 后 OUTOFPARTREQS), 单源 legacy 路径无重排队基础设施, 会写入已到的块、游标越过未服务
-  // 的块并正常返回(不在本次 run 内重试)——本 pf.complete() 门是"不误报成功"的唯一保证: 只要有 part
-  // 的 MD4 未通过/字节缺失就以 io_error 返回。重构 Download::run() 时切勿删除此门(否则 partial-batch
-  // 会退化为静默假成功)。多源 pull_blocks_phase 自身会重排队, 不依赖此门。
+  // 关键安全网(C6/C7 后): dispatch_blocks_phase 采用 3 块流水线批处理, 若源中途只服务了部分块
+  // (如 1-of-3 后 OUTOFPARTREQS)会在本次 run 内按 (start,end) 精确重试未服务的区间(有界,
+  // kMaxUnservedRetries)——但源若在有界次数内持续拒绝同一区间, dispatch 仍会放弃该区间、正常
+  // 返回(不当作硬错误), 该区间的字节永远不会写入。本 pf.complete() 门是"不误报成功"的最后一道
+  // 保证: 只要有 part 的 MD4 未通过/字节缺失就以 io_error 返回。重构 Download::run() 时切勿删除
+  // 此门(否则有界放弃后的残留缺口会退化为静默假成功)。多源 pull_blocks_phase 自身会重排队给其它
+  // worker/源, 不依赖此门。
   if(!pf.complete()) co_return tl::unexpected(make_error_code(errc::io_error));
   co_return tl::expected<void,std::error_code>{};
 }

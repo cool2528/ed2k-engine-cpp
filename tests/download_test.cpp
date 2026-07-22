@@ -316,6 +316,93 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<st
   }
   co_await keep_alive(s); co_return;
 }
+// 审计 C7 TDD: 首次 REQUESTPARTS 只服务槽 0, 随即 OUTOFPARTREQS 拒绝槽 1/2(模拟真实 eMule 对端
+// 上传槽在批次中途被抢占/提前 OUTOFPARTREQS); 此后每次 REQUESTPARTS 一律正常全服务。用于验证
+// dispatch_blocks_phase 会重新请求被拒绝的区间, 而不是让游标越过它们、永久静默丢弃(见 C6
+// 遗留在 dispatch_blocks_phase 里的 concern 注释)。
+static asio::awaitable<void> serve_full_peer_refuse_once(tcp::socket s, const MockFile& mf){
+  using namespace ed2k::peer;
+  std::vector<std::byte> full;
+  full.insert(full.end(), mf.d0.begin(), mf.d0.end());
+  full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false);
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+  bool first_batch = true;
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
+    (void)r.hash16();                                    // 文件 hash
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    if(first_batch){
+      first_batch = false;
+      // 只服务槽 0, 立即 OUTOFPARTREQS 拒绝槽 1/2(即便它们是真实区间)。
+      std::size_t off = static_cast<std::size_t>(rs[0]);
+      std::size_t len = static_cast<std::size_t>(re[0]-rs[0]);
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(rs[0]); w.u32(re[0]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+      co_await send_pkt(s, op::OUTOFPARTREQS, {});
+      continue;
+    }
+    for(std::size_t i=0;i<3;++i){
+      if(rs[i]==0 && re[i]==0) continue;
+      std::size_t off = static_cast<std::size_t>(rs[i]);
+      std::size_t len = static_cast<std::size_t>(re[i]-rs[i]);
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(rs[i]); w.u32(re[i]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
+  }
+  co_await keep_alive(s); co_return;
+}
+// 审计 C7 TDD(有界重试的 bound-test): 极小单 part 文件(2 块, 免 hashset 往返), 对每次
+// REQUESTPARTS 一律立即 OUTOFPARTREQS(零服务), 模拟"永久拒绝"的源。requests_seen 供调用方
+// 断言重试确有发生且有界——而不是修复前"第一次就硬失败、从不重试", 也不是修复有 bug 时的
+// "对着永久拒绝的源无限重试挂起"。
+static asio::awaitable<void> serve_refuse_forever_peer(tcp::socket s, const FileHash& fhash,
+                                                        std::size_t& requests_seen){
+  using namespace ed2k::peer;
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false);
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(0);       // 单 part 完整共享文件的既有约定(count=0)
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
+    (void)r.hash16();                                    // 文件 hash
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    ++requests_seen;
+    co_await send_pkt(s, op::OUTOFPARTREQS, {});          // 永远零服务, 立即拒绝
+  }
+  co_await keep_alive(s); co_return;
+}
 // AICH-aware mock peer (两级 V2): 回 OP_AICHFILEHASHANS(真实两级 master) + 对任意 part 回
 // OP_AICHANSWER(V2 恢复数据 = 兄弟 part-root + 该 part 全部叶, 带标识符)。数据损坏
 // (corrupt_block_n) 只影响 SENDINGPART —— proof 恒取自 clean full, 故 verify_block 对
@@ -494,6 +581,63 @@ TEST(Download, BlockCorruptFails){
     if(!r) EXPECT_EQ(r.error(), make_error_code(errc::block_corrupt));
     co_return;
   });
+  std::filesystem::remove_all(dir);
+}
+
+// 审计 C7 (被 C6 3-block 流水线暴露): dispatch_blocks_phase(单源 legacy 路径) 没有
+// BlockAllocator 式的重排队列——若源在批次中途 OUTOFPARTREQS(只服务槽 0, 拒绝槽 1/2), 修复前
+// 会让游标越过被拒绝的区间、永久静默跳过。下载本可以完成(源在下一次请求时会正常服务这些
+// 区间), 却因为从未重新请求而以 pf.complete()==false(io_error)失败。断言下载最终 COMPLETES,
+// 证明重试确实发生。
+TEST(Download, DispatchRetriesUnservedRangeAfterOutOfPartReqsThenCompletes){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_retry_refuse_once";
+  std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+  auto mf = make_mock_file(0x11, 0x22);
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_full_peer_refuse_once(std::move(s), mf); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x0100007Fu, peer.port()});
+    auto r = co_await dl.run(5s);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    if(!r) co_return;
+    PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
+// 审计 C7 有界重试(bound-test): 源对每次 REQUESTPARTS 都立即 OUTOFPARTREQS(永久拒绝, 零服务)。
+// 下载必须以失败告终(pf.complete() 兜底门, 与修复前同样保守, 不误报成功), 且重试必须有界——
+// requests_seen 断言确有重试发生(>1, 与"修复前第一次就硬失败、从未重试"区分)且不会对着永久
+// 拒绝的源无限重试挂起(<= 宽松上限, 不绑定具体实现常量)。
+TEST(Download, DispatchGivesUpBoundedWhenSourcePermanentlyRefuses){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_retry_refuse_forever";
+  std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+  std::vector<std::byte> data(static_cast<std::size_t>(AICH_BLOCK_SIZE)*2, std::byte(0x5A));
+  crypto::MD4 m; m.update(data);
+  auto fhash = FileHash::from_bytes(m.finish());
+  std::size_t requests_seen = 0;
+
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_refuse_forever_peer(std::move(s), fhash, requests_seen); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::Download dl(rt.executor(), path, fhash, static_cast<std::uint64_t>(AICH_BLOCK_SIZE)*2,
+                          SourceEndpoint{0x0100007Fu, peer.port()});
+    auto r = co_await dl.run(5s);
+    EXPECT_FALSE(r.has_value()) << "source that never serves any block must not report success";
+    co_return;
+  });
+  EXPECT_GT(requests_seen, 1u)
+      << "must retry the unserved range at least once, not fail on the very first refusal";
+  EXPECT_LE(requests_seen, 20u)
+      << "retry budget must be bounded, not infinite (would hang against a permanently-refusing source)";
   std::filesystem::remove_all(dir);
 }
 
