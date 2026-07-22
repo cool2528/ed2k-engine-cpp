@@ -212,6 +212,7 @@ ServerConnection::get_server_list(std::chrono::milliseconds timeout){
 asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::callback_request(std::uint32_t client_id, std::chrono::milliseconds timeout){
   (void)timeout;
+  auto gate = co_await impl_->acquire_request_gate();   // 终审 I1: send 也串行, 防与 gated get_sources send 交织 async_write
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::CALLBACKREQUEST;
   req.payload = encode_callback_request(client_id);
   co_return co_await impl_->conn.send(req);
@@ -219,6 +220,7 @@ ServerConnection::callback_request(std::uint32_t client_id, std::chrono::millise
 
 asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::publish_files(std::span<const ed2k::share::KnownFile> files){
+  auto gate = co_await impl_->acquire_request_gate();   // 终审 I1: send 串行, 同 callback_request
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::OFFERFILES;
   req.payload = encode_offer_files(files);
   co_return co_await impl_->conn.send(req);
@@ -226,6 +228,10 @@ ServerConnection::publish_files(std::span<const ed2k::share::KnownFile> files){
 
 asio::awaitable<tl::expected<void,std::error_code>>
 ServerConnection::receive_events(std::chrono::milliseconds timeout){
+  // 终审 C1 修复: 快照窗口的 receive_events 也走同一门闸, 与下载 run_task 的 get_sources 串行——
+  // 否则 connect_server 快照窗口(仍在 recv 推送)与"连接刚 emit connected 后立即启动的下载"的
+  // get_sources 会在同一 socket 上并发 recv(net::Connection 无内部读串行化)=UB。
+  auto gate = co_await impl_->acquire_request_gate();
   auto rp = co_await impl_->pump_until(op::NONE, timeout);
   if(!rp) co_return tl::unexpected(rp.error());
   co_return tl::expected<void,std::error_code>{};

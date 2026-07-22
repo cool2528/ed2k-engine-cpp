@@ -361,6 +361,69 @@ TEST(Session, DownloadUsesConnectedSearchServerForSources){
   std::filesystem::remove_all(tmp_dir);
 }
 
+// 终审 C2 回归: 活动下载期间 disconnect_server 必须不 UAF。run_task/supervisor 持 self->login 的
+// shared 副本, disconnect 的 login.reset() 只脱开 Session 的引用, 连接对象由下载副本保活直到下载
+// 结束。用慢速 peer(~1.1s 供完整文件)保证下载在 disconnect 时仍活跃; server 每次 GETSOURCES 都应答
+// (supervisor 周期重问), disconnect 后 supervisor 会对已 close 的 server 连接反复 get_sources——
+// 修复前那是对已析构 ServerConnection 的 UAF, 修复后连接对象仍存活、只是 I/O 失败(优雅)。断言进程
+// 不崩且任务收敛到终态。
+TEST(Session, DisconnectDuringActiveDownloadDoesNotUseAfterFree){
+  auto mf = make_mock_file(0x55, 0x66);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer_slow(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+    for(;;){
+      auto body = co_await read_frame(s);   // GETSOURCES (或连接被 disconnect 关闭 → 空帧)
+      if(body.empty()) co_return;
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
+      w.u32(0x0100007Fu); w.u16(peer.port());
+      co_await send_pkt(s, ed2k::server::op::FOUNDSOURCES, w.take());
+    }
+  });
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_disconnect_mid_dl";
+  std::filesystem::create_directories(tmp_dir);
+  auto out = tmp_dir / "t.bin";
+  std::filesystem::remove(out); std::filesystem::remove(out.string()+".part.met");
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 2000ms;
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session(rt, cfg);
+
+  Ed2kFileLink link; link.name="t.bin"; link.size=PART*2; link.hash=mf.fhash;
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto cr = co_await session.connect_server(std::nullopt);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    std::uint64_t task_id = session.add_download(link, tmp_dir);
+    asio::steady_timer timer(rt.context());
+    for(int i=0;i<200;++i){   // 等进入 downloading(慢速 peer 保证此时下载仍在进行)
+      auto snap = session.query(task_id);
+      if(snap && snap->state == TaskState::downloading) break;
+      timer.expires_after(20ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    session.disconnect_server();   // 活动下载期间 reset self->login —— 不得 UAF
+    for(int i=0;i<600;++i){        // 等收敛(peer 供完 → completed; 或失败), 只要不崩溃/不挂起
+      auto snap = session.query(task_id);
+      if(snap && (snap->state==TaskState::completed || snap->state==TaskState::failed)) break;
+      timer.expires_after(50ms); co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(task_id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_TRUE(snap->state==TaskState::completed || snap->state==TaskState::failed)
+        << "task must converge to a terminal state after mid-download disconnect, not hang or UAF-crash";
+    co_return;
+  });
+  std::filesystem::remove_all(tmp_dir);
+}
+
 TEST(Session, QueryAllListsTasksAndUnknownIdReturnsNullopt){
   IoRuntime rt;
   SessionConfig cfg;

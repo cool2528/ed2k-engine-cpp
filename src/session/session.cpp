@@ -73,7 +73,11 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // 服务器列表(server.met 解析结果); add_server/remove_server/update_server_met 修改后立即落盘。
   ServerList servers;
   // 当前登录会话; nullopt 表示未连接。
-  std::optional<app::LoginSession> login;
+  // C2(终审): shared_ptr 而非 optional——活动下载(run_task/supervisor/LowID callback)持该 LoginSession
+  // 的 shared 副本, 保活其 ServerConnection 覆盖整个 dl.run; 使 disconnect_server/re-connect_server 的
+  // login.reset() 只脱开 Session 自己的引用, 不会在下载仍持有引用时销毁连接(否则 supervisor 下次
+  // get_sources / callback_request 解引用已析构对象 = UAF)。
+  std::shared_ptr<app::LoginSession> login;
   server::ServerConnection::Subscription server_sub;
   ServerStateEvent server_state;
   // 每次 connect_server/disconnect_server 递增, 令在途的旧 connect_server 初始快照读窗口
@@ -347,10 +351,12 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     // owned_login 在回退路径持有该独立登录会话, 保证其连接生命周期覆盖到 dl.run 结束; 用已连服务器
     // 时连接由 self->login 持有(self 在本协程各 co_await 后一直被 relock 持有, 收尾前不析构)。
     std::optional<app::LoginSession> owned_login;
+    std::shared_ptr<app::LoginSession> shared_login;   // C2: 用已连服务器时持 self->login 的 shared 副本, 保活 conn 覆盖 dl.run
     server::ServerConnection* src_conn = nullptr;
     bool self_high_id = false;
     if(self->login){
-      src_conn = &self->login->conn;
+      shared_login = self->login;          // C2: 持 shared 副本, disconnect/reconnect 的 login.reset() 不会析构本下载仍用的 conn
+      src_conn = &shared_login->conn;
       self_high_id = self->server_state.high_id;
     } else {
       auto lg = co_await app::login_with_rotation(ex, self->server_met_bytes, self->cfg.server_override,
@@ -712,7 +718,7 @@ Session::connect_server(std::optional<app::ServerTarget> target){
   }
   if(!lg) co_return tl::unexpected(lg.error());
   auto result = lg->result;                 // 先取值, 避免 move 之后再读悬空成员
-  self->login = std::move(*lg);
+  self->login = std::make_shared<app::LoginSession>(std::move(*lg));
 
   self->server_state = ServerStateEvent{};
   self->server_state.connected = true;
@@ -784,13 +790,13 @@ void Session::disconnect_server(){
 }
 
 bool Session::server_connected() const {
-  return impl_->login.has_value();
+  return impl_->login != nullptr;
 }
 
 std::vector<ServerInfo> Session::server_list() const {
   std::vector<ServerInfo> out;
   out.reserve(impl_->servers.servers.size());
-  const bool connected = impl_->login.has_value() && impl_->server_state.connected;
+  const bool connected = (impl_->login != nullptr) && impl_->server_state.connected;
   for(const auto& e : impl_->servers.servers){
     ServerInfo info;
     info.ip = e.ip; info.port = e.port; info.name = e.name;
