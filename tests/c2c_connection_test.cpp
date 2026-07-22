@@ -612,6 +612,35 @@ TEST(C2CConnection, RequestBlocksReassemblesSplitCompressedPart){
     c.close(); co_return;
   });
 }
+TEST(C2CConnection, RequestBlocksRejectsOversizedCompressedSize){
+  // C3 安全修复回归测试: compressed_size 是未认证的线上 u32——恶意对端可在一个
+  // ~24 字节的 COMPRESSEDPART 分段里声明 compressed_size ≈ 4GiB(实际只带极少载荷),
+  // 诱导旧代码在 accumulate_blocks 里对 pending.data 执行一次 reserve(0xFFFFFFFF)
+  // (单包、未认证、远程 DoS)。修复后必须在 reserve 之前就以 packet_too_large 拒绝该分段。
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                       // REQUESTPARTS
+    {
+      codec::ByteWriter w;
+      w.hash16(h);
+      w.u32(0);
+      w.u32(0xFFFFFFFFu);                                // 恶意声明的 compressed_size(~4GiB)
+      w.blob(bytes({1,2,3,4}));                          // 实际载荷仅 4 字节
+      co_await send_pkt(s, op::COMPRESSEDPART, w.take(), proto::eMule);
+    }
+    co_await keep_alive(s); co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    auto r = co_await c.request_blocks(h, {0,0,0}, {10,0,0}, 300ms);
+    EXPECT_FALSE(r.has_value());
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::packet_too_large));
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, FileNotFound){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{

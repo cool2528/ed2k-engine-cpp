@@ -4,6 +4,7 @@
 #include "ed2k/net/framing.hpp"
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/util/error.hpp"
+#include "ed2k/hash/aich_hasher.hpp"   // PART_SIZE(C3 修复: compressed_size 上限校验用)
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -113,6 +114,14 @@ accumulate_blocks(Stream& conn, const FileHash& h,
     if (seg->hash != h) continue;
     if (seg->data.size() > seg->compressed_size)
       co_return tl::unexpected(make_error_code(errc::decompress_failed));
+    // C3 安全修复: compressed_size 是未认证的线上 u32, 攻击者可用一个 ~24 字节的分段
+    // 声明 compressed_size ≈ 4GiB, 诱导下面 pending.data.reserve() 尝试一次巨量分配
+    // (远程、未认证、单包 DoS)。真实压缩数据不会超过一个 part 的原始大小(压缩不会让
+    // 数据显著膨胀; 发送端 upload_session 也只在 packed_size < 原始大小时才启用压缩),
+    // 故用协议原生的 PART_SIZE(单 part 上限, 比实际单块请求的 AICH_BLOCK_SIZE 更宽松但
+    // 仍足够保守)作为上限, 必须在 reserve 之前拒绝越界声明, 不能先分配后校验。
+    if (seg->compressed_size > PART_SIZE)
+      co_return tl::unexpected(make_error_code(errc::packet_too_large));
     auto it = std::find_if(pending_compressed.begin(), pending_compressed.end(),
       [&](const PendingCompressed& p) {
         return p.hash == seg->hash && p.start == seg->start && p.compressed_size == seg->compressed_size;
