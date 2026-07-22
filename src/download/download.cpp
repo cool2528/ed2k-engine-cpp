@@ -170,6 +170,11 @@ dispatch_blocks_phase(peer::C2CConnection& conn,
   // 缺失 part 位图: 用于跳过对端没有 / 已完成的 part。
   std::vector<bool> need_part(data_part_count(size), false);
   for(std::uint32_t p : missing) need_part[p] = true;
+  // 审计 C4: >4GiB 文件的块偏移超出 32-bit REQUESTPARTS 的表示范围 —— static_cast<uint32_t>
+  // 会静默截断高位(offset mod 2^32), 请求/写入落到错误偏移, 造成静默数据损坏而非报错。与
+  // MultiSourceDownload::pull_blocks_phase 的 large_file 判定同一阈值/同一 request_blocks_i64
+  // 编解码路径(该路径已被 Beyond4GiBBoundaryRoundTrip 验证), 此处复用而非另造一套编码。
+  const bool large_file = size > (std::uint64_t(1) << 32);
   // per-part 块迭代: 块绝不跨 part 边界, 与 aMule 两级树 per-part 叶序一致。
   std::size_t np = data_part_count(size);
   for(std::size_t p=0; p<np; ++p){
@@ -181,13 +186,24 @@ dispatch_blocks_phase(peer::C2CConnection& conn,
       if(pf.is_block_done(p, b)) continue;
       std::uint64_t start = pstart + static_cast<std::uint64_t>(b) * AICH_BLOCK_SIZE;
       std::uint64_t end = std::min(start + AICH_BLOCK_SIZE, pstart + plen);
-      auto blocks = co_await conn.request_blocks(hash,
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start),0,0},
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end),0,0},
-        timeout);
-      if(!blocks) co_return tl::unexpected(blocks.error());
-      if(blocks->empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
-      for(auto& b2 : *blocks){
+      std::vector<peer::Block> blocks_vec;
+      if(large_file){
+        auto blocks = co_await conn.request_blocks_i64(hash,
+          std::array<std::uint64_t,3>{start,0,0},
+          std::array<std::uint64_t,3>{end,0,0},
+          timeout);
+        if(!blocks) co_return tl::unexpected(blocks.error());
+        blocks_vec = std::move(*blocks);
+      } else {
+        auto blocks = co_await conn.request_blocks(hash,
+          std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start),0,0},
+          std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end),0,0},
+          timeout);
+        if(!blocks) co_return tl::unexpected(blocks.error());
+        blocks_vec = std::move(*blocks);
+      }
+      if(blocks_vec.empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
+      for(auto& b2 : blocks_vec){
         auto w = pf.write_block(b2.start, b2.end, b2.data);
         if(!w) co_return tl::unexpected(w.error());
       }

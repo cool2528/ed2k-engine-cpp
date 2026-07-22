@@ -1889,3 +1889,164 @@ TEST(Download, Beyond4GiBBoundaryRoundTrip){
   std::filesystem::remove(tmp);
   std::filesystem::remove(met_path);
 }
+
+// P1 Task 5 (审计 C4): 单源 Download::dispatch_blocks_phase 请求 mock peer —— FILESTATUS 仅
+// 声明一个指定 part(boundary_part)可用, 其余全部声明不可用; dispatch_blocks_phase 的
+// missing_parts_peer_has 因此只会为这一个 part 发起块请求, 无需为其余 part 准备/传输数据
+// (技巧与 Beyond4GiBBoundaryRoundTrip 一致, 但那里绕开了 C2CConnection, 直接摆弄
+// BlockAllocator/PartFile; 这里要验证 dispatch_blocks_phase 实际发出的线上请求, 必须经真实
+// C2CConnection 往返)。
+// 捕获每次收到的 REQUESTPARTS(0x47, 32-bit)/REQUESTPARTS_I64(0xA3, 64-bit)请求的
+// (opcode, 解码后按 u64 保留的 start/end)供测试断言。offset 若落在 boundary part 真实内容
+// 范围之外(32-bit 回绕会回绕到 <4GiB 的错误位置, 落在其它 part), 只回一段等长占位数据,
+// 不越界索引 content —— 该分支纯粹是防御性的, 断言直接读 captured, 不依赖响应数据本身。
+struct CapturedPartsRequest { std::uint8_t opcode; std::uint64_t start; std::uint64_t end; };
+static asio::awaitable<void> serve_boundary_part_peer(
+    tcp::socket s, const FileHash& fhash, const std::vector<PartHash>& part_hashes,
+    std::size_t boundary_part, const std::vector<std::byte>& content,
+    std::vector<CapturedPartsRequest>& captured) {
+  using namespace ed2k::peer;
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false);
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  {
+    // FILESTATUS: 仅 boundary_part 一位为 1, 其余为 0 (decode_file_status: bit i = byte[i/8]
+    // 的 bit (i%8), LSB-first, 见 c2c_messages.cpp decode_file_status)。其余 443 part 因而
+    // 永远不会进入 dispatch_blocks_phase 的 missing 集合, 不需要真实数据。
+    codec::ByteWriter w; w.hash16(fhash);
+    w.u16(static_cast<std::uint16_t>(part_hashes.size()));
+    std::size_t nbytes = (part_hashes.size() + 7) / 8;
+    std::vector<std::uint8_t> bits(nbytes, 0);
+    bits[boundary_part/8] |= static_cast<std::uint8_t>(1u << (boundary_part%8));
+    for(auto b : bits) w.u8(b);
+    co_await send_pkt(s, op::FILESTATUS, w.take());
+  }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(static_cast<std::uint16_t>(part_hashes.size()));
+    for(const auto& p : part_hashes) w.hash16(p);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+
+  const std::uint64_t bstart = static_cast<std::uint64_t>(boundary_part) * PART;
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS 或 REQUESTPARTS_I64
+    if(body.empty()) co_return;
+    std::uint8_t opcode = std::to_integer<std::uint8_t>(body[0]);
+    std::span<const std::byte> pl(body.data()+1, body.size()-1);
+    std::uint64_t s0, e0;
+    if(opcode == op::REQUESTPARTS){
+      codec::ByteReader r(pl); (void)r.hash16();
+      std::uint32_t rs0=r.u32(), rs1=r.u32(), rs2=r.u32();
+      std::uint32_t re0=r.u32(), re1=r.u32(), re2=r.u32();
+      (void)rs1;(void)rs2;(void)re1;(void)re2;
+      s0 = rs0; e0 = re0;
+    } else if(opcode == op::REQUESTPARTS_I64){
+      codec::ByteReader r(pl); (void)r.hash16();
+      std::uint64_t rs1, rs2, re1, re2;
+      s0=r.u64(); rs1=r.u64(); rs2=r.u64();
+      e0=r.u64(); re1=r.u64(); re2=r.u64();
+      (void)rs1;(void)rs2;(void)re1;(void)re2;
+    } else {
+      continue;                                          // 其它 opcode 忽略
+    }
+    captured.push_back({opcode, s0, e0});
+    std::size_t len = static_cast<std::size_t>(e0 - s0);
+    std::vector<std::byte> d;
+    if(s0 >= bstart && e0 <= bstart + content.size()){
+      std::size_t off = static_cast<std::size_t>(s0 - bstart);
+      d.assign(content.begin()+off, content.begin()+off+len);
+    } else {
+      d.assign(len, std::byte{0});                        // 落在 content 范围外: 安全占位, 不越界
+    }
+    if(opcode == op::REQUESTPARTS_I64){
+      codec::ByteWriter w; w.hash16(fhash); w.u64(s0); w.u64(e0); w.blob(std::span<const std::byte>(d));
+      co_await send_pkt(s, op::SENDINGPART_I64, w.take(), proto::eMule);
+    } else {
+      codec::ByteWriter w; w.hash16(fhash);
+      w.u32(static_cast<std::uint32_t>(s0)); w.u32(static_cast<std::uint32_t>(e0));
+      w.blob(std::span<const std::byte>(d));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
+  }
+}
+
+// P1 Task 5 (审计 C4): 单源 Download::dispatch_blocks_phase 对 >4GiB 文件必须使用 64-bit
+// REQUESTPARTS_I64 分支(修复前恒用 32-bit REQUESTPARTS —— offset 转 u32 时静默回绕, 落在
+// 错误 part 触发静默数据损坏; 修复后与 MultiSourceDownload::pull_blocks_phase 的 large_file
+// 分支一致, 按 size>4GiB 选择 64-bit 请求)。
+// 构造 4GiB+2*PART 文件(与 Beyond4GiBBoundaryRoundTrip 同一构造), FILESTATUS 仅声明
+// boundary_part(起点 4,299,776,000 > 4GiB)可用 —— 其余 443 part 因而被
+// missing_parts_peer_has 跳过, 无需真实传输 4.3GiB 数据; 预写 .part.met(gaps=全文件)跳过
+// PartFile 构造时的 rehash_all 全量扫描(同一技巧, 见 Beyond4GiBBoundaryRoundTrip 注释)。
+// 断言两层:
+//   1) 线路层——mock peer 捕获到的每次请求必须是 REQUESTPARTS_I64, 且解码后的 u64 offset
+//      必须 >= 4GiB(32-bit 回绕会产生 <4GiB 的错误值, 直接证伪回绕)。
+//   2) 落盘层(round-trip)——boundary part 必须真正 MD4 校验通过、从 gaps() 消失: 回绕 bug 会
+//      把请求/写入错误地路由到 part 0/1 的中段(既不触发那两个 part 的 MD4, 也永远碰不到
+//      boundary_part), 该 part 会永远停留在 gaps() 里。
+TEST(Download, SingleSourceBeyond4GiBUsesI64Requests){
+  constexpr std::uint64_t GIB = std::uint64_t(4)*1024*1024*1024;          // 4 GiB = 4294967296
+  std::uint64_t size = GIB + 2*PART;                                       // ~4.31 GiB → 444 parts
+  std::size_t boundary_part = static_cast<std::size_t>(GIB / PART) + 1;    // 442, 起点 > 4GiB
+  ASSERT_GT(static_cast<std::uint64_t>(boundary_part) * PART, GIB);
+  std::size_t nparts = static_cast<std::size_t>((size + PART - 1) / PART); // 444
+  const std::uint64_t bstart = static_cast<std::uint64_t>(boundary_part) * PART;
+
+  std::vector<std::byte> content(PART, std::byte{0x5A});
+  crypto::MD4 m; m.update(content); PartHash boundary_hash = PartHash::from_bytes(m.finish());
+  std::vector<PartHash> part_hashes(nparts, boundary_hash);   // 其余 part hash 占位(本测试不下载)
+  m = {}; for(auto& h : part_hashes) m.update(h.bytes());
+  FileHash fhash = FileHash::from_bytes(m.finish());
+
+  auto tmp = std::filesystem::temp_directory_path() / "ed2k_dl_i64_single";
+  auto met_path = std::filesystem::path(tmp.string() + ".part.met");
+  std::filesystem::remove(tmp);
+  std::filesystem::remove(met_path);
+  {
+    ed2k::PartFileState st; st.hash = fhash; st.part_hashes = part_hashes;
+    st.gaps = {{0, size}};
+    auto met_bytes = ed2k::write_part_met(st);
+    std::ofstream mm(met_path, std::ios::binary | std::ios::trunc);
+    mm.write(reinterpret_cast<const char*>(met_bytes.data()), static_cast<std::streamsize>(met_bytes.size()));
+  }
+
+  std::vector<CapturedPartsRequest> captured;
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_boundary_part_peer(std::move(s), fhash, part_hashes, boundary_part, content, captured);
+    co_return;
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::Download dl(rt.executor(), tmp, fhash, size, SourceEndpoint{0x0100007Fu, peer.port()});
+    // 全文件仅 1/444 part 对 peer 可用, pf.complete() 恒为 false —— 不能作为本测试的判据
+    // (与 dispatch_blocks_phase 的 32-bit/64-bit 分支是否正确无关), 结果本身仅忽略。
+    (void)co_await dl.run(5s);
+    co_return;
+  });
+
+  std::size_t expected_blocks = (PART + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;  // 满 part = 53
+  ASSERT_FALSE(captured.empty()) << "mock peer 从未收到任何 REQUESTPARTS(_I64) 请求";
+  EXPECT_EQ(captured.size(), expected_blocks);
+  for(const auto& req : captured){
+    EXPECT_EQ(req.opcode, ed2k::peer::op::REQUESTPARTS_I64)
+        << "size>4GiB 时必须使用 64-bit REQUESTPARTS_I64, 而非 32-bit REQUESTPARTS(offset 会静默回绕)";
+    EXPECT_GE(req.start, GIB) << "解码后的请求偏移已回绕到 4GiB 以下(32-bit narrowing 的典型症状)";
+    EXPECT_GE(req.end, GIB);
+  }
+
+  {
+    PartFile pf(tmp, size, fhash, part_hashes);
+    auto g = pf.gaps();
+    bool boundary_in_gaps = false;
+    for(auto& [gs, ge] : g) if(gs < bstart + PART && ge > bstart) boundary_in_gaps = true;
+    EXPECT_FALSE(boundary_in_gaps) << "boundary part (>4GiB) 必须下载完成且 MD4 校验通过 (round-trip)";
+  }
+
+  std::filesystem::remove(tmp);
+  std::filesystem::remove(met_path);
+}
