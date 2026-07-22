@@ -2,6 +2,7 @@
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/util/error.hpp"
 #include "ed2k/download/download.hpp"
+#include "ed2k/kad/network.hpp"   // KadNetwork::routing_table (B4: kad_peers 快照)
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include <algorithm>
@@ -123,7 +124,16 @@ download_link(boost::asio::any_io_executor ex, const ed2k::Ed2kFileLink& link,
                    .obfuscation(opts.obfuscation_policy, opts.local_user_hash)
                    .server(lg->conn);
   if(listener) builder.listener(*listener);
-  if(opts.kad_network) builder.kad_network(opts.kad_network->get());
+  if(opts.kad_network){
+    // B4: MultiSourceDownload::run() 不再自行从 kad_network 的路由表取 peers(该值现在必须由
+    // 调用方显式传入, 见 download.hpp Builder::kad_peers 注释)。download_link 是一次性 CLI
+    // 用法(不像 Session 那样有常驻 kad_run 单读者), 这里直接用 opts.kad_network 自己的路由表
+    // 做快照——与本函数改动前 run() 内部隐式做的事完全等价, 保持既有调用方(CLI/测试)行为不变。
+    auto& kad_network = opts.kad_network->get();
+    const auto file_id = kad::KadID::from_bytes(link.hash.bytes());
+    builder.kad_network(kad_network)
+           .kad_peers(kad_network.routing_table().closest_to(file_id, kad::KBucket::capacity));
+  }
   if(opts.ip_filter) builder.ip_filter(opts.ip_filter, opts.ip_filter_level);
   auto dl = builder.build();
   co_return co_await dl.run(opts.total_timeout, 3);

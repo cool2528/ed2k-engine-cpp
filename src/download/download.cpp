@@ -233,6 +233,7 @@ struct MultiSourceDownload::Impl {
        std::optional<std::reference_wrapper<server::ServerConnection>> server_conn_arg,
        std::optional<std::reference_wrapper<peer::InboundListener>> listener_arg,
        std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_arg,
+       std::vector<kad::Contact> kad_peers_arg,
        std::shared_ptr<const infra::IPFilter> ip_filter_arg,
        std::uint8_t ip_filter_level_arg,
        peer::ObfuscationPolicy obfuscation_policy_arg,
@@ -242,7 +243,8 @@ struct MultiSourceDownload::Impl {
     : ex(net_ex), disk_ex(std::move(disk_ex_arg)), out(std::move(out_arg)), hash(hash_arg), size(size_arg),
       aich(std::move(aich_arg)), sources(std::move(sources_arg)),
       server_conn(std::move(server_conn_arg)), listener(std::move(listener_arg)),
-      kad_network(std::move(kad_network_arg)), ip_filter(std::move(ip_filter_arg)),
+      kad_network(std::move(kad_network_arg)), kad_peers(std::move(kad_peers_arg)),
+      ip_filter(std::move(ip_filter_arg)),
       ip_filter_level(ip_filter_level_arg), obfuscation_policy(obfuscation_policy_arg),
       local_user_hash(std::move(local_user_hash_arg)), on_progress(std::move(on_progress_arg)),
       stop(std::move(stop_arg)) {}
@@ -257,6 +259,10 @@ struct MultiSourceDownload::Impl {
   std::optional<std::reference_wrapper<server::ServerConnection>> server_conn;
   std::optional<std::reference_wrapper<peer::InboundListener>> listener;
   std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network;
+  // B4: kad_network 若为 ephemeral 实例(自己的路由表为空), run() 不能再从它自己的路由表取
+  // peers——必须由调用方(如 Session::run_task)从主路由表快照后显式传入。与 kad_network 是
+  // "有没有 Kad 网络对象可用"和"该向谁发 find_sources 请求"两个独立维度。
+  std::vector<kad::Contact> kad_peers;
   std::shared_ptr<const infra::IPFilter> ip_filter;
   std::uint8_t ip_filter_level = 127;
   peer::ObfuscationPolicy obfuscation_policy = peer::ObfuscationPolicy::disabled;
@@ -281,7 +287,8 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor ex,
       }(),
       server_conn ? std::optional<std::reference_wrapper<server::ServerConnection>>(std::ref(*server_conn)) : std::nullopt,
       listener ? std::optional<std::reference_wrapper<peer::InboundListener>>(std::ref(*listener)) : std::nullopt,
-      std::nullopt, nullptr, 127, peer::ObfuscationPolicy::disabled, std::nullopt, nullptr, nullptr)) {}
+      std::nullopt, std::vector<kad::Contact>{}, nullptr, 127, peer::ObfuscationPolicy::disabled,
+      std::nullopt, nullptr, nullptr)) {}
 
 MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor net_ex,
                                          boost::asio::any_io_executor disk_ex,
@@ -291,6 +298,7 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor net_ex,
                                          std::optional<std::reference_wrapper<server::ServerConnection>> server_conn,
                                          std::optional<std::reference_wrapper<peer::InboundListener>> listener,
                                          std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network,
+                                         std::vector<kad::Contact> kad_peers,
                                          std::shared_ptr<const infra::IPFilter> ip_filter,
                                          std::uint8_t ip_filter_level,
                                          peer::ObfuscationPolicy obfuscation_policy,
@@ -299,8 +307,9 @@ MultiSourceDownload::MultiSourceDownload(boost::asio::any_io_executor net_ex,
                                          std::shared_ptr<const bool> stop)
   : impl_(std::make_unique<Impl>(net_ex, std::move(disk_ex), std::move(out), hash, size,
                                  std::move(aich), std::move(sources), std::move(server_conn),
-                                 std::move(listener), std::move(kad_network), std::move(ip_filter),
-                                 ip_filter_level, obfuscation_policy, std::move(local_user_hash),
+                                 std::move(listener), std::move(kad_network), std::move(kad_peers),
+                                 std::move(ip_filter), ip_filter_level, obfuscation_policy,
+                                 std::move(local_user_hash),
                                  std::move(on_progress), std::move(stop))) {}
 
 MultiSourceDownload::~MultiSourceDownload() = default;
@@ -315,7 +324,8 @@ MultiSourceDownload MultiSourceDownload::Builder::build() {
   return MultiSourceDownload(net_ex_, disk_ex_, std::move(out_), hash_, size_,
                              std::move(aich_), std::move(sources_),
                              std::move(server_), std::move(listener_),
-                             std::move(kad_network_), std::move(ip_filter_), ip_filter_level_,
+                             std::move(kad_network_), std::move(kad_peers_),
+                             std::move(ip_filter_), ip_filter_level_,
                              obfuscation_policy_, std::move(local_user_hash_),
                              std::move(on_progress_), std::move(stop_));
 }
@@ -962,24 +972,27 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
                          std::chrono::milliseconds source_reask_interval,
                          std::chrono::milliseconds source_reconnect_backoff){
   auto& self = *impl_;
-  if(self.kad_network){
+  // B4: peers 由调用方显式传入(self.kad_peers), 不再从 kad_network 自己的路由表取——
+  // kad_network 常见是调用方新建的 ephemeral 实例(独立 socket, 不与常驻 Kad 读者抢包,
+  // 见 Session::run_task 的用法), 其自身路由表从始至终为空, routing_table().closest_to(...)
+  // 恒返回空。真正的候选 peers 来自"主"路由表的快照, 由调用方(如 Session::run_task 从
+  // self->kad 快照, 或测试直接构造)通过 Builder::kad_peers() 注入。kad_peers 为空时(未启用
+  // Kad, 或主路由表当前没有可用联系人)整段跳过, 行为等同"仅服务器源"(不回归既有路径)。
+  if(self.kad_network && !self.kad_peers.empty()){
     auto& kad_network = self.kad_network->get();
     const auto file_id = kad_id_from_hash(self.hash);
-    auto peers = kad_network.routing_table().closest_to(file_id, kad::KBucket::capacity);
-    if(!peers.empty()){
-      auto kad_sources = co_await kad_network.find_sources(peers, file_id, self.size, total_timeout);
-      if(kad_sources){
-        for(const auto& entry : *kad_sources){
-          auto identity = peer_identity_from_kad_source(entry);
-          if(!identity) continue;
-          if(self.ip_filter && self.ip_filter->blocked(
-              IPv4::from_wire(identity->endpoint.id), self.ip_filter_level)) continue;
-          const auto duplicate = std::any_of(self.sources.begin(), self.sources.end(),
-                                             [&](const peer::PeerIdentity& current){
-                                               return same_source(current.endpoint, identity->endpoint);
-                                             });
-          if(!duplicate) self.sources.push_back(std::move(*identity));
-        }
+    auto kad_sources = co_await kad_network.find_sources(self.kad_peers, file_id, self.size, total_timeout);
+    if(kad_sources){
+      for(const auto& entry : *kad_sources){
+        auto identity = peer_identity_from_kad_source(entry);
+        if(!identity) continue;
+        if(self.ip_filter && self.ip_filter->blocked(
+            IPv4::from_wire(identity->endpoint.id), self.ip_filter_level)) continue;
+        const auto duplicate = std::any_of(self.sources.begin(), self.sources.end(),
+                                           [&](const peer::PeerIdentity& current){
+                                             return same_source(current.endpoint, identity->endpoint);
+                                           });
+        if(!duplicate) self.sources.push_back(std::move(*identity));
       }
     }
   }

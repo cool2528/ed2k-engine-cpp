@@ -273,6 +273,93 @@ TEST(AppDownload, KadSourcesCompleteWhenServerReturnsNoSources){
   std::filesystem::remove(tmp);
 }
 
+// B4: 验证 Session::run_task 采用的 "ephemeral KadNetwork + 显式传入 peers" 模式在
+// MultiSourceDownload::run() 里真正生效, 而不是退化成旧代码那样从 kad_network 自己的路由表
+// (对 ephemeral 实例而言恒为空)去取 peers。query_node 在 dl.run() 开始前从未发起过任何 Kad
+// RPC, 其路由表在那一刻确凿为空(下方 ASSERT 核实——注意 KadNetwork 的每个公开 RPC 方法都会
+// 把 remote 参数 add_or_update 进调用方自己的路由表, 见 network.cpp; 因此这条 ASSERT 必须放在
+// query_node 发起第一次 RPC 之前, 用一个独立的 publisher 实例做种子发布, 不能借 query_node
+// 自己去发布, 否则会在验证点之前就把 indexer "顺手" 记进 query_node 的表、使断言失去意义)。
+// 唯一的候选 peer(indexer)通过 Builder::kad_peers() 作为参数传入——这正是 Session::run_task
+// 对 self->kad 主路由表做快照后注入 ephemeral 实例的同一种用法(区别于上面
+// KadSourcesCompleteWhenServerReturnsNoSources 测试: 那个测试靠
+// searcher.routing_table().add_or_update(...) 把联系人写进了 kad_network 自己的表, 测的是
+// download_link/DownloadOpts 这条路径——现在 download_link 内部改为显式快照后传入 kad_peers,
+// 结果等价, 但不再依赖 run() 自己读 kad_network 的路由表, 见 server_session.cpp 的改动)。
+// 不构造任何服务器/服务器源(不调用 Builder::server/sources), 模拟"服务器无源": 唯一源来自
+// Kad find_sources, 直接驱动 MultiSourceDownload::Builder(绕开 download_link, 因为
+// DownloadOpts 没有 kad_peers 旋钮, 且这里要验证的正是 download.cpp 里那段 Kad 分支本身)。
+TEST(AppDownload, EphemeralKadNodeUsesInjectedPeersToFindSource){
+  auto mf = make_mock_file(0xAA, 0xBB);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+
+  // publisher: 仅用于把 source 记录种到 indexer 上, 与 query_node 分开(见上方大注释的理由)。
+  ed2k::kad::KadNetwork publisher(rt.executor(), ed2k::kad::KadNetworkOptions{
+    .id = kad_id("00000000000000000000000000000001"),
+    .ip = IPv4::from_dotted("127.0.0.1").value(),
+    .tcp_port = peer.port(),
+    .version = ed2k::kad::kad2_version,
+  });
+  // indexer: 存有该文件 source 记录的 Kad 节点; id 落在 file_id 上(与
+  // KadSourcesCompleteWhenServerReturnsNoSources 同一手法, 满足 XOR 距离容差过滤)。
+  ed2k::kad::KadNetwork indexer(rt.executor(), ed2k::kad::KadNetworkOptions{
+    .id = kad_id(mf.fhash),
+    .ip = IPv4::from_dotted("127.0.0.1").value(),
+    .tcp_port = 4662,
+    .version = ed2k::kad::kad2_version,
+  });
+  // query_node: 模拟 Session::run_task 新建的临时查询实例——udp_port=0(ephemeral, 独立
+  // socket, 与生产代码同款)。在 dl.run() 之前绝不发起任何 RPC, 保证下方的空路由表断言有效。
+  ed2k::kad::KadNetwork query_node(rt.executor(), ed2k::kad::KadNetworkOptions{
+    .id = kad_id("00000000000000000000000000000003"),
+    .ip = IPv4::from_dotted("127.0.0.1").value(),
+    .udp_port = 0,
+    .tcp_port = 4663,
+    .version = ed2k::kad::kad2_version,
+  });
+
+  auto tmp = std::filesystem::temp_directory_path() / "ed2k_app_dl_kad_ephemeral_test";
+  std::filesystem::remove(tmp);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    // source_udp_port 字段对本测试的连通性无影响(peer_identity_from_kad_source 只读
+    // source_type/source_port/source_ip), 传 0 即可。
+    auto source = kad_source_entry("cccccccccccccccccccccccccccccccc", peer.port(), 0, PART*2);
+    asio::co_spawn(rt.context(), serve_kad_n(indexer, 1), asio::detached);
+    auto published = co_await publisher.publish_source(indexer.self_contact(), kad_id(mf.fhash), source, 1s);
+    // ASSERT_* 展开成裸 return, 在 C++20 协程里非法(必须 co_return); 本文件既有测试的惯用法是
+    // EXPECT_* + 手动 if(...) co_return 模拟"断言失败即中止"(如上面
+    // KadSourcesCompleteWhenServerReturnsNoSources 测试), 这里同样遵循。
+    EXPECT_TRUE(published.has_value()) << (published ? "" : published.error().message());
+    if(!published) co_return;
+
+    // 核心断言: query_node 自己的路由表此刻为空(它还没发起过任何 RPC)。若
+    // MultiSourceDownload::run() 仍像改动前那样调用
+    // kad_network.routing_table().closest_to(...) 取 peers, 结果必然是空, 下面的
+    // find_sources 根本不会被调用, 下载会因为"没有任何源"而失败——peers 必须来自显式构造
+    // 并通过 kad_peers() 传入的快照, 而不是 query_node 自己的表。
+    const bool query_node_table_empty = query_node.routing_table().all_contacts().empty();
+    EXPECT_TRUE(query_node_table_empty);
+    if(!query_node_table_empty) co_return;
+    std::vector<ed2k::kad::Contact> peers{ indexer.self_contact() };
+
+    asio::co_spawn(rt.context(), serve_kad_n(indexer, 2), asio::detached);
+
+    auto builder = ed2k::download::MultiSourceDownload::Builder(rt.executor())
+                     .out(tmp).hash(mf.fhash).size(PART*2)
+                     .kad_network(query_node)
+                     .kad_peers(peers);
+    auto dl = builder.build();
+    auto r = co_await dl.run(20000ms, 3);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+  ASSERT_TRUE(std::filesystem::exists(tmp));
+  EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
+  std::filesystem::remove(tmp);
+}
+
 TEST(AppDownload, KadSourceIdentityAllowsRequiredObfuscationToReachTcp) {
   IoRuntime rt;
   tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));

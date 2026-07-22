@@ -12,6 +12,7 @@
 #include <boost/asio/awaitable.hpp>
 #include "ed2k/core/hash.hpp"
 #include "ed2k/infra/ip_filter.hpp"
+#include "ed2k/kad/routing_table.hpp"  // kad::Contact (B4: kad_peers 快照)
 #include "ed2k/server/messages.hpp"   // SourceEndpoint
 #include "ed2k/server/connection.hpp"  // ServerConnection (M3 LowID callback)
 #include "ed2k/peer/c2c_connection.hpp"
@@ -94,6 +95,10 @@ class MultiSourceDownload {
     Builder& server(server::ServerConnection& s) { server_ = std::ref(s); return *this; }
     Builder& listener(peer::InboundListener& l) { listener_ = std::ref(l); return *this; }
     Builder& kad_network(kad::KadNetwork& k) { kad_network_ = std::ref(k); return *this; }
+    // B4: kad_network 自身路由表为空的 ephemeral 实例场景下, run() 不能再靠
+    // kad_network.routing_table().closest_to(...) 取 peers(结果恒为空)——peers 必须由调用方
+    // 从"主"路由表(如 Session::Impl::kad, 与 ephemeral 查询实例分离)显式快照后传入。
+    Builder& kad_peers(std::vector<kad::Contact> p) { kad_peers_ = std::move(p); return *this; }
     Builder& disk_executor(boost::asio::any_io_executor ex) { disk_ex_ = ex; return *this; }
     Builder& ip_filter(std::shared_ptr<const infra::IPFilter> f, std::uint8_t level = 127) {
       ip_filter_ = std::move(f);
@@ -116,6 +121,7 @@ class MultiSourceDownload {
     std::optional<std::reference_wrapper<server::ServerConnection>> server_;
     std::optional<std::reference_wrapper<peer::InboundListener>> listener_;
     std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network_;
+    std::vector<kad::Contact> kad_peers_;
     std::shared_ptr<const infra::IPFilter> ip_filter_;
     std::uint8_t ip_filter_level_ = 127;
     ProgressFn on_progress_;
@@ -153,6 +159,7 @@ class MultiSourceDownload {
                       std::optional<std::reference_wrapper<server::ServerConnection>> server_conn,
                       std::optional<std::reference_wrapper<peer::InboundListener>> listener,
                       std::optional<std::reference_wrapper<kad::KadNetwork>> kad_network,
+                      std::vector<kad::Contact> kad_peers,
                       std::shared_ptr<const infra::IPFilter> ip_filter,
                       std::uint8_t ip_filter_level,
                       peer::ObfuscationPolicy obfuscation_policy,

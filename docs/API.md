@@ -141,6 +141,7 @@ class MultiSourceDownload {
     Builder& server(server::ServerConnection&);
     Builder& listener(peer::InboundListener&);
     Builder& kad_network(kad::KadNetwork&);              // optional Kad source augmentation
+    Builder& kad_peers(std::vector<kad::Contact>);       // required alongside kad_network (B4, see below)
     Builder& disk_executor(boost::asio::any_io_executor);
     MultiSourceDownload build();
   };
@@ -149,9 +150,16 @@ class MultiSourceDownload {
 };
 ```
 
-When a `KadNetwork` is injected, `MultiSourceDownload::run` asks the local routing table for the
-closest contacts to the file hash and appends direct Kad source results before the existing
-multi-source setup loop. Server sources remain first in priority; Kad only augments the candidate list.
+When a `KadNetwork` is injected, `MultiSourceDownload::run` calls `find_sources(kad_peers, ...)` and
+appends direct Kad source results before the existing multi-source setup loop; it does **not** read
+`kad_network`'s own routing table. `kad_peers` must be populated by the caller (a snapshot from
+whatever routing table actually has contacts) — this lets `kad_network` be a throwaway ephemeral
+instance with an empty routing table of its own (e.g. `udp_port=0`, independent socket), which is
+required when a resident Kad instance is already being read by another coroutine (single-reader
+constraint; see `Session::run_task` in `session.cpp`, which snapshots peers from its resident `kad`
+member and queries through a fresh ephemeral `KadNetwork` instead of reusing the resident socket).
+If `kad_peers` is empty the Kad branch is skipped entirely, same as when `kad_network` is unset.
+Server sources remain first in priority; Kad only augments the candidate list.
 
 ## `ed2k/kad` — Kademlia DHT
 
@@ -202,7 +210,9 @@ awaitable<expected<void, ec>>
 ```
 `download_link` does: login → `get_sources` → construct `InboundListener` only if LowID sources
 exist (else HighID-only direct connect) → optionally append Kad direct sources when
-`DownloadOpts::kad_network` is set → `MultiSourceDownload(...).run(total_timeout, 3)`.
+`DownloadOpts::kad_network` is set (peers snapshotted from that same `kad_network`'s own routing
+table via `closest_to`, then passed to `Builder::kad_peers` — see `MultiSourceDownload::Builder`
+above) → `MultiSourceDownload(...).run(total_timeout, 3)`.
 
 ## `ed2k/infra/http_download.hpp` — verified HTTP(S) download
 

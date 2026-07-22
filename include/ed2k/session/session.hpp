@@ -57,8 +57,9 @@ struct SessionConfig {
   // 独立字段便于测试注入更短值。语义等同 download::kSourceReaskInterval。
   std::chrono::milliseconds source_reask_interval = std::chrono::minutes(3);
   // 启用 Kad(DHT) 子系统: 用 data_dir/nodes.dat 做种子引导, 维护路由表并可被其它 Kad 节点发现,
-  // shutdown 时把当前路由表落盘回 nodes.dat。当前不接入下载增源(find_sources) ——
-  // 该功能会与 Kad 常驻的单读者 socket 争抢同一连接, 留待后续专项任务实现; 见 kad_status()。
+  // shutdown 时把当前路由表落盘回 nodes.dat。下载增源(find_sources)已接入(B4): run_task 从
+  // 主路由表快照 peers 后, 新建一个独立 socket 的 ephemeral KadNetwork 专供该次下载查询, 不与
+  // 本字段维护的常驻单读者 socket(kad_run/serve_once)抢包; 见 session.cpp::run_task 内注释。
   // kad_udp_port 端口绑定失败(如已被其它 Kad 客户端占用)时自动降级为不启用, 不影响 Session
   // 其余功能; kad_status().running 会反映实际是否成功启用。
   bool enable_kad = false;

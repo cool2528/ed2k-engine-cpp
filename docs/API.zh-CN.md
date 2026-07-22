@@ -137,6 +137,7 @@ class MultiSourceDownload {
     Builder& server(server::ServerConnection&);
     Builder& listener(peer::InboundListener&);
     Builder& kad_network(kad::KadNetwork&);              // 可选的 Kad 来源扩充
+    Builder& kad_peers(std::vector<kad::Contact>);       // 与 kad_network 搭配使用, 必填(B4, 见下文)
     Builder& disk_executor(boost::asio::any_io_executor);
     MultiSourceDownload build();
   };
@@ -145,9 +146,14 @@ class MultiSourceDownload {
 };
 ```
 
-注入 `KadNetwork` 后，`MultiSourceDownload::run` 会向本地路由表查询距离文件哈希最近的
-联系人，并在现有多来源设置循环之前追加直接 Kad 来源结果。服务器来源仍具有最高优先级；
-Kad 仅用于扩充候选列表。
+注入 `KadNetwork` 后，`MultiSourceDownload::run` 会调用 `find_sources(kad_peers, ...)`，并在现有
+多来源设置循环之前追加直接 Kad 来源结果——**不会**读取 `kad_network` 自己的路由表。`kad_peers`
+必须由调用方显式填入(从真正持有联系人的路由表快照而来)，这样 `kad_network` 就可以是一个自己
+路由表为空的一次性 ephemeral 实例(如 `udp_port=0`、独立 socket)——当已有一个常驻 Kad 实例正被
+另一个协程读取时(单读者约束；见 `session.cpp` 中的 `Session::run_task`：它从常驻的 `kad` 成员
+快照 peers，再用一个全新的 ephemeral `KadNetwork` 发起查询，而不是复用常驻 socket)，这正是所
+需要的方式。`kad_peers` 为空时整段 Kad 分支会被跳过，效果与不设置 `kad_network` 相同。
+服务器来源仍具有最高优先级；Kad 仅用于扩充候选列表。
 
 ## `ed2k/kad` — Kademlia DHT
 
@@ -198,7 +204,8 @@ awaitable<expected<void, ec>>
 ```
 `download_link` 的流程为：登录 → `get_sources` → 仅在存在 LowID 来源时构造
 `InboundListener`（否则只直接连接 HighID）→ 设置 `DownloadOpts::kad_network` 时选择性地
-追加 Kad 直接来源 → `MultiSourceDownload(...).run(total_timeout, 3)`。
+追加 Kad 直接来源（peers 从该 `kad_network` 自己的路由表通过 `closest_to` 快照后, 传给上文
+`MultiSourceDownload::Builder` 的 `kad_peers`）→ `MultiSourceDownload(...).run(total_timeout, 3)`。
 
 ## `ed2k/infra/http_download.hpp` — 经验证的 HTTP(S) 下载
 

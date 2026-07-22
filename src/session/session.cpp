@@ -410,6 +410,36 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       catch(const std::exception&) { /* 端口被占 — LowID 源跳过 */ }
     }
 
+    // B4: Kad 增源接入下载。不能直接把 self->kad 注入 MultiSourceDownload::Builder——
+    // self->kad 的 socket 由 Impl::kad_run 的 serve_once 循环常驻独占读取(单读者模型,
+    // 见 kad_run 注释), find_sources 若共用同一个 KadNetwork 实例/socket 会与 kad_run 的
+    // recv 互相偷走对方期待的响应包。做法与 Session::kad_search 完全同构(同一 ephemeral
+    // 实例模式): 先从主路由表(self->kad)快照出 peers(拷贝, 隔离主表后续被 kad_run 修改的
+    // 影响), 再仅当快照非空时才新建一个独立 socket(udp_port=0, 系统分配)的临时 KadNetwork
+    // 专供本次下载使用; peers 作为参数传给 find_sources(见 download.cpp Builder::kad_peers),
+    // 而非依赖 query_node 自己(全新为空)的路由表。query_node 声明在 run_task 函数作用域
+    // (与上面的 owned_login 同构), 而非某个先于 dl.run() 结束的 if 块内部, 以保证其生命周期
+    // 覆盖到下面 dl.run() 结束——Builder 只存 kad::KadNetwork& 引用, 提前析构会悬垂。
+    // 未启用 Kad、或主路由表当前快照为空时 query_node 保持 nullopt, 不调用 builder.kad_network()/
+    // kad_peers(), MultiSourceDownload::run() 的 Kad 分支整体跳过, 行为与改动前一致(仅服务器源)。
+    std::optional<kad::KadNetwork> query_node;
+    std::vector<kad::Contact> kad_peers_snapshot;
+    if(self->kad){
+      const auto file_id = kad::KadID::from_bytes(link.hash.bytes());
+      kad_peers_snapshot = self->kad->routing_table().closest_to(file_id, kad::KBucket::capacity);
+      if(!kad_peers_snapshot.empty()){
+        const auto user_hash = self->effective_user_hash();
+        kad::KadNetworkOptions opts;
+        opts.id = kad::KadID::from_user_hash(user_hash, 1);
+        opts.ip = IPv4::from_dotted("0.0.0.0").value();   // 本地公网 IP 未知, 占位(与主实例/kad_search 一致)
+        opts.udp_port = 0;                                // ephemeral, 独立 socket, 不与 kad_run 争抢
+        opts.tcp_port = self->cfg.tcp_port;
+        opts.version = kad::kad2_version;
+        opts.user_hash = kad::KadID::from_bytes(user_hash.bytes());
+        query_node.emplace(self->rt.executor(), std::move(opts));
+      }
+    }
+
     self->set_state(*t, TaskState::downloading);
     auto builder = download::MultiSourceDownload::Builder(ex)
       .out(out_path).hash(link.hash).size(link.size)
@@ -424,16 +454,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
           if(auto* e = s->find_alive(id, gen)) e->bytes_done = done;
       });
     if(listener) builder.listener(*listener);
-    // 刻意不注入 builder.kad_network(*self->kad): MultiSourceDownload::run() 内部若发现
-    // sources 不足会自动调用 kad_network.find_sources(...) 增源(既有逻辑, 见 download.cpp),
-    // 但 find_sources 的 UDP recv 与 Impl::kad_run 常驻的 serve_once 循环共用同一个
-    // KadNetwork 实例、同一个 socket——KadNetwork 的收包路径无请求/响应 ID 分发, 谁在当前
-    // 时刻发起 recv 谁就拿走下一个到达的数据报, 两者并发会互相偷走对方期待的响应包
-    // (与用户已批准的方案 C 要根治的"并发读同一 socket"是同一类问题; 见 Task 6/7 里
-    // server::ServerConnection 的单读者约束)。enable_kad 目前只负责 Kad DHT 参与本身
-    // (路由表维护/可被网络发现/nodes.dat 持久化), 由 kad_run 作为唯一读者正确维护;
-    // 下载侧的 Kad 增源留待后续专项任务, 参照 Task 7 的单读者仲裁模式实现(该仲裁同时也能
-    // 根治多个并发下载任务各自调用 find_sources 时相互抢占同一 socket 的问题)。
+    if(query_node) builder.kad_network(*query_node).kad_peers(std::move(kad_peers_snapshot));
     auto dl = builder.build();
     auto r = co_await dl.run(self->cfg.task_io_timeout, 3, self->cfg.source_reask_interval);
 
