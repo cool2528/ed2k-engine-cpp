@@ -1131,6 +1131,183 @@ TEST(Download, MultiSourceSingleSubsetFails){
   std::filesystem::remove_all(dir);
 }
 
+// === Task 6: 源重试/重连 + 编排周期重问 (P0) ===
+// 单 block/单 part 极简文件(与 Task 5 的 kQueueTestFileSize 同款), 跳过 hashset。
+static constexpr std::uint64_t kReconnectTestFileSize = 1000;
+
+// mock peer: fetch_hashset 阶段(HELLO..FILESTATUS)如实应答成功, 随后不响应任何后续帧就直接
+// 断开(协程返回, socket 析构关闭)——模拟 run_source_session(start_upload_phase)阶段的瞬时
+// 连接丢失(对客户端而言是 connection_closed/timed_out, 均属 is_transient)。
+static asio::awaitable<void> serve_drop_after_filestatus(tcp::socket s, const FileHash& fhash){
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false, 0);
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(0);
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  co_return;                                              // 故意不再响应, 直接断开
+}
+// mock peer: 正常完整握手 + 供整个文件(与 Task 5 WaitsInUploadQueueThenAcceptsAndDownloads 同款
+// 单 part 小文件手写服务端, 跳过 hashset)。
+static asio::awaitable<void> serve_small_file_full(tcp::socket s, const FileHash& fhash,
+                                                    const std::vector<std::byte>& data){
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false, 0);
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(0);
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // STARTUPLOADREQ
+  co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
+    (void)r.hash16();
+    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
+    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
+    (void)s1;(void)s2;(void)e1;(void)e2;
+    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+    std::size_t off = s0, len = e0 - s0;
+    codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
+    w.blob(std::span<const std::byte>(data).subspan(off, len));
+    co_await send_pkt(s, op::SENDINGPART, w.take());
+  }
+}
+
+// transient 断开一次后重连恢复: 唯一源的第一次连接在 fetch_hashset 阶段正常应答, 但之后
+// (run_source_session 阶段)不告而断; 若 peer_worker 没有重连逻辑, 整个源在此彻底放弃,
+// dl.run() 必然失败; 若有(本任务实现), 应对同一源发起全新 TCP 连接重试, 第二次连接完整
+// 供文件, 下载最终成功。
+//
+// 关键实现细节: ed2k::test::MockPeer::serve() 每次调用各自独立 co_await acceptor_.async_accept(),
+// 若提前注册两个 handler 再等连接到达, asio 不保证"先注册的 handler 拿到先到达的连接"(实测确实
+// 会反过来, 见 RED 阶段记录于 task-6-report.md)——与 session_test.cpp PauseResumeCancelLifecycle
+// 里 "MockPeer/MockServer 的 serve() 只 accept 一次" 那条注释描述的是同一类限制。本测试改用该
+// 测试同款手写单一 acceptor + accept 循环: 循环体在拿到一个连接后才决定"这是第几次连接"再派发
+// 对应行为, 从而按连接到达的真实顺序(而非注册顺序)确定性地区分"第一次(丢弃)"与"第二次
+// (完整服务, 即重连)"。
+TEST(Download, TransientDropThenReconnectCompletes){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_reconnect"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+  std::vector<std::byte> data(kReconnectTestFileSize, std::byte(0x5B));
+  crypto::MD4 m; m.update(data);
+  auto fhash = FileHash::from_bytes(m.finish());
+
+  IoRuntime rt;
+  tcp::acceptor acceptor(rt.context(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));
+  const std::uint16_t peer_port = acceptor.local_endpoint().port();
+  int connection_count = 0;
+  bool second_connection_served = false;
+  asio::co_spawn(rt.context(), [&]() -> asio::awaitable<void>{
+    for(;;){
+      auto [ec, sock] = co_await acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+      if(ec) co_return;
+      { boost::system::error_code ndc; sock.set_option(tcp::no_delay(true), ndc); }
+      ++connection_count;
+      const bool is_first = (connection_count == 1);
+      if(!is_first) second_connection_served = true;
+      asio::co_spawn(rt.context(),
+        [sock = std::move(sock), is_first, &fhash, &data]() mutable -> asio::awaitable<void>{
+          try {
+            if(is_first) co_await serve_drop_after_filestatus(std::move(sock), fhash);
+            else co_await serve_small_file_full(std::move(sock), fhash, data);
+          } catch(...) {}
+          co_return;
+        }, asio::detached);
+    }
+  }, asio::detached);
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(fhash).size(kReconnectTestFileSize).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peer_port}}).build();
+    // source_reask_interval 对本测试无意义(未注入 .server(), 监督不会启动); 用一个较短的
+    // source_reconnect_backoff 让重连退避不拖慢测试。
+    auto r = co_await dl.run(5s, 3, kSourceReaskInterval, 50ms);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, kReconnectTestFileSize, fhash, {});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  EXPECT_EQ(connection_count, 2)
+      << "expected exactly one drop + one reconnect (not zero, not more)";
+  EXPECT_TRUE(second_connection_served)
+      << "peer_worker must reconnect to the same source after a transient drop, not give up permanently";
+  std::filesystem::remove_all(dir);
+}
+
+// 周期重问返回新源→加入并联合完成下载。初始只给 A(仅 part0, 与 MultiSourceSingleSubsetFails
+// 完全同一 fixture——那条测试证明"仅 A 必然 io_error"), 但本测试额外注入一个真实
+// server::ServerConnection + MockServer: 监督的首次周期重问(source_reask_interval 覆盖为
+// 很短)会调用 get_sources, mock 服务器返回 B(仅 part1)的端点。若监督正确合并新源并为其
+// 启动新 worker, B 加入后与 A 互补完成整文件, dl.run() 成功——与 MultiSourceSingleSubsetFails
+// 的失败结果形成直接对照, 证明"周期重问确实让此前会失败的下载改为成功"。
+TEST(Download, PeriodicRequeryAddsNewSourceAndCompletes){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_requery_add"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  IoRuntime rt;
+
+  ed2k::test::MockPeer peerA(rt.context());
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_subset_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}, {true, false}); co_return; });   // A: part0 only
+  ed2k::test::MockPeer peerB(rt.context());
+  bool peer_b_connected = false;
+  peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    peer_b_connected = true;
+    co_await serve_subset_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}, {false, true}); co_return; });   // B: part1 only
+
+  // mock 搜索服务器: 登录后对每一次 GETSOURCES 都回一个仅含 B 的 FOUNDSOURCES(循环应答, 因为
+  // supervisor 存活期间会反复重问; 已知源 B 在第二次起会被 known_sources 去重, 不会重复 spawn)。
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    co_await send_pkt(s, server::op::IDCHANGE, idchange_payload(0x01000000u, 0x0119u));
+    for(;;){
+      auto body = co_await read_frame(s);   // GETSOURCES
+      if(body.empty()) co_return;           // 连接已断(下载已结束)
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
+      w.u32(0x0100007Fu); w.u16(peerB.port());
+      co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
+    }
+  });
+
+  auto tmp = std::filesystem::temp_directory_path()/"ed2k_requery_add_out"; std::filesystem::remove(tmp);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    server::ServerConnection sc(rt.executor());
+    server::LoginParams p; p.nickname="u"; p.client_port=0;
+    p.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+    auto lr = co_await sc.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 3000ms);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(tmp).hash(mf.fhash).size(PART*2).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}})   // 仅 A, 无 B
+                .server(sc)
+                .build();
+    // source_reask_interval 覆盖为 50ms(生产默认 3 分钟), 使监督的首次周期重问尽快发生;
+    // source_reconnect_backoff 本测试用不到, 用默认值。
+    auto r = co_await dl.run(15s, 3, 50ms, kSourceReconnectBackoff);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+  EXPECT_TRUE(peer_b_connected)
+      << "source_reask_supervisor must dial the newly-merged source returned by a later get_sources";
+  ASSERT_TRUE(std::filesystem::exists(tmp));
+  EXPECT_EQ(std::filesystem::file_size(tmp), PART*2);
+  std::filesystem::remove(tmp);
+  std::filesystem::remove_all(dir);
+}
+
 // === P4c-3 M3 验收 (异步磁盘 I/O) ===
 // 功能: Builder.disk_executor 注入真实 disk 线程池 → write_block_async 走卸载路径 (状态/I/O 分离)。
 // 断言多源并发 + 异步磁盘路径下文件完整 + part-MD4 通过 (无竞态/腐败)。

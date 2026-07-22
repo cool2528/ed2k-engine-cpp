@@ -7,6 +7,7 @@
 #include "ed2k/peer/peer_reask.hpp"
 #include "ed2k/net/udp_socket.hpp"
 #include "ed2k/util/error.hpp"
+#include <algorithm>
 #include <optional>
 #include <cassert>
 #include <thread>
@@ -21,6 +22,7 @@
 #include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/ip/udp.hpp>
+#include <boost/asio/steady_timer.hpp>
 namespace ed2k::download {
 namespace {
 kad::KadID kad_id_from_hash(const FileHash& hash) {
@@ -37,6 +39,23 @@ std::uint32_t ipv4_to_wire(IPv4 ip) noexcept {
 
 bool same_source(const server::SourceEndpoint& lhs, const server::SourceEndpoint& rhs) noexcept {
   return lhs.id == rhs.id && lhs.port == rhs.port;
+}
+
+// Task 6 错误分类: 判断源级失败应"退避重连同一源/编排监督稍后重试"(transient)还是应"彻底
+// 放弃该源"(terminal)。
+// TRANSIENT — 与网络层瞬时状态相关, 同源换一次连接/等一等大概率能恢复:
+//   - timed_out:         握手/请求超时(对端一时无响应, 不代表源已失效)。
+//   - connection_closed: 连接被对端关闭/读写失败(EOF、RST 等, 见 net::Connection 的错误映射)。
+//   - upload_queued:     排队等待放弃(queue_wait_phase 里 reask 收到 QUEUEFULL——源此刻上传槽
+//                        满, 不代表源没有这个文件; kQueueWaitMax 耗尽走的是 timed_out, 已覆盖)。
+// TERMINAL — 与"这个源到底有没有这个文件/数据是否正确"相关的确定性判断, 重连不会改变结论,
+// 因此除上面显式列出的以外一律按 terminal 处理(含 file_not_found/hash_mismatch/block_corrupt/
+// connect_failed/ip_filtered 等, 以及未来新增错误码如 Task 7 的双 LowID——不了解语义的错误码
+// 默认不重试, 比默认重试更安全)。
+bool is_transient(std::error_code ec) noexcept {
+  return ec == make_error_code(errc::timed_out) ||
+         ec == make_error_code(errc::connection_closed) ||
+         ec == make_error_code(errc::upload_queued);
 }
 
 std::optional<server::SourceEndpoint> endpoint_from_kad_source(const kad::KadSearchEntry& entry) {
@@ -383,6 +402,23 @@ inline constexpr std::chrono::milliseconds kReaskCallTimeout{3000};
 // 只可能因为"确实收到了新帧"而提前赢得竞速, 不会因为自己的超时抢先(令 reask 的结果被白白丢弃)。
 inline constexpr std::chrono::milliseconds kReaskRaceMargin{500};
 
+// === Task 6: 源重试/重连 + 编排周期重问的常量与取消安全等待基础设施 ===
+// 单个 peer_worker 对同一源的 transient 重连上限(不含最初一次连接; 与本文件既有的
+// max_retries/AICH 块级重试计数同一约定——"N 次重试"=最初一次 + N 次重试, 见 pull_blocks_phase
+// 里 `++retry > max_retries` 的计数方式)。达到上限后彻底放弃该源(转交编排监督, 见下), 而不是
+// 无限重连同一个可能已经不可达的源。
+inline constexpr std::size_t kMaxSourceReconnect = 3;
+// 可取消等待(退避重连 / 监督重问定时器)的轮询切片粒度: 与其一次性睡满整段时长, 不如切成短片段
+// 循环, 每片之间重新检查 st.stopped()/st.alloc.complete()——保证 cancel/shutdown 或"文件已被
+// 其它源下完"能在一个切片内被发现, 而不是被整段退避/3 分钟定时器"吞掉"。取值参考本文件既有的
+// 轮询式取消检查粒度(如 session.cpp accept_loop 的 1s 轮询), 200ms 足够快又不至于空转过密。
+inline constexpr std::chrono::milliseconds kCancellableWaitSlice{200};
+// cancellable_wait() 的实现见 SharedState 定义之后(依赖 SharedState::stopped()/alloc)。
+// done_ch(ResultCh) 容量相对初始 worker 数的余量: 覆盖 source_reask_supervisor 动态增补的新源/
+// transient 重试源(单次 GETSOURCES 应答受协议 u8 计数上限 255, 加上重试池, 留足余量避免
+// try_send 因容量不足而静默丢 token——那会让 run() 的收尾等待永久挂起, 见 run() 内注释)。
+inline constexpr std::size_t kDoneChannelHeadroom = 1024;
+
 // 排队等待 UDP reask 的串行化门闸(架构决策#1): net::UdpSocket::recv_datagram 是裸
 // async_receive_from, 不支持多路等待者(peer_reask.hpp 顶部注释已详述该限制)。用容量=1 的
 // channel 当二元信号量: 取到令牌(recv 成功)= 获得排他使用权; try_send 放回令牌 = 释放。
@@ -426,6 +462,15 @@ struct SharedState {
   std::uint64_t bytes_done = 0;
   ProgressFn on_progress;
   std::shared_ptr<const bool> stop;
+  // Task 6: source_reask_supervisor 是否仍存活。run() 的收尾等待循环据此判断——只要它还在跑,
+  // 就可能继续增补新 worker(active_workers 因此可能回升), run() 就不能提前返回析构本 SharedState
+  // (supervisor 持有 SharedState&, 提前析构 = 悬垂引用)。仅由 run()(启动前置 true)与
+  // source_reask_supervisor 自身(退出前置 false)读写, 同一网络线程, 无锁。
+  bool supervisor_active = false;
+  // Task 6: 已耗尽 kMaxSourceReconnect 预算、最终仍以 transient 错误放弃的源池——供
+  // source_reask_supervisor 周期性取走并重新尝试(全新 peer_worker 调用, 拿到全新重连预算)。
+  // terminal 放弃的源不进这个池(重试没有意义)。
+  std::vector<peer::PeerIdentity> transient_retry_pool;
   bool stopped() const noexcept { return stop && *stop; }
   void add_progress(std::uint64_t n) {
     assert_owner();
@@ -451,7 +496,28 @@ struct SharedState {
     complete = true;
   }
 };
-// 完成信号 channel: worker 退出时 try_send 发一个 token; run() 收 N 个 token。
+
+// 可取消的定时等待(Task 6): 睡眠 duration, 但按 kCancellableWaitSlice 切片轮询, 一旦
+// st.stopped()(用户取消/Session::shutdown)或 st.alloc.complete()(整文件已被其它源下完, 无需
+// 再等)命中即立即返回, 不吞掉这两类信号。供 peer_worker 的退避重连与 source_reask_supervisor
+// 的周期定时器共用——调用方返回后自行重新检查这两个条件决定下一步(继续重连/重问, 还是收尾
+// 退出), 本函数不区分"等满"/"被提前唤醒"这两种返回路径(调用方的后续检查已经足够)。
+static boost::asio::awaitable<void>
+cancellable_wait(SharedState& st, boost::asio::any_io_executor ex, std::chrono::milliseconds duration){
+  using clock_type = std::chrono::steady_clock;
+  const auto deadline = clock_type::now() + duration;
+  boost::asio::steady_timer timer(ex);
+  while(clock_type::now() < deadline){
+    if(st.stopped() || st.alloc.complete()) co_return;
+    const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock_type::now());
+    const auto step = std::min(kCancellableWaitSlice, std::max(remain, std::chrono::milliseconds{0}));
+    if(step <= std::chrono::milliseconds{0}) co_return;
+    timer.expires_after(step);
+    co_await timer.async_wait(boost::asio::use_awaitable);
+  }
+}
+
+// 完成信号 channel: worker/supervisor 退出时 try_send 发一个 token; run() 按状态驱动收 token。
 // 签名 void(boost::system::error_code, int): 首参 error_code 被 use_awaitable 当操作状态
 // (始终 success), int 为可忽略的 token。错误经 st.first_err 传递 (worker 在 finish 内写入,
 // 单网络线程无竞争)。对照 boost asio experimental::channel 文档示例。
@@ -686,11 +752,47 @@ queue_wait_phase(ed2k::peer::C2CConnection& conn, SharedState& st,
   }
 }
 
-// raccoon worker: 连接 source → (复用 setup 连接或全新连接) → start_upload → (若 Queued, 排队
-// 等待直到被接受或放弃, 见 queue_wait_phase) → AICH master 协商 (per-worker) → 按
-// next_block_for_parts(has_part) 取块 (仅请求对端有该 part 的块) → request_blocks → AICH verify
-// (若启用) → write_block → mark_done; 若中途被源重新打回排队(errc::upload_queued, 架构决策#4),
-// 回到排队等待循环而不是判该源失败。源耗尽 (无对端可服务块) 或失败 → finally_send 退出; 整文件
+// 单次"已建立连接"会话(Task 6 从原 peer_worker 抽出): start_upload → (若 Queued, 排队等待直到
+// 被接受或放弃, 见 queue_wait_phase) → AICH master 协商 (per-worker) → 按 next_block_for_parts
+// (has_part) 取块 (仅请求对端有该 part 的块) → request_blocks → AICH verify (若启用) →
+// write_block → mark_done; 若中途被源重新打回排队(errc::upload_queued, 架构决策#4), 回到排队
+// 等待循环而不是判该源失败。返回"这次连接尝试"的最终结果——成功(含"文件已被其它源下完, 我这
+// 份工作无需再做"这种和平退出)或失败错误码。抽出后, peer_worker 的外层重连重试循环(Task 6)
+// 只需要在每次尝试前调用 setup_source_phase(全新连接)+ 本函数, 不必复制一份控制流。
+static boost::asio::awaitable<tl::expected<void,std::error_code>>
+run_source_session(ed2k::peer::C2CConnection& conn, SharedState& st, std::vector<bool> fs_parts,
+                   std::uint16_t source_udp_port, IPv4 source_ip,
+                   std::chrono::milliseconds timeout, std::size_t max_retries){
+  auto upload = co_await start_upload_phase(conn, st.hash, timeout);
+  if(!upload) co_return tl::unexpected(upload.error());
+  if(std::holds_alternative<peer::UploadQueued>(*upload)){
+    auto waited = co_await queue_wait_phase(conn, st, source_udp_port, source_ip);
+    if(!waited) co_return tl::unexpected(waited.error());
+  }
+
+  const bool aich_active = co_await negotiate_aich_phase(conn, st, timeout);
+  for(;;){
+    // fs_parts 不 move: 中途被打回排队后, 循环回来还要再用同一份初始 FILESTATUS 位图重新构建
+    // servable(见 pull_blocks_phase 内 normalize_file_status_parts); 值拷贝成本低(bool 位图)。
+    auto pulled = co_await pull_blocks_phase(conn, st, fs_parts, aich_active, timeout, max_retries);
+    if(pulled) co_return tl::expected<void,std::error_code>{};
+    if(pulled.error() != make_error_code(errc::upload_queued)) co_return tl::unexpected(pulled.error());
+    // 中途被源打回排队 (架构决策#4, accumulate_blocks 新识别的信号): 回排队等待循环而非直接放弃
+    // 该源。此路径未解出具体新排名(保持 accumulate_blocks 改动最小化), queue_wait_phase 不需要
+    // 排名输入, 无影响。
+    auto requeued = co_await queue_wait_phase(conn, st, source_udp_port, source_ip);
+    if(!requeued) co_return tl::unexpected(requeued.error());
+    // 重新被接受: 循环回去继续 pull_blocks_phase(同一连接/文件, aich_active 不变无需重新协商)。
+  }
+}
+
+// raccoon worker(Task 6 扩展): 连接 source → (复用 setup 连接或全新连接) → run_source_session。
+// 一次尝试失败后先分类(is_transient): transient 且重连预算未耗尽 → 退避(cancellable_wait, 可被
+// 取消/整文件已完成提前打断)后对同一源发起全新连接重试(不复用旧连接/pre_conn——旧连接大概率
+// 已死, pre_conn 只在最初一次真正有效); terminal, 或 transient 但预算已耗尽(kMaxSourceReconnect,
+// 计数约定见该常量注释) → 彻底放弃该源。彻底放弃且原因是 transient(重试耗尽而非从未重试过)时,
+// 把源记入 st.transient_retry_pool——供 source_reask_supervisor 在下一个周期重新尝试(全新的
+// peer_worker 调用, 拿到全新的重连预算)。源耗尽(无对端可服务块)或成功 → finish 退出; 整文件
 // 完成由 st.complete 判定 (最后一块 mark_done 置位)。
 static boost::asio::awaitable<void>
 peer_worker(boost::asio::any_io_executor ex,
@@ -706,47 +808,137 @@ peer_worker(boost::asio::any_io_executor ex,
             std::uint8_t ip_filter_level,
             ed2k::peer::ObfuscationPolicy obfuscation_policy,
             std::optional<UserHash> local_user_hash,
+            std::chrono::milliseconds reconnect_backoff,
             ResultCh& done_ch){
   auto finish = [&](std::error_code ec){
     st.set_error(ec);        // 首个失败错误 (单网络线程 → 无竞争)
     st.dec_active_workers();
-    done_ch.try_send(boost::system::error_code{}, 0);   // capacity=N, 永不阻塞; 纯完成信号
+    done_ch.try_send(boost::system::error_code{}, 0);   // capacity 足够大, 永不阻塞; 纯完成信号
   };
 
-  auto setup = co_await setup_source_phase(ex, source, std::move(pre_conn), std::move(pre_parts),
-                                           pre_udp_port, st.hash, st.size, timeout, server_conn, listener,
-                                           std::move(ip_filter), ip_filter_level,
-                                           obfuscation_policy, std::move(local_user_hash));
-  if(!setup){ finish(setup.error()); co_return; }
-
   const IPv4 source_ip = IPv4::from_wire(source.endpoint.id);
-  auto upload = co_await start_upload_phase(setup->conn, st.hash, timeout);
-  if(!upload){ finish(upload.error()); co_return; }
-  if(std::holds_alternative<peer::UploadQueued>(*upload)){
-    auto waited = co_await queue_wait_phase(setup->conn, st, setup->source_udp_port, source_ip);
-    if(!waited){ finish(waited.error()); co_return; }
-  }
+  std::optional<ed2k::peer::C2CConnection> conn_for_attempt = std::move(pre_conn);
+  std::vector<bool> parts_for_attempt = std::move(pre_parts);
+  std::uint16_t udp_port_for_attempt = pre_udp_port;
+  std::size_t reconnects = 0;
 
-  const bool aich_active = co_await negotiate_aich_phase(setup->conn, st, timeout);
   for(;;){
-    // fs_parts 不 move: 中途被打回排队后, 循环回来还要再用同一份初始 FILESTATUS 位图重新构建
-    // servable(见 pull_blocks_phase 内 normalize_file_status_parts); 值拷贝成本低(bool 位图)。
-    auto pulled = co_await pull_blocks_phase(setup->conn, st, setup->fs_parts,
-                                             aich_active, timeout, max_retries);
-    if(pulled){ finish(std::error_code{}); co_return; }
-    if(pulled.error() != make_error_code(errc::upload_queued)){ finish(pulled.error()); co_return; }
-    // 中途被源打回排队 (架构决策#4, accumulate_blocks 新识别的信号): 回排队等待循环而非直接放弃
-    // 该源。此路径未解出具体新排名(保持 accumulate_blocks 改动最小化), queue_wait_phase 不需要
-    // 排名输入, 无影响。
-    auto requeued = co_await queue_wait_phase(setup->conn, st, setup->source_udp_port, source_ip);
-    if(!requeued){ finish(requeued.error()); co_return; }
-    // 重新被接受: 循环回去继续 pull_blocks_phase(同一连接/文件, aich_active 不变无需重新协商)。
+    auto setup = co_await setup_source_phase(ex, source, std::move(conn_for_attempt), std::move(parts_for_attempt),
+                                             udp_port_for_attempt, st.hash, st.size, timeout, server_conn, listener,
+                                             ip_filter, ip_filter_level, obfuscation_policy, local_user_hash);
+    tl::expected<void,std::error_code> result;
+    if(setup){
+      result = co_await run_source_session(setup->conn, st, setup->fs_parts, setup->source_udp_port,
+                                           source_ip, timeout, max_retries);
+    } else {
+      result = tl::unexpected(setup.error());
+    }
+    if(result){ finish(std::error_code{}); co_return; }
+
+    const auto ec = result.error();
+    if(st.stopped()){ finish(make_error_code(errc::cancelled)); co_return; }
+    const bool can_retry = is_transient(ec) && reconnects < kMaxSourceReconnect;
+    if(!can_retry){
+      if(is_transient(ec)) st.transient_retry_pool.push_back(source);   // 供监督后续重试
+      finish(ec);
+      co_return;
+    }
+    ++reconnects;
+    co_await cancellable_wait(st, ex, reconnect_backoff);
+    if(st.stopped()){ finish(make_error_code(errc::cancelled)); co_return; }
+    if(st.alloc.complete()){ finish(std::error_code{}); co_return; }   // 退避期间他源已下完整文件
+    conn_for_attempt.reset(); parts_for_attempt.clear(); udp_port_for_attempt = 0;
   }
+}
+
+// Task 6: spawn_worker/source_reask_supervisor 共用的"整次下载不变"配置打包。MultiSourceDownload
+// ::Impl 是私有嵌套类型(仅类自身与友元 Builder 可见), 本文件里的自由函数不能直接引用它——沿用
+// 本文件既有惯例(fetch_hashset/setup_source_phase/peer_worker 均以摊平字段传参, 而非传 Impl&),
+// 用这个小结构体收敛 Task 6 新增两处调用点(spawn_worker/source_reask_supervisor)的公共字段,
+// 不改动既有函数签名。全部字段按值持有(shared_ptr/optional<reference_wrapper> 拷贝代价低)。
+struct WorkerContext {
+  boost::asio::any_io_executor ex;
+  std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn;
+  std::optional<std::reference_wrapper<ed2k::peer::InboundListener>> listener;
+  std::shared_ptr<const infra::IPFilter> ip_filter;
+  std::uint8_t ip_filter_level;
+  ed2k::peer::ObfuscationPolicy obfuscation_policy;
+  std::optional<UserHash> local_user_hash;
+};
+
+// 启动一个新的 peer_worker(Task 6): 递增 active_workers 后 co_spawn, 供 run() 的初始批次与
+// source_reask_supervisor 的新源/重试源共用, 避免重复"递增计数 + co_spawn"样板。pre_conn/
+// pre_parts/pre_udp_port 默认空——仅 run() 里复用 setup 阶段连接的那一个源会传实参。
+static void
+spawn_worker(const WorkerContext& wc, const ed2k::peer::PeerIdentity& source, SharedState& st,
+            std::chrono::milliseconds timeout, std::size_t max_retries,
+            std::chrono::milliseconds reconnect_backoff, ResultCh& done_ch,
+            std::optional<ed2k::peer::C2CConnection> pre_conn = std::nullopt,
+            std::vector<bool> pre_parts = {}, std::uint16_t pre_udp_port = 0){
+  ++st.active_workers;
+  boost::asio::co_spawn(wc.ex,
+    peer_worker(wc.ex, source, std::move(pre_conn), std::move(pre_parts), pre_udp_port, st,
+                timeout, max_retries, wc.server_conn, wc.listener,
+                wc.ip_filter, wc.ip_filter_level, wc.obfuscation_policy,
+                wc.local_user_hash, reconnect_backoff, done_ch),
+    boost::asio::detached);
+}
+
+// 编排监督(Task 6): 下载存活期间周期性重新 get_sources, 合并未知新源 + 重试已弃的 transient 源;
+// 直到 st.stopped()(取消/shutdown)或 st.alloc.complete()(整文件已被下完)。只有 run() 探测到
+// server_conn 有值(即有办法查更多源)才会启动本协程——没有服务器连接 = 结构性无法重问, 行为与
+// Task 6 之前完全一致(见 run() 内的启动条件), 不影响任何未注入 server_conn 的既有调用方/测试。
+//
+// 复用既有 get_sources 机制(server_conn->get().get_sources, 与 run_task/download_link 现有的
+// 首次取源调用完全同一套 API)——本任务不改"问哪个服务器"(Task 7 范围), 只在其结果之上叠加
+// 周期重问 + 合并 + 重试的编排框架, Task 7 更换服务器来源后本框架不需要改动。
+//
+// 去重复用既有 same_source(id+port), 与 run() 开头 Kad 增源分支同一套判定; ip_filter 判定同理。
+// known_sources 即 run() 的 self.sources(单网络线程写入, 无并发)。
+static boost::asio::awaitable<void>
+source_reask_supervisor(WorkerContext wc, SharedState& st,
+                        std::vector<ed2k::peer::PeerIdentity>& known_sources,
+                        std::chrono::milliseconds timeout, std::size_t max_retries,
+                        std::chrono::milliseconds reask_interval,
+                        std::chrono::milliseconds reconnect_backoff,
+                        ResultCh& done_ch){
+  for(;;){
+    co_await cancellable_wait(st, wc.ex, reask_interval);
+    if(st.stopped() || st.alloc.complete()) break;
+    if(!wc.server_conn) break;   // 防御性: run() 只在有值时才会启动本协程, 正常不会走到这里
+
+    auto found = co_await wc.server_conn->get().get_sources(st.hash, st.size, timeout);
+    if(st.stopped() || st.alloc.complete()) break;
+    if(found){
+      for(const auto& src : found->sources){
+        if(wc.ip_filter && wc.ip_filter->blocked(IPv4::from_wire(src.id), wc.ip_filter_level)) continue;
+        const bool known = std::any_of(known_sources.begin(), known_sources.end(),
+                                       [&](const peer::PeerIdentity& cur){ return same_source(cur.endpoint, src); });
+        if(known) continue;
+        peer::PeerIdentity identity{src, std::nullopt};
+        known_sources.push_back(identity);
+        spawn_worker(wc, identity, st, timeout, max_retries, reconnect_backoff, done_ch);
+      }
+    }
+    // get_sources 失败(服务器连接问题等)不致命: 忽略本轮合并, 下个周期继续尝试(eMule 惯例——
+    // 服务器暂时联系不上也不放弃下载; 是否需要重连服务器本身属于 Task 7 的服务器选择范围)。
+
+    if(!st.transient_retry_pool.empty()){
+      // 重试已弃的 transient 源: 取走当前池并清空(新 peer_worker 调用拿到全新重连预算)。
+      auto retry_pool = std::move(st.transient_retry_pool);
+      st.transient_retry_pool.clear();
+      for(auto& identity : retry_pool) spawn_worker(wc, identity, st, timeout, max_retries, reconnect_backoff, done_ch);
+    }
+  }
+  st.supervisor_active = false;
+  done_ch.try_send(boost::system::error_code{}, 0);
 }
 
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
-                         std::size_t max_retries){
+                         std::size_t max_retries,
+                         std::chrono::milliseconds source_reask_interval,
+                         std::chrono::milliseconds source_reconnect_backoff){
   auto& self = *impl_;
   if(self.kad_network){
     auto& kad_network = self.kad_network->get();
@@ -793,8 +985,10 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   std::size_t n_workers = self.sources.size() - setup_idx;
   SharedState st{std::move(pf), std::move(alloc), std::nullopt, self.aich, self.hash, self.size,
                  self.disk_ex, net::UdpSocket(self.ex), ReaskGate(self.ex, 1),
-                 false, n_workers, std::nullopt};
+                 false, /*active_workers=*/0, std::nullopt};
   // 聚合初始化后补显式赋值: SharedState 尾部含 NDEBUG 条件成员, 位置初始化脆弱, 显式赋值更安全。
+  // active_workers 从 0 开始, 由下面 spawn_worker 逐个递增(Task 6: 与 source_reask_supervisor
+  // 动态增补 worker 时递增的方式统一, 不再在此处一次性赋值 n_workers)。
   st.bytes_done = initial_done;
   st.on_progress = self.on_progress;
   st.stop = self.stop;
@@ -802,25 +996,42 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   if(st.on_progress) st.on_progress(st.bytes_done, st.size);   // 初始进度(续传时非 0)
   if(self.aich) st.checker.emplace(*self.aich, self.size);
 
-  // 阶段二: raccoon — N worker 并发。worker[setup_idx] 复用 setup 连接, 其余全新连接。
-  ResultCh done_ch(self.ex, n_workers);      // capacity = N
+  // 阶段二: raccoon — N worker 并发。worker[setup_idx] 复用 setup 连接, 其余全新连接。Task 6:
+  // 之后 source_reask_supervisor 可能动态增补更多 worker, done_ch 容量按上限预留充分余量
+  // (GETSOURCES 单次应答受协议 u8 计数上限 255, 加上初始批次与 transient 重试池, 1024 足够宽松;
+  // try_send 是非阻塞的 fire-and-forget, 容量不足会静默丢 token 导致 run() 的收尾等待永久挂起,
+  // 故宁可预留充分)。
+  WorkerContext wc{self.ex, self.server_conn, self.listener, self.ip_filter, self.ip_filter_level,
+                   self.obfuscation_policy, self.local_user_hash};
+  ResultCh done_ch(self.ex, n_workers + kDoneChannelHeadroom);
   for(std::size_t i = setup_idx; i < self.sources.size(); ++i){
-    std::optional<ed2k::peer::C2CConnection> pre_conn;
-    std::vector<bool> pre_parts;
-    std::uint16_t pre_udp_port = 0;
     if(i == setup_idx){
-      pre_conn = std::move(fr.conn); pre_parts = std::move(fr.fs_parts); pre_udp_port = fr.source_udp_port;
+      spawn_worker(wc, self.sources[i], st, total_timeout, max_retries, source_reconnect_backoff, done_ch,
+                  std::move(fr.conn), std::move(fr.fs_parts), fr.source_udp_port);
+    } else {
+      spawn_worker(wc, self.sources[i], st, total_timeout, max_retries, source_reconnect_backoff, done_ch);
     }
+  }
+
+  // Task 6: 只有存在服务器连接(有办法查更多源)才启动周期重问监督; 无服务器连接(如多数既有
+  // 单测/直接构造场景)时行为与 Task 6 之前完全一致——不启动监督, 下方收尾等待循环退化为原来的
+  // "等到 active_workers 归零"。supervisor_active 必须在 co_spawn 之前同步置位(而非等协程自己
+  // 跑到才置位), 避免下方收尾循环在监督协程真正开始执行前就误判"没有监督在跑"而提前退出。
+  if(self.server_conn){
+    st.supervisor_active = true;
     boost::asio::co_spawn(self.ex,
-      peer_worker(self.ex, self.sources[i], std::move(pre_conn), std::move(pre_parts), pre_udp_port, st,
-                  total_timeout, max_retries, self.server_conn, self.listener,
-                  self.ip_filter, self.ip_filter_level, self.obfuscation_policy,
-                  self.local_user_hash, done_ch),
+      source_reask_supervisor(wc, st, self.sources, total_timeout, max_retries,
+                              source_reask_interval, source_reconnect_backoff, done_ch),
       boost::asio::detached);
   }
-  // 收集 N 个完成信号 (worker 退出即 try_send; run 挂起在 async_receive, 网络线程跑 worker)。
-  // 错误经 st.first_err 传递 (worker 在 finish 内写入, 单网络线程无竞争)。
-  for(std::size_t i = 0; i < n_workers; ++i){
+
+  // 收尾等待: 按状态驱动(而非固定计数), 因为 supervisor 可能动态增补新 worker(active_workers
+  // 因此可能回升)。只要还有活跃 worker 或 supervisor 未退出, 就必须继续等待收完成信号——否则
+  // 它们持有的 SharedState& 会在本函数返回、st 析构后变成悬垂引用(worker/supervisor 各自退出前
+  // 的最后一步都是 try_send 一个 token, 因此每次能让本循环条件变化的状态转移都配对一次 token,
+  // 不会永久卡在 async_receive 上; 详见 worker finish()/supervisor 收尾处注释)。
+  // 结果判定沿用既有逻辑: complete 优先于 stopped, 其次上报 first_err(worker 里记录的首个错误)。
+  while(st.active_workers > 0 || st.supervisor_active){
     (void)co_await done_ch.async_receive(boost::asio::use_awaitable);
   }
   if(st.alloc.complete()) co_return tl::expected<void,std::error_code>{};

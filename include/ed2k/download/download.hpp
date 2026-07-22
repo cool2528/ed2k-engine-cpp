@@ -28,6 +28,14 @@ peer_identity_from_kad_source(const kad::KadSearchEntry& entry);
 // GUI 进度回调: (已完成字节, 总字节)。在网络线程触发, 调用方负责跨线程转投。
 using ProgressFn = std::function<void(std::uint64_t bytes_done, std::uint64_t total)>;
 
+// Task 6(源重试/重连 + 编排周期重问)的默认时间参数, 经 MultiSourceDownload::run() 的对应
+// 形参暴露(与既有 max_retries 同一模式: 生产调用方用默认值, 测试可传入更短的间隔避免真实
+// 等待, 无需为此新增 Builder 旋钮/破坏既有构造链)。
+// kSourceReaskInterval:   编排监督重新 get_sources 的周期(eMule 惯例"每隔几分钟重问服务器")。
+// kSourceReconnectBackoff: peer_worker 对同源 transient 失败重连前的退避等待(固定值, 非指数)。
+inline constexpr std::chrono::milliseconds kSourceReaskInterval{std::chrono::minutes(3)};
+inline constexpr std::chrono::milliseconds kSourceReconnectBackoff{5000};
+
 class Download {
  public:
   Download(boost::asio::any_io_executor ex, const std::filesystem::path& out,
@@ -127,7 +135,9 @@ class MultiSourceDownload {
   void set_disk_executor(boost::asio::any_io_executor ex);
 
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(
-    std::chrono::milliseconds total_timeout, std::size_t max_retries = 3);
+    std::chrono::milliseconds total_timeout, std::size_t max_retries = 3,
+    std::chrono::milliseconds source_reask_interval = kSourceReaskInterval,
+    std::chrono::milliseconds source_reconnect_backoff = kSourceReconnectBackoff);
 
   MultiSourceDownload(const MultiSourceDownload&) = delete;
   MultiSourceDownload& operator=(const MultiSourceDownload&) = delete;
