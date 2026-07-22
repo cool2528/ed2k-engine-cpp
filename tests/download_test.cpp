@@ -1487,6 +1487,50 @@ TEST(Download, DiskPoolIsSingleThreadByContract){
     << "PartFile f_ 由单 disk 线程串行访问; 改 >1 必须先加 strand";
 }
 
+// audit C1 (async 路径): write_block_async 是 MultiSourceDownload 生产主路径实际调用的写入,
+// 其 MD4 失败分支必须与 sync write_block 一样重置该 part 记账, 否则生产路径下载的损坏 part 永不可
+// 重验。镜像 PartFile.MD4MismatchResetsPartStateForRedownload 的场景, 但走 disk_executor 卸载路径。
+TEST(Download, AsyncWriteBlockMD4MismatchResetsPartState){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_async_md4_reset"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  std::vector<std::byte> correct(PART, std::byte(0x11));
+  std::vector<std::byte> corrupt(PART, std::byte(0xFF));   // 内容不同 -> 组装后 MD4 与期望不符
+  crypto::MD4 m; m.update(correct);
+  auto h0 = PartHash::from_bytes(m.finish());              // part 真实期望 hash (仅 correct 能通过)
+  IoRuntime rt;
+  {
+  PartFile pf(path, PART, *FileHash::from_hex("00112233445566778899aabbccddeeff"), {h0});
+  const std::size_t nb = static_cast<std::size_t>((PART + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    // 1) async 写入损坏数据全部块: 末块攒满触发 disk 线程 readback+MD4, 应失败并重置。
+    for(std::size_t b=0; b<nb; ++b){
+      std::uint64_t s = b*AICH_BLOCK_SIZE, e = std::min(s+AICH_BLOCK_SIZE, PART);
+      auto w = co_await pf.write_block_async(s, e,
+                     std::span(corrupt).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)),
+                     rt.disk_executor());
+      if(b+1 == nb) EXPECT_FALSE(w.has_value()) << "async 末块应触发 MD4 校验并因内容损坏失败";
+    }
+    EXPECT_FALSE(pf.complete());
+    // 2) 状态应被重置: 该 part 全部块重新变为未完成。
+    for(std::size_t b=0; b<nb; ++b)
+      EXPECT_FALSE(pf.is_block_done(0, b)) << "async: block " << b << " 应在 MD4 失败后被重置";
+    EXPECT_EQ(pf.pending_blocks().size(), nb) << "async: MD4 失败后该 part 全部块应重新待下载";
+    // 3) async 重下正确数据: 若 part_filled 未归零(bug), 累计永不再等于整 part, MD4 不再触发,
+    //    complete() 永久 false —— 本用例捕获的正是生产路径(write_block_async)的该回归。
+    for(std::size_t b=0; b<nb; ++b){
+      std::uint64_t s = b*AICH_BLOCK_SIZE, e = std::min(s+AICH_BLOCK_SIZE, PART);
+      auto w = co_await pf.write_block_async(s, e,
+                     std::span(correct).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)),
+                     rt.disk_executor());
+      EXPECT_TRUE(w.has_value()) << "async: block " << b << " 重下正确数据应成功";
+    }
+    EXPECT_TRUE(pf.complete()) << "async 重下正确数据后该 part 应重新通过 MD4 并整体完成";
+    co_return;
+  });
+  }
+  std::filesystem::remove_all(dir);
+}
+
 TEST(Download, LowIdSourceViaCallback){
   // M3 capstone: LowID source via server callback. MockServer 登录后读到客户端发来的
   // CALLBACKREQUEST(source.id=0x100), 即刻 spawn 一个 MockPeer 主动连 InboundListener

@@ -255,7 +255,17 @@ PartFile::Impl::write_block_async(std::uint64_t start, std::uint64_t end, std::s
                         if(PartHash::from_bytes(m.finish()) != part_hashes[p]) corrupt = true; } }
     co_await boost::asio::post(net_ex, boost::asio::bind_executor(net_ex, boost::asio::use_awaitable));    // 回网络线程
     if(iofail) co_return tl::unexpected(make_error_code(errc::io_error));
-    if(corrupt) co_return tl::unexpected(make_error_code(errc::block_corrupt));
+    if(corrupt){
+      // audit C1 (镜像 sync write_block): MD4 不符 = 已写字节损坏。此刻已回到网络线程(状态仅网络线程
+      // 变更, 见本函数顶部注释), 重置该 part 记账(block_done 全 false + part_filled 归零 + part_done
+      // 置 false), 使全部块可重下重验; 否则 :218 的幂等短路会让重下同批块被静默丢弃 —— 损坏字节永久
+      // 留盘、该 part 永不可验。仅重置内存记账, 不动盘上字节(重下块写入自然覆盖)。write_block_async 是
+      // MultiSourceDownload 生产主路径实际调用的写入, 必须与 sync write_block 同样重置才算 C1 完整。
+      block_done[p].assign(blocks_in_part(p), false);
+      part_filled[p] = 0;
+      part_done[p] = false;
+      co_return tl::unexpected(make_error_code(errc::block_corrupt));
+    }
     part_done[p] = true;
     save_met();   // M2: 网络线程同步写 met (小文件)
   }
