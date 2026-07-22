@@ -84,6 +84,21 @@ BlockAllocator::next_block_for_parts(const std::vector<bool>& has_part) {
   return std::nullopt;
 }
 
+// 审计 C6: 连续调用 next_block_for_parts 最多 max_count 次, 遇 nullopt(源耗尽)提前停止。
+// 不做任何"凑数"或失败回滚——每个返回项都已从 pending_ 移出(与 next_block_for_parts 单块语义
+// 一致), 调用方对未被实际服务的项负责 requeue_block。
+std::vector<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>>
+BlockAllocator::next_blocks_for_parts(const std::vector<bool>& has_part, std::size_t max_count) {
+  std::vector<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>> out;
+  out.reserve(max_count);
+  for (std::size_t i = 0; i < max_count; ++i) {
+    auto nb = next_block_for_parts(has_part);
+    if (!nb) break;
+    out.push_back(*nb);
+  }
+  return out;
+}
+
 bool BlockAllocator::complete() const {
   for (const auto& pv : done_) {
     for (bool b : pv) {

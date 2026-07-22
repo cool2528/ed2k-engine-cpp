@@ -26,6 +26,12 @@
 #include <boost/asio/steady_timer.hpp>
 namespace ed2k::download {
 namespace {
+// 审计 C6 (3-block 请求流水线): eD2k REQUESTPARTS 固定携带 3 个 (start,end) 槽位, eMule 标准做法
+// 是尽量填满这 3 槽 —— 单次往返换回最多 3 个块(相比逐块一次往返一个块, 同一源上约 3 倍吞吐:
+// 每 3*AICH_BLOCK_SIZE≈540KiB 一次 RTT, 而非每 AICH_BLOCK_SIZE≈180KiB 一次)。dispatch_blocks_phase
+// (单源 legacy 路径) 与 pull_blocks_phase (raccoon 多源路径) 共用同一深度。
+inline constexpr std::size_t kPipelineDepth = 3;
+
 kad::KadID kad_id_from_hash(const FileHash& hash) {
   return kad::KadID::from_bytes(hash.bytes());
 }
@@ -175,38 +181,70 @@ dispatch_blocks_phase(peer::C2CConnection& conn,
   // MultiSourceDownload::pull_blocks_phase 的 large_file 判定同一阈值/同一 request_blocks_i64
   // 编解码路径(该路径已被 Beyond4GiBBoundaryRoundTrip 验证), 此处复用而非另造一套编码。
   const bool large_file = size > (std::uint64_t(1) << 32);
-  // per-part 块迭代: 块绝不跨 part 边界, 与 aMule 两级树 per-part 叶序一致。
   std::size_t np = data_part_count(size);
-  for(std::size_t p=0; p<np; ++p){
-    if(p >= need_part.size() || !need_part[p]) continue;
-    std::uint64_t pstart = static_cast<std::uint64_t>(p) * PART_SIZE;
-    std::uint64_t plen = std::min(PART_SIZE, size - pstart);
-    std::size_t nb = static_cast<std::size_t>((plen + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
-    for(std::size_t b=0; b<nb; ++b){
-      if(pf.is_block_done(p, b)) continue;
-      std::uint64_t start = pstart + static_cast<std::uint64_t>(b) * AICH_BLOCK_SIZE;
+
+  // 审计 C6: 本路径 (单源 legacy Download::run) 没有 BlockAllocator, 用本地游标 (cur_p, cur_b)
+  // 顺序产出下一个待下载块 —— 跳过对端没有/已完成的 part 及已下载块, 绝不跨 part 边界(与
+  // aMule 两级树 per-part 叶序一致)。批量凑齐最多 kPipelineDepth 个块后一次性发起单个
+  // REQUESTPARTS(而非每块一次往返), 与 pull_blocks_phase 的 BlockAllocator::next_blocks_for_parts
+  // 同一流水线思路; 单源顺序消费, 无并发, 不需要共享队列。
+  std::size_t cur_p = 0, cur_b = 0;
+  auto next_pending = [&]() -> std::optional<std::tuple<std::size_t,std::size_t,std::uint64_t,std::uint64_t>> {
+    while(cur_p < np){
+      if(cur_p >= need_part.size() || !need_part[cur_p]){ ++cur_p; cur_b = 0; continue; }
+      std::uint64_t pstart = static_cast<std::uint64_t>(cur_p) * PART_SIZE;
+      std::uint64_t plen = std::min(PART_SIZE, size - pstart);
+      std::size_t nb = static_cast<std::size_t>((plen + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE);
+      if(cur_b >= nb){ ++cur_p; cur_b = 0; continue; }
+      if(pf.is_block_done(cur_p, cur_b)){ ++cur_b; continue; }
+      std::uint64_t start = pstart + static_cast<std::uint64_t>(cur_b) * AICH_BLOCK_SIZE;
       std::uint64_t end = std::min(start + AICH_BLOCK_SIZE, pstart + plen);
-      std::vector<peer::Block> blocks_vec;
-      if(large_file){
-        auto blocks = co_await conn.request_blocks_i64(hash,
-          std::array<std::uint64_t,3>{start,0,0},
-          std::array<std::uint64_t,3>{end,0,0},
-          timeout);
-        if(!blocks) co_return tl::unexpected(blocks.error());
-        blocks_vec = std::move(*blocks);
-      } else {
-        auto blocks = co_await conn.request_blocks(hash,
-          std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start),0,0},
-          std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end),0,0},
-          timeout);
-        if(!blocks) co_return tl::unexpected(blocks.error());
-        blocks_vec = std::move(*blocks);
+      auto result = std::make_tuple(cur_p, cur_b, start, end);
+      ++cur_b;
+      return result;
+    }
+    return std::nullopt;
+  };
+
+  for(;;){
+    std::vector<std::tuple<std::size_t,std::size_t,std::uint64_t,std::uint64_t>> batch;
+    batch.reserve(kPipelineDepth);
+    while(batch.size() < kPipelineDepth){
+      auto nb = next_pending();
+      if(!nb) break;
+      batch.push_back(*nb);
+    }
+    if(batch.empty()) break;   // 该 part 位图内全部块均已下载完成
+
+    std::array<std::uint64_t,3> starts64{0,0,0}, ends64{0,0,0};
+    for(std::size_t i=0;i<batch.size();++i){
+      starts64[i] = std::get<2>(batch[i]);
+      ends64[i] = std::get<3>(batch[i]);
+    }
+
+    std::vector<peer::Block> blocks_vec;
+    if(large_file){
+      auto blocks = co_await conn.request_blocks_i64(hash, starts64, ends64, timeout);
+      if(!blocks) co_return tl::unexpected(blocks.error());
+      blocks_vec = std::move(*blocks);
+    } else {
+      std::array<std::uint32_t,3> starts32{0,0,0}, ends32{0,0,0};
+      for(std::size_t i=0;i<3;++i){
+        starts32[i] = static_cast<std::uint32_t>(starts64[i]);
+        ends32[i] = static_cast<std::uint32_t>(ends64[i]);
       }
-      if(blocks_vec.empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
-      for(auto& b2 : blocks_vec){
-        auto w = pf.write_block(b2.start, b2.end, b2.data);
-        if(!w) co_return tl::unexpected(w.error());
-      }
+      auto blocks = co_await conn.request_blocks(hash, starts32, ends32, timeout);
+      if(!blocks) co_return tl::unexpected(blocks.error());
+      blocks_vec = std::move(*blocks);
+    }
+    if(blocks_vec.empty()) co_return tl::unexpected(make_error_code(errc::io_error));   // 避免空响应死循环
+    // 审计 C7 concern(留后续任务处理, 本任务只需不崩溃): 本路径没有 BlockAllocator 式的重排队列,
+    // 若源只服务了批次中的一部分区间(如提前 OUTOFPARTREQS), 未被服务的区间在此被静默跳过、
+    // 不再重试 —— 与本函数修复前"任何空响应即 io_error 硬失败"一样保守(不会误报成功: 该区间
+    // 的字节永远不会写入, pf.complete() 最终会如实反映未完成)。真正的重排/换源重试是 C7 范围。
+    for(auto& b2 : blocks_vec){
+      auto w = pf.write_block(b2.start, b2.end, b2.data);
+      if(!w) co_return tl::unexpected(w.error());
     }
   }
   co_return tl::expected<void,std::error_code>{};
@@ -667,68 +705,123 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
   std::vector<bool> servable = normalize_file_status_parts(std::move(fs_parts), st.size);
   bool large_file = st.size > (std::uint64_t(1) << 32);
   std::size_t retry = 0;
+  using PendingBlock = std::tuple<std::size_t,std::size_t,std::uint64_t,std::uint64_t>;
+  auto part_of = [](const PendingBlock& p) { return std::get<0>(p); };
+  auto block_of = [](const PendingBlock& p) { return std::get<1>(p); };
+  auto start_of = [](const PendingBlock& p) { return std::get<2>(p); };
+  auto end_of = [](const PendingBlock& p) { return std::get<3>(p); };
+
   while(!st.alloc.complete()){
     if(st.complete) break;
     if(st.stopped()) co_return tl::unexpected(make_error_code(errc::cancelled));
-    auto nb = st.alloc.next_block_for_parts(servable);
-    if(!nb){
+    // 审计 C6: 一次性分配最多 kPipelineDepth(3) 个可服务块, 装进单个 REQUESTPARTS 的 3 个槽位——
+    // 一次往返换回最多 3 块, 而非逐块往返(eMule 标准 3-block 流水线, ~3x 吞吐)。批次内的块可能
+    // 跨越不同 part(与真实 eMule GetNextRequestedBlock 一致), 单块本身仍不跨 part 边界。
+    auto batch = st.alloc.next_blocks_for_parts(servable, kPipelineDepth);
+    if(batch.empty()){
       // 无对端可服务块 = 源耗尽。若已完成 → 成功退出; 仅剩我一人且未完成 → io_error;
       // 否则正常退出, 余块由兄弟 worker 处理。
       if(st.complete) co_return tl::expected<void,std::error_code>{};
       if(st.active_workers <= 1) co_return tl::unexpected(make_error_code(errc::io_error));
       co_return tl::expected<void,std::error_code>{};
     }
-    auto [part_index, block_in_part, start_byte, end_byte] = *nb;
+
+    std::array<std::uint64_t,3> starts64{0,0,0}, ends64{0,0,0};
+    for(std::size_t i=0;i<batch.size();++i){
+      starts64[i] = start_of(batch[i]);
+      ends64[i] = end_of(batch[i]);
+    }
 
     std::vector<ed2k::peer::Block> blocks;
     if(large_file){
-      auto r = co_await conn.request_blocks_i64(st.hash,
-        std::array<std::uint64_t,3>{start_byte,0,0}, std::array<std::uint64_t,3>{end_byte,0,0}, timeout);
-      if(!r){ st.alloc.requeue_block(part_index, block_in_part); co_return tl::unexpected(r.error()); }
+      auto r = co_await conn.request_blocks_i64(st.hash, starts64, ends64, timeout);
+      if(!r){
+        for(auto& pb : batch) st.alloc.requeue_block(part_of(pb), block_of(pb));   // 整批未发出, 全部退回
+        co_return tl::unexpected(r.error());
+      }
       blocks = std::move(*r);
     } else {
-      auto r = co_await conn.request_blocks(st.hash,
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(start_byte),0,0},
-        std::array<std::uint32_t,3>{static_cast<std::uint32_t>(end_byte),0,0}, timeout);
-      if(!r){ st.alloc.requeue_block(part_index, block_in_part); co_return tl::unexpected(r.error()); }
+      std::array<std::uint32_t,3> starts32{0,0,0}, ends32{0,0,0};
+      for(std::size_t i=0;i<3;++i){
+        starts32[i] = static_cast<std::uint32_t>(starts64[i]);
+        ends32[i] = static_cast<std::uint32_t>(ends64[i]);
+      }
+      auto r = co_await conn.request_blocks(st.hash, starts32, ends32, timeout);
+      if(!r){
+        for(auto& pb : batch) st.alloc.requeue_block(part_of(pb), block_of(pb));
+        co_return tl::unexpected(r.error());
+      }
       blocks = std::move(*r);
     }
-    if(blocks.empty()){
-      // 对端声称有该 part 但未供块 (部分 part) → 标该 part 不可服务 + requeue, 试别块。
-      servable[part_index] = false;
-      st.alloc.requeue_block(part_index, block_in_part);
-      continue;
-    }
 
-    for(auto& b : blocks){
+    // 审计 C7 (留后续任务处理, 本任务只需不崩溃): 按 (start,end) 精确匹配把返回的 Block 对回
+    // 批次里的 (part, block_in_part) —— accumulate_blocks 对每个"完成"区间回填的正是请求时的原始
+    // start/end(见 c2c_connection.cpp consume_block/accumulate_blocks 末尾构造), 故精确匹配可靠,
+    // 且不依赖返回顺序与批次顺序一致(批次中间某个区间提前 OUTOFPARTREQS 未被服务时, 后续区间仍可能
+    // 正常送达, 顺序假设会误判)。未匹配到的项 = 对端未服务该区间, 标其 part 不可服务 + requeue,
+    // 不致命、继续处理批次内其它已到达的块。
+    std::size_t next_unprocessed = batch.size();   // 若无提前退出, 视为"批次已全部处理完"
+    bool early_exit = false;
+    std::error_code early_ec;
+    for(std::size_t i = 0; i < batch.size(); ++i){
+      auto& pb = batch[i];
+      auto it = std::find_if(blocks.begin(), blocks.end(), [&](const ed2k::peer::Block& b){
+        return b.start == start_of(pb) && b.end == end_of(pb);
+      });
+      if(it == blocks.end()){
+        servable[part_of(pb)] = false;
+        st.alloc.requeue_block(part_of(pb), block_of(pb));
+        continue;
+      }
+      ed2k::peer::Block& b = *it;
       // C2 先验证后写入: AICH 启用时先拉 proof + verify_block, 通过才写盘;
       // 校验失败 requeue 同源重试, 超 max_retries 返回 block_corrupt 让该源退出 (块回队列, 他源可取)。
       if(aich_active){
         auto rd = co_await conn.request_aich_proof(st.hash, *st.aich,
-                                                   static_cast<std::uint16_t>(part_index), timeout);
+                                                   static_cast<std::uint16_t>(part_of(pb)), timeout);
         // 架构决策#4 (review 修复): 等 AICH proof 期间也可能中途收到 QUEUERANKING——
         // request_aich_proof 内部走 pump_until, 对 QUEUERANKING 早已映射为 errc::upload_queued
-        // (c2c_connection.cpp pump_until)。与下方 request_blocks(_i64) 分支同款: 原样传播该错误
+        // (c2c_connection.cpp pump_until)。与上方 request_blocks(_i64) 分支同款: 原样传播该错误
         // 给 peer_worker 的循环回 queue_wait_phase 重新排队, 而不是落入下面"校验失败"分支当作
-        // 数据损坏计入 max_retries——否则会在重试耗尽后误判为 block_corrupt 放弃该源。
+        // 数据损坏计入 max_retries——否则会在重试耗尽后误判为 block_corrupt 放弃该源。批次里排在
+        // 后面、尚未处理到的块在下面统一 requeue(不丢失)。
         if(!rd && rd.error() == make_error_code(errc::upload_queued)){
-          st.alloc.requeue_block(part_index, block_in_part);
-          co_return tl::unexpected(rd.error());
+          st.alloc.requeue_block(part_of(pb), block_of(pb));
+          early_ec = rd.error(); early_exit = true; next_unprocessed = i + 1; break;
         }
         bool ok = false;
-        if(rd) ok = st.checker->verify_block(part_index, block_in_part, b.data,
+        if(rd) ok = st.checker->verify_block(part_of(pb), block_of(pb), b.data,
                                              std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
         if(!ok){
-          st.alloc.requeue_block(part_index, block_in_part);
-          if(++retry > max_retries) co_return tl::unexpected(make_error_code(errc::block_corrupt));
-          break;   // 同源重下该块 (next_block_for_parts 会再取到 requeue 的块或下一可服务块)
+          st.alloc.requeue_block(part_of(pb), block_of(pb));
+          if(++retry > max_retries){
+            early_ec = make_error_code(errc::block_corrupt); early_exit = true; next_unprocessed = i + 1; break;
+          }
+          // 同源重下该块(已 requeue, next_blocks_for_parts 之后会再取到)——继续处理批次里
+          // 已到达的下一块, 不能整批放弃(会丢弃已成功接收但尚未写盘的其它块数据)。
+          continue;
         }
       }
       auto w = co_await st.pf.write_block_async(b.start, b.end, b.data, st.disk_ex);
-      if(!w){ st.alloc.requeue_block(part_index, block_in_part); co_return tl::unexpected(w.error()); }
+      if(!w){
+        st.alloc.requeue_block(part_of(pb), block_of(pb));
+        early_ec = w.error(); early_exit = true; next_unprocessed = i + 1; break;
+      }
       st.add_progress(b.end - b.start);
-      if(st.alloc.mark_block_done(part_index, block_in_part)){ st.mark_complete(); break; }
+      if(st.alloc.mark_block_done(part_of(pb), block_of(pb))){
+        // 整文件已完成: 批次里不可能还有其它尚未标 done 的块(它们此刻仍是本 worker 独占的本地
+        // 状态, complete() 扫描到它们为 false 就不会在此提前返回 true)——无需继续本批次。
+        st.mark_complete();
+        break;
+      }
       retry = 0;   // 成功一块, 重置同源重试计数
+    }
+    if(early_exit){
+      // 提前退出前尚未轮到处理的批次剩余项(若有)也必须 requeue —— 否则这些已从 pending_ 弹出、
+      // 但从未写盘也从未 requeue 的块会永久丢失(既不在 done_ 也不在 pending_ 里)。
+      for(std::size_t j = next_unprocessed; j < batch.size(); ++j)
+        st.alloc.requeue_block(part_of(batch[j]), block_of(batch[j]));
+      co_return tl::unexpected(early_ec);
     }
   }
   co_return tl::expected<void,std::error_code>{};

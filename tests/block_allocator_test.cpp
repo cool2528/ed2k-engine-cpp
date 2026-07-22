@@ -127,3 +127,56 @@ TEST(BlockAllocator, RequeueBlock){
   }
   EXPECT_GE(seen, 1u);
 }
+
+// 审计 C6 (3-block 流水线): next_blocks_for_parts 应等价于连续调用 3 次 next_block_for_parts,
+// 按 FIFO 顺序一次性取出最多 3 个块, 且第二次调用应取到紧随其后的下 3 个(队列不重复/不遗漏)。
+TEST(BlockAllocator, NextBlocksForPartsReturnsUpToMaxCountInFifoOrder){
+  std::vector<PartHash> ph;
+  ph.push_back(*PartHash::from_hex("00112233445566778899aabbccddeeff"));
+  ph.push_back(*PartHash::from_hex("112233445566778899aabbccddeeff00"));
+  BlockAllocator a{PART*2, ph, std::nullopt};   // 2 part, 106 块
+  std::vector<bool> has_part{true, true};
+
+  auto batch1 = a.next_blocks_for_parts(has_part, 3);
+  ASSERT_EQ(batch1.size(), 3u);
+  EXPECT_EQ(std::get<0>(batch1[0]), 0u); EXPECT_EQ(std::get<1>(batch1[0]), 0u);
+  EXPECT_EQ(std::get<0>(batch1[1]), 0u); EXPECT_EQ(std::get<1>(batch1[1]), 1u);
+  EXPECT_EQ(std::get<0>(batch1[2]), 0u); EXPECT_EQ(std::get<1>(batch1[2]), 2u);
+
+  // 第二批紧随其后, 无重复/无遗漏(FIFO 队列语义: 前一批已从 pending_ 移出)。
+  auto batch2 = a.next_blocks_for_parts(has_part, 3);
+  ASSERT_EQ(batch2.size(), 3u);
+  EXPECT_EQ(std::get<1>(batch2[0]), 3u);
+  EXPECT_EQ(std::get<1>(batch2[1]), 4u);
+  EXPECT_EQ(std::get<1>(batch2[2]), 5u);
+}
+
+// 队列剩余不足 max_count 时应如实返回较少数量(不为凑数返回空/重复块), 耗尽后返回空。
+TEST(BlockAllocator, NextBlocksForPartsReturnsFewerWhenQueueRunsOutThenEmpty){
+  std::vector<PartHash> ph;
+  ph.push_back(*PartHash::from_hex("00112233445566778899aabbccddeeff"));
+  BlockAllocator a{AICH_BLOCK*2, ph, std::nullopt};   // 1 part, 恰 2 整块
+  std::vector<bool> has_part{true};
+
+  auto batch1 = a.next_blocks_for_parts(has_part, 3);
+  ASSERT_EQ(batch1.size(), 2u) << "只有 2 块可分配, 不应凑数到 3";
+  EXPECT_EQ(std::get<1>(batch1[0]), 0u);
+  EXPECT_EQ(std::get<1>(batch1[1]), 1u);
+
+  auto batch2 = a.next_blocks_for_parts(has_part, 3);
+  EXPECT_TRUE(batch2.empty()) << "源已耗尽, 不应返回任何块";
+}
+
+// has_part 过滤应在批次内生效: part0 对该源不可服务(FIFO 队首却是 part0)时, 批次应只含
+// part1 的块(与 next_block_for_parts 单块语义一致, 不可服务块被重入队尾而非返回)。
+TEST(BlockAllocator, NextBlocksForPartsSkipsUnavailablePartsWithinBatch){
+  std::vector<PartHash> ph;
+  ph.push_back(*PartHash::from_hex("00112233445566778899aabbccddeeff"));
+  ph.push_back(*PartHash::from_hex("112233445566778899aabbccddeeff00"));
+  BlockAllocator a{PART*2, ph, std::nullopt};
+  std::vector<bool> has_part{false, true};   // 只有 part1 对该源可服务
+
+  auto batch = a.next_blocks_for_parts(has_part, 3);
+  ASSERT_EQ(batch.size(), 3u);
+  for(const auto& b : batch) EXPECT_EQ(std::get<0>(b), 1u) << "part0 不可服务, 批次应全部来自 part1";
+}

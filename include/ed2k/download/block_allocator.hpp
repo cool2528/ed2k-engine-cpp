@@ -35,6 +35,16 @@ class BlockAllocator {
   std::optional<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>>
     next_block_for_parts(const std::vector<bool>& has_part);
 
+  // 审计 C6 (3-block 请求流水线): 一次性分配最多 max_count 个可服务块, 语义等价于连续调用
+  // 最多 max_count 次 next_block_for_parts, 直至源耗尽(某次返回 nullopt)或凑满 max_count —— 队列
+  // 剩余不足 max_count 时如实返回较少数量(从不为凑数返回空/重复块)。返回的块之间不保证同属一个
+  // part(与真实 eMule GetNextRequestedBlock 一致, 允许跨 part 打包进同一次 REQUESTPARTS); 每个块
+  // 本身仍遵循 next_block_for_parts 的不跨 part 边界约束。返回顺序 = 分配顺序(调用方按此顺序把
+  // (start,end) 填入 REQUESTPARTS 的 3 个槽位)。调用方需在这些块失败/未被服务时自行 requeue_block
+  // (本函数不做失败回滚——分配即从 pending_ 移出, 与既有 next_block_for_parts 语义一致)。
+  std::vector<std::tuple<std::size_t, std::size_t, std::uint64_t, std::uint64_t>>
+    next_blocks_for_parts(const std::vector<bool>& has_part, std::size_t max_count);
+
   // Is entire file complete?
   bool complete() const;
 

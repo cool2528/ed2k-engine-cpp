@@ -199,16 +199,22 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf, 
     if(body.empty()){ co_await keep_alive(s); co_return; }
     codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
     (void)r.hash16();                                    // 文件 hash
-    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
-    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
-    (void)s1;(void)s2;(void)e1;(void)e2;
-    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-    // flat 切片: [s0,e0) 可能跨 part 边界, 直接从 full 取
-    std::size_t off = static_cast<std::size_t>(s0);
-    std::size_t len = static_cast<std::size_t>(e0 - s0);
-    codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
-    w.blob(std::span<const std::byte>(full).subspan(off, len));
-    co_await send_pkt(s, op::SENDINGPART, w.take());
+    // 审计 C6: 单次 REQUESTPARTS 最多携带 3 个真实区间(流水线), 逐槽解出后各自回 SENDINGPART
+    // (占位槽位 start==end==0 跳过), 而非只读槽0/忽略槽1-2(否则生产侧新的 3-block 批量请求会
+    // 卡在等永远不会到来的槽1/槽2 数据, 直到超时)。
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    for(std::size_t i=0;i<3;++i){
+      if(rs[i]==0 && re[i]==0) continue;
+      // flat 切片: [rs[i],re[i]) 可能跨 part 边界, 直接从 full 取
+      std::size_t off = static_cast<std::size_t>(rs[i]);
+      std::size_t len = static_cast<std::size_t>(re[i]-rs[i]);
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(rs[i]); w.u32(re[i]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
   }
   co_await keep_alive(s); co_return;
 }
@@ -240,15 +246,19 @@ static asio::awaitable<void> serve_full_peer_no_mule_ext(tcp::socket s, const Mo
     if(body.empty()){ co_await keep_alive(s); co_return; }
     codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
     (void)r.hash16();                                    // 文件 hash
-    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
-    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
-    (void)s1;(void)s2;(void)e1;(void)e2;
-    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-    std::size_t off = static_cast<std::size_t>(s0);
-    std::size_t len = static_cast<std::size_t>(e0 - s0);
-    codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
-    w.blob(std::span<const std::byte>(full).subspan(off, len));
-    co_await send_pkt(s, op::SENDINGPART, w.take());
+    // 审计 C6: 逐槽解出最多 3 个真实区间(见 serve_full_peer 同款注释), 各自回 SENDINGPART。
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    for(std::size_t i=0;i<3;++i){
+      if(rs[i]==0 && re[i]==0) continue;
+      std::size_t off = static_cast<std::size_t>(rs[i]);
+      std::size_t len = static_cast<std::size_t>(re[i]-rs[i]);
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(rs[i]); w.u32(re[i]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
   }
   co_await keep_alive(s); co_return;
 }
@@ -290,15 +300,19 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const std::vector<st
     if(body.empty()){ co_await keep_alive(s); co_return; }
     codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
     (void)r.hash16();                                    // 文件 hash
-    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
-    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
-    (void)s1;(void)s2;(void)e1;(void)e2;
-    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-    std::size_t off = static_cast<std::size_t>(s0);
-    std::size_t len = static_cast<std::size_t>(e0 - s0);
-    codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
-    w.blob(std::span<const std::byte>(full).subspan(off, len));
-    co_await send_pkt(s, op::SENDINGPART, w.take());
+    // 审计 C6: 逐槽解出最多 3 个真实区间(见 serve_full_peer(MockFile) 同款注释), 各自回 SENDINGPART。
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    for(std::size_t i=0;i<3;++i){
+      if(rs[i]==0 && re[i]==0) continue;
+      std::size_t off = static_cast<std::size_t>(rs[i]);
+      std::size_t len = static_cast<std::size_t>(re[i]-rs[i]);
+      codec::ByteWriter w; w.hash16(fhash); w.u32(rs[i]); w.u32(re[i]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
   }
   co_await keep_alive(s); co_return;
 }
@@ -363,20 +377,26 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
     }
     if(opcode == op::REQUESTPARTS){
       codec::ByteReader r(pl); (void)r.hash16();
-      std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
-      (void)s1;(void)s2;(void)e1;(void)e2;
-      if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-      std::size_t off = s0;
-      std::size_t len = e0 - s0;
-      std::vector<std::byte> d(full.begin()+off, full.begin()+off+len);
-      if(corrupt_block_n){
-        // corrupt_idx 为 part 内块号; part0 起始偏移 0 → s0/AICH_BLOCK_SIZE == part0 块号。
-        // part1 块号 = (s0-PART)/AICH_BLOCK_SIZE, 不会等于 part0 的 corrupt_idx。
-        std::size_t blkidx = s0 / AICH_BLOCK_SIZE;
-        if(blkidx == corrupt_idx) std::fill(d.begin(), d.end(), std::byte(0xFF));
+      // 审计 C6: 逐槽解出最多 3 个真实区间(见 serve_full_peer 同款注释), 各自按自己的 blkidx
+      // 判断是否命中 corrupt_idx 并回 SENDINGPART(不能只用槽0 的判定套用到其它槽位的数据)。
+      std::array<std::uint32_t,3> rs{}, re{};
+      for(auto& v : rs) v = r.u32();
+      for(auto& v : re) v = r.u32();
+      if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+      for(std::size_t i=0;i<3;++i){
+        if(rs[i]==0 && re[i]==0) continue;
+        std::size_t off = rs[i];
+        std::size_t len = re[i] - rs[i];
+        std::vector<std::byte> d(full.begin()+off, full.begin()+off+len);
+        if(corrupt_block_n){
+          // corrupt_idx 为 part 内块号; part0 起始偏移 0 → s0/AICH_BLOCK_SIZE == part0 块号。
+          // part1 块号 = (s0-PART)/AICH_BLOCK_SIZE, 不会等于 part0 的 corrupt_idx。
+          std::size_t blkidx = rs[i] / AICH_BLOCK_SIZE;
+          if(blkidx == corrupt_idx) std::fill(d.begin(), d.end(), std::byte(0xFF));
+        }
+        codec::ByteWriter w; w.hash16(mf.fhash); w.u32(rs[i]); w.u32(re[i]); w.blob(std::span<const std::byte>(d));
+        co_await send_pkt(s, op::SENDINGPART, w.take());
       }
-      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0); w.blob(std::span<const std::byte>(d));
-      co_await send_pkt(s, op::SENDINGPART, w.take());
       continue;
     }
     // other opcodes ignored
@@ -529,6 +549,89 @@ TEST(Download, BlockLevelSingleSource){
   std::filesystem::remove_all(dir);
 }
 
+// 审计 C6: 捕获每次收到的 REQUESTPARTS 的全部 3 个 (start,end) 槽位(不像其它 mock 那样只读
+// 槽0/丢弃槽1-2), 按批次对每个非零槽位各回一个 SENDINGPART —— 既能验证生产侧真正发出的槽位
+// 内容, 也对新旧两版生产代码都能正确供块(旧: 1 真 2 占位; 新: 最多 3 真)。
+struct CapturedBatchRequest { std::array<std::uint32_t,3> starts; std::array<std::uint32_t,3> ends; };
+static asio::awaitable<void> serve_full_peer_capturing_batches(
+    tcp::socket s, const MockFile& mf, std::vector<CapturedBatchRequest>& captured) {
+  using namespace ed2k::peer;
+  std::vector<std::byte> full;
+  full.insert(full.end(), mf.d0.begin(), mf.d0.end());
+  full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false);
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u16(2); w.hash16(mf.h0); w.hash16(mf.h1);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  (void)co_await read_frame(s);                          // REQUESTFILENAME
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+    co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+  (void)co_await read_frame(s); co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});  // STARTUPLOADREQ
+  for(;;){
+    auto body = co_await read_frame(s);                  // REQUESTPARTS
+    if(body.empty()){ co_await keep_alive(s); co_return; }
+    codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
+    (void)r.hash16();                                    // 文件 hash
+    std::array<std::uint32_t,3> starts{}, ends{};
+    for(auto& v : starts) v = r.u32();
+    for(auto& v : ends) v = r.u32();
+    if(starts[0]==0 && ends[0]==0){ co_await keep_alive(s); co_return; }
+    captured.push_back({starts, ends});
+    for(std::size_t i=0;i<3;++i){
+      if(starts[i]==0 && ends[i]==0) continue;           // 占位槽位: 跳过
+      std::size_t off = static_cast<std::size_t>(starts[i]);
+      std::size_t len = static_cast<std::size_t>(ends[i]-starts[i]);
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(starts[i]); w.u32(ends[i]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
+  }
+}
+
+// 审计 C6 (3-block 请求流水线, TDD RED/GREEN 核心测试): 单源、无 AICH、2-part(每 part 53 块,
+// 远多于 3) —— 断言首次 REQUESTPARTS 携带 3 个真实块区间(而非 1 真 2 占位), 且这 3 块完成后
+// 紧接着的下一次请求携带紧随其后的 3 块(块序单调、无重复/无跳过), 证明流水线保持 3 块在途。
+// 对当前(修复前)1-block-per-request 代码, count_real(captured[0]) 恒为 1, 本测试确定性 RED。
+TEST(Download, PullBlocksPhasePipelinesThreeBlocksPerRequestParts){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_pipeline3"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<CapturedBatchRequest> captured;
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_full_peer_capturing_batches(std::move(s), mf, captured); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(mf.fhash).size(PART*2).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peer.port()}}).build();
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    co_return;
+  });
+  auto count_real = [](const CapturedBatchRequest& req){
+    std::size_t n=0;
+    for(std::size_t i=0;i<3;++i) if(!(req.starts[i]==0 && req.ends[i]==0)) ++n;
+    return n;
+  };
+  ASSERT_GE(captured.size(), 2u) << "expected at least 2 REQUESTPARTS batches for a 106-block file";
+  EXPECT_EQ(count_real(captured[0]), 3u)
+      << "single REQUESTPARTS must carry 3 real block ranges when >=3 blocks are available "
+         "(eMule-standard pipelining), not 1 real + 2 zero-padding";
+  EXPECT_EQ(captured[0].starts[0], 0u);
+  EXPECT_EQ(captured[0].ends[2], 3u*AICH_BLOCK_SIZE);
+  EXPECT_EQ(count_real(captured[1]), 3u);
+  EXPECT_EQ(captured[1].starts[0], 3u*AICH_BLOCK_SIZE)
+      << "second batch must continue from where the first left off (blocks 3,4,5), not repeat/skip";
+  std::filesystem::remove_all(dir);
+}
+
 // === Task 5: peer_worker 排队等待集成 (P0) ===
 // 单 block/单 part 极简文件(1000 字节, 远小于 AICH_BLOCK_SIZE/PART_SIZE), 跳过 hashset(size<=
 // PART_SIZE)。EMULEINFO 故意不应答 -> source_udp_port()==0, 使排队等待循环走"纯 TCP 被动"分支
@@ -586,14 +689,19 @@ TEST(Download, WaitsInUploadQueueThenAcceptsAndDownloads){
       if(body.empty()) co_return;
       codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
       (void)r.hash16();
-      std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
-      std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
-      (void)s1;(void)s2;(void)e1;(void)e2;
-      if(s0==0 && e0==0) co_return;
-      std::size_t off = s0, len = e0 - s0;
-      codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
-      w.blob(std::span<const std::byte>(data).subspan(off, len));
-      co_await send_pkt(s, op::SENDINGPART, w.take());
+      // 审计 C6: 逐槽解出最多 3 个真实区间(本测试文件仅 1 块, 恒只有槽0非零, 但保持与其它
+      // mock 一致的通用处理, 不假设"只有槽0"这一现已过时的前提)。
+      std::array<std::uint32_t,3> rs{}, re{};
+      for(auto& v : rs) v = r.u32();
+      for(auto& v : re) v = r.u32();
+      if(rs[0]==0 && re[0]==0) co_return;
+      for(std::size_t i=0;i<3;++i){
+        if(rs[i]==0 && re[i]==0) continue;
+        std::size_t off = rs[i], len = re[i] - rs[i];
+        codec::ByteWriter w; w.hash16(fhash); w.u32(rs[i]); w.u32(re[i]);
+        w.blob(std::span<const std::byte>(data).subspan(off, len));
+        co_await send_pkt(s, op::SENDINGPART, w.take());
+      }
     };
     if(pending) co_await serve_one(*pending);   // 若确实提前收到(旧 bug 路径), 仍照常回块避免卡死
     for(;;){
@@ -792,13 +900,18 @@ TEST(Download, MidTransferQueueRankingDuringAichProofWaitReentersQueueWait){
       }
       if(opcode == op::REQUESTPARTS){
         codec::ByteReader r(pl); (void)r.hash16();
-        std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
-        (void)s1;(void)s2;(void)e1;(void)e2;
-        if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-        std::size_t off = s0, len = e0 - s0;
-        codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
-        w.blob(std::span<const std::byte>(data).subspan(off, len));
-        co_await send_pkt(s, op::SENDINGPART, w.take());
+        // 审计 C6: 逐槽解出最多 3 个真实区间(见 serve_full_peer 同款注释), 各自回 SENDINGPART。
+        std::array<std::uint32_t,3> rs{}, re{};
+        for(auto& v : rs) v = r.u32();
+        for(auto& v : re) v = r.u32();
+        if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+        for(std::size_t i=0;i<3;++i){
+          if(rs[i]==0 && re[i]==0) continue;
+          std::size_t off = rs[i], len = re[i] - rs[i];
+          codec::ByteWriter w; w.hash16(fhash); w.u32(rs[i]); w.u32(re[i]);
+          w.blob(std::span<const std::byte>(data).subspan(off, len));
+          co_await send_pkt(s, op::SENDINGPART, w.take());
+        }
         continue;
       }
       // 其它 opcode 忽略
@@ -1072,14 +1185,20 @@ static asio::awaitable<void> serve_subset_peer(tcp::socket s, const std::vector<
     if(body.empty()){ co_await keep_alive(s); co_return; }
     codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
     (void)r.hash16();
-    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
-    (void)s1;(void)s2;(void)e1;(void)e2;
-    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-    std::size_t off = static_cast<std::size_t>(s0);
-    std::size_t len = static_cast<std::size_t>(e0 - s0);
-    codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
-    w.blob(std::span<const std::byte>(full).subspan(off, len));
-    co_await send_pkt(s, op::SENDINGPART, w.take());
+    // 审计 C6: 逐槽解出最多 3 个真实区间(见 serve_full_peer 同款注释), 各自回 SENDINGPART
+    // (worker 经 next_blocks_for_parts 只请求对端有该 part 的块, 故仅会请求己有 part 的块)。
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    for(std::size_t i=0;i<3;++i){
+      if(rs[i]==0 && re[i]==0) continue;
+      std::size_t off = static_cast<std::size_t>(rs[i]);
+      std::size_t len = static_cast<std::size_t>(re[i]-rs[i]);
+      codec::ByteWriter w; w.hash16(fhash); w.u32(rs[i]); w.u32(re[i]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
   }
   co_await keep_alive(s); co_return;
 }
@@ -1254,14 +1373,18 @@ static asio::awaitable<void> serve_small_file_full(tcp::socket s, const FileHash
     if(body.empty()){ co_await keep_alive(s); co_return; }
     codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
     (void)r.hash16();
-    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
-    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
-    (void)s1;(void)s2;(void)e1;(void)e2;
-    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-    std::size_t off = s0, len = e0 - s0;
-    codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
-    w.blob(std::span<const std::byte>(data).subspan(off, len));
-    co_await send_pkt(s, op::SENDINGPART, w.take());
+    // 审计 C6: 逐槽解出最多 3 个真实区间(见 serve_full_peer 同款注释), 各自回 SENDINGPART。
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    for(std::size_t i=0;i<3;++i){
+      if(rs[i]==0 && re[i]==0) continue;
+      std::size_t off = rs[i], len = re[i] - rs[i];
+      codec::ByteWriter w; w.hash16(fhash); w.u32(rs[i]); w.u32(re[i]);
+      w.blob(std::span<const std::byte>(data).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
   }
 }
 
@@ -1574,14 +1697,20 @@ TEST(Download, MultiSourceAllocCompleteButPartFileIncompleteIsNotSuccess){
       if(body.empty()){ co_await keep_alive(s); co_return; }
       codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
       (void)r.hash16();
-      std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
-      (void)s1;(void)s2;(void)e1;(void)e2;
-      if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-      std::size_t off = s0, len = e0 - s0;
-      codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
-      if(static_cast<std::uint64_t>(off) == kCorruptOff) w.blob(std::span<const std::byte>(corrupt_block).subspan(0, len));
-      else w.blob(std::span<const std::byte>(data).subspan(off, len));
-      co_await send_pkt(s, op::SENDINGPART, w.take());
+      // 审计 C6: 逐槽解出最多 3 个真实区间(见 serve_full_peer 同款注释), 各自按自己的偏移判断
+      // 是否命中 kCorruptOff(不能只用槽0 的判定套用到其它槽位)。
+      std::array<std::uint32_t,3> rs{}, re{};
+      for(auto& v : rs) v = r.u32();
+      for(auto& v : re) v = r.u32();
+      if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+      for(std::size_t i=0;i<3;++i){
+        if(rs[i]==0 && re[i]==0) continue;
+        std::size_t off = rs[i], len = re[i] - rs[i];
+        codec::ByteWriter w; w.hash16(fhash); w.u32(rs[i]); w.u32(re[i]);
+        if(static_cast<std::uint64_t>(off) == kCorruptOff) w.blob(std::span<const std::byte>(corrupt_block).subspan(0, len));
+        else w.blob(std::span<const std::byte>(data).subspan(off, len));
+        co_await send_pkt(s, op::SENDINGPART, w.take());
+      }
     }
   };
 
@@ -1938,39 +2067,45 @@ static asio::awaitable<void> serve_boundary_part_peer(
     if(body.empty()) co_return;
     std::uint8_t opcode = std::to_integer<std::uint8_t>(body[0]);
     std::span<const std::byte> pl(body.data()+1, body.size()-1);
-    std::uint64_t s0, e0;
+    std::array<std::uint64_t,3> starts{}, ends{};
     if(opcode == op::REQUESTPARTS){
       codec::ByteReader r(pl); (void)r.hash16();
-      std::uint32_t rs0=r.u32(), rs1=r.u32(), rs2=r.u32();
-      std::uint32_t re0=r.u32(), re1=r.u32(), re2=r.u32();
-      (void)rs1;(void)rs2;(void)re1;(void)re2;
-      s0 = rs0; e0 = re0;
+      std::array<std::uint32_t,3> rs{}, re{};
+      for(auto& v : rs) v = r.u32();
+      for(auto& v : re) v = r.u32();
+      for(std::size_t i=0;i<3;++i){ starts[i] = rs[i]; ends[i] = re[i]; }
     } else if(opcode == op::REQUESTPARTS_I64){
       codec::ByteReader r(pl); (void)r.hash16();
-      std::uint64_t rs1, rs2, re1, re2;
-      s0=r.u64(); rs1=r.u64(); rs2=r.u64();
-      e0=r.u64(); re1=r.u64(); re2=r.u64();
-      (void)rs1;(void)rs2;(void)re1;(void)re2;
+      for(auto& v : starts) v = r.u64();
+      for(auto& v : ends) v = r.u64();
     } else {
       continue;                                          // 其它 opcode 忽略
     }
-    captured.push_back({opcode, s0, e0});
-    std::size_t len = static_cast<std::size_t>(e0 - s0);
-    std::vector<std::byte> d;
-    if(s0 >= bstart && e0 <= bstart + content.size()){
-      std::size_t off = static_cast<std::size_t>(s0 - bstart);
-      d.assign(content.begin()+off, content.begin()+off+len);
-    } else {
-      d.assign(len, std::byte{0});                        // 落在 content 范围外: 安全占位, 不越界
-    }
-    if(opcode == op::REQUESTPARTS_I64){
-      codec::ByteWriter w; w.hash16(fhash); w.u64(s0); w.u64(e0); w.blob(std::span<const std::byte>(d));
-      co_await send_pkt(s, op::SENDINGPART_I64, w.take(), proto::eMule);
-    } else {
-      codec::ByteWriter w; w.hash16(fhash);
-      w.u32(static_cast<std::uint32_t>(s0)); w.u32(static_cast<std::uint32_t>(e0));
-      w.blob(std::span<const std::byte>(d));
-      co_await send_pkt(s, op::SENDINGPART, w.take());
+    // 审计 C6: 单次 REQUESTPARTS(_I64) 最多携带 3 个真实区间(流水线批量请求)——逐个非占位槽位
+    // 各捕获一条 CapturedPartsRequest 并各回一个 SENDINGPART(_I64), 使既有断言
+    // captured.size()==expected_blocks(53, 一 part 满块数) 不受批量打包影响: 无论生产侧一次
+    // REQUESTPARTS 里塞了 1 个还是 3 个真实区间, 这里统计的始终是"总共请求到的块数"。
+    for(std::size_t i=0;i<3;++i){
+      if(starts[i]==0 && ends[i]==0) continue;
+      std::uint64_t s0 = starts[i], e0 = ends[i];
+      captured.push_back({opcode, s0, e0});
+      std::size_t len = static_cast<std::size_t>(e0 - s0);
+      std::vector<std::byte> d;
+      if(s0 >= bstart && e0 <= bstart + content.size()){
+        std::size_t off = static_cast<std::size_t>(s0 - bstart);
+        d.assign(content.begin()+off, content.begin()+off+len);
+      } else {
+        d.assign(len, std::byte{0});                        // 落在 content 范围外: 安全占位, 不越界
+      }
+      if(opcode == op::REQUESTPARTS_I64){
+        codec::ByteWriter w; w.hash16(fhash); w.u64(s0); w.u64(e0); w.blob(std::span<const std::byte>(d));
+        co_await send_pkt(s, op::SENDINGPART_I64, w.take(), proto::eMule);
+      } else {
+        codec::ByteWriter w; w.hash16(fhash);
+        w.u32(static_cast<std::uint32_t>(s0)); w.u32(static_cast<std::uint32_t>(e0));
+        w.blob(std::span<const std::byte>(d));
+        co_await send_pkt(s, op::SENDINGPART, w.take());
+      }
     }
   }
 }

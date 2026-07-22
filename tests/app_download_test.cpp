@@ -136,16 +136,22 @@ static asio::awaitable<void> serve_full_peer(tcp::socket s, const MockFile& mf){
     if(body.empty()){ co_await keep_alive(s); co_return; }
     codec::ByteReader r(std::span<const std::byte>(body).subspan(1));  // 跳过 opcode
     (void)r.hash16();                                    // 文件 hash
-    std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32();
-    std::uint32_t e0=r.u32(), e1=r.u32(), e2=r.u32();
-    (void)s1;(void)s2;(void)e1;(void)e2;
-    if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
-    // flat 切片: [s0,e0) 可能跨 part 边界, 直接从 full 取
-    std::size_t off = static_cast<std::size_t>(s0);
-    std::size_t len = static_cast<std::size_t>(e0 - s0);
-    codec::ByteWriter w; w.hash16(mf.fhash); w.u32(s0); w.u32(e0);
-    w.blob(std::span<const std::byte>(full).subspan(off, len));
-    co_await send_pkt(s, op::SENDINGPART, w.take());
+    // 审计 C6: 单次 REQUESTPARTS 最多携带 3 个真实区间(流水线), 逐槽解出后各自回 SENDINGPART
+    // (占位槽位 start==end==0 跳过), 而非只读槽0/忽略槽1-2(否则生产侧新的 3-block 批量请求会
+    // 卡在等永远不会到来的槽1/槽2 数据, 直到超时)。
+    std::array<std::uint32_t,3> rs{}, re{};
+    for(auto& v : rs) v = r.u32();
+    for(auto& v : re) v = r.u32();
+    if(rs[0]==0 && re[0]==0){ co_await keep_alive(s); co_return; }
+    for(std::size_t i=0;i<3;++i){
+      if(rs[i]==0 && re[i]==0) continue;
+      // flat 切片: [rs[i],re[i]) 可能跨 part 边界, 直接从 full 取
+      std::size_t off = static_cast<std::size_t>(rs[i]);
+      std::size_t len = static_cast<std::size_t>(re[i]-rs[i]);
+      codec::ByteWriter w; w.hash16(mf.fhash); w.u32(rs[i]); w.u32(re[i]);
+      w.blob(std::span<const std::byte>(full).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
   }
   co_await keep_alive(s); co_return;
 }
