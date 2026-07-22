@@ -477,6 +477,38 @@ TEST(Download, BlockCorruptFails){
   std::filesystem::remove_all(dir);
 }
 
+// audit C5: 恶意源伪造一份"自洽"的假 hashset —— HASHSETANSWER 前导 file_hash 字段如实回显请求的
+// mf.fhash(能通过 decode_hashset_answer 现有的 wire 级 file_hash 校验), 但两个 part hash 是攻击者
+// 就着自己伪造的数据(fake.d0/d1, 与真实内容 mf.d0/d1 完全不同)算出来的——彼此"自洽"(per-block
+// MD4 校验会通过, 因为实际服务的数据确实等于这两个 hash), 唯独拼接后的 MD4 不等于 mf.fhash(攻击
+// 者算不出第二原像)。修复前, 这份垃圾 hashset 会被直接采纳进 PartFile, 后续全部块校验都按这份
+// 错误基准走, 下载"成功"落地的其实是攻击者的伪造内容——这正是 C5 描述的完整性绕过(可用于污染
+// 诚实源的数据或为伪造内容洗白)。修复后应在 fetch_hashset_phase 里即被拒绝为 hash_mismatch,
+// 不采纳该 hashset。
+TEST(Download, FakeSelfConsistentHashsetRejected){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_hashset_fake"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  MockFile fake;
+  fake.d0.assign(PART, std::byte(0xAA));
+  fake.d1.assign(PART, std::byte(0xBB));
+  crypto::MD4 m; m.update(fake.d0); fake.h0 = PartHash::from_bytes(m.finish());
+  m = {}; m.update(fake.d1); fake.h1 = PartHash::from_bytes(m.finish());
+  fake.fhash = mf.fhash;   // 伪装成同一个"真实"文件: 前导字段回显请求 hash, 骗过既有 wire 级校验
+  ASSERT_NE(fake.h0, mf.h0); ASSERT_NE(fake.h1, mf.h1);   // 确认这确实是一份与真实 part hash 不同的伪造
+
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), fake); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    download::Download dl(rt.executor(), path, mf.fhash, PART*2, SourceEndpoint{0x0100007Fu, peer.port()});
+    auto r = co_await dl.run(5s);
+    EXPECT_FALSE(r.has_value()) << "fake self-consistent hashset must not be silently accepted";
+    if(!r) EXPECT_EQ(r.error(), make_error_code(errc::hash_mismatch));
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
 TEST(Download, BlockLevelSingleSource){
   // download 2-part file with block-level allocation (no AICH)
   auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_block"; std::filesystem::create_directories(dir);
@@ -1126,6 +1158,59 @@ TEST(Download, MultiSourceSingleSubsetFails){
                 .sources(std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}}).build();
     auto r = co_await dl.run(15s, 3);
     EXPECT_FALSE(r.has_value());   // 单源仅 part0 → part1 永远缺 → 源耗尽 → io_error
+    co_return;
+  });
+  std::filesystem::remove_all(dir);
+}
+
+// audit C5 mock: 恶意源——FILESTATUS/HASHSETANSWER 前导 file_hash 字段如实回显请求的 fhash(能过
+// decode_hashset_answer 现有的 wire 级校验), 但 HASHSETANSWER 里的两个 part hash 是攻击者随意
+// 伪造的值。fetch_hashset() 只走到 HASHSETANSWER 就返回(不会再发 REQUESTFILENAME/STARTUPLOADREQ),
+// 故这里发完 HASHSETANSWER 后 keep_alive 等客户端因 hash_mismatch 主动断开即可, 无需服务后续帧。
+static asio::awaitable<void> serve_fake_hashset_peer(tcp::socket s, const FileHash& fhash,
+                                                     const PartHash& fake_h0, const PartHash& fake_h1) {
+  using namespace ed2k::peer;
+  (void)co_await read_frame(s);                          // HELLO
+  { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+    co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+  co_await exchange_mule_mock(s, false);
+  (void)co_await read_frame(s);                          // SETREQFILEID
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(2); w.u8(0xFF); w.u8(0x03);  // 两 part 都有
+    co_await send_pkt(s, op::FILESTATUS, w.take()); }
+  (void)co_await read_frame(s);                          // HASHSETREQUEST
+  { codec::ByteWriter w; w.hash16(fhash); w.u16(2); w.hash16(fake_h0); w.hash16(fake_h1);
+    co_await send_pkt(s, op::HASHSETANSWER, w.take()); }
+  co_await keep_alive(s); co_return;
+}
+// audit C5 (多源场景): 首个源(A)提供伪造的 hashset(fhash 如实回显, part hash 伪造), 第二个源(B)
+// 提供真实 hashset + 完整数据。fetch_hashset() 的 setup 阶段应在 A 处因 hash_mismatch 被拒绝
+// (is_transient 判定其为 terminal, 不重连 A)、顺次尝试 B——B 合法, 下载改用 B 的 hashset 完成,
+// 证明"拒绝该源"不等于"拒绝整个下载"(还有其它源时应继续尝试), 且最终落盘内容必须是真实内容
+// (用真实 h0/h1 重新构造 PartFile 独立校验 complete())。
+TEST(Download, MultiSourceFakeHashsetSourceSkippedFallsBackToLegit){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_ms_hashset_fake"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  auto fake_h0 = *PartHash::from_hex("11111111111111111111111111111111");
+  auto fake_h1 = *PartHash::from_hex("22222222222222222222222222222222");
+  IoRuntime rt;
+  ed2k::test::MockPeer peerA(rt.context());   // A: 伪造 hashset
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_fake_hashset_peer(std::move(s), mf.fhash, fake_h0, fake_h1); co_return; });
+  ed2k::test::MockPeer peerB(rt.context());   // B: 真实 hashset + 完整数据
+  peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(mf.fhash).size(PART*2).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}, SourceEndpoint{0x0100007Fu, peerB.port()}})
+                .build();
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
     co_return;
   });
   std::filesystem::remove_all(dir);

@@ -7,6 +7,7 @@
 #include "ed2k/peer/peer_reask.hpp"
 #include "ed2k/net/udp_socket.hpp"
 #include "ed2k/util/error.hpp"
+#include "crypto/md4.hpp"
 #include <algorithm>
 #include <optional>
 #include <cassert>
@@ -105,6 +106,22 @@ std::vector<bool> normalize_file_status_parts(std::vector<bool> parts, std::uint
   return parts;
 }
 
+// 审计 C5: 校验收到的 hashset 是否与文件 hash 密码学一致 —— eD2k 协议定义多 part 文件的
+// file_hash = MD4(按序拼接的所有 part hash 字节)。首个应答源(或任一源)的 hashset 会被直接
+// 采纳为后续块级 MD4 校验的基准(见下方 fetch_hashset_phase/fetch_hashset/setup_source_phase);
+// 若不校验这层关系, 恶意源可以伪造一组"自洽"的假 part hash —— 攻击者就着自己伪造的数据计算出
+// 真实 MD4 当作这些假 hash, 使得后续逐块 MD4 校验对着伪造数据也能通过, 块级校验形同虚设。只要
+// MD4 具备抗第二原像性(攻击者找不出一组假 part hash, 使其拼接后的 MD4 恰好等于真实
+// file_hash), 这层校验就能挡下该伪造, 拒绝采纳并把该源当作坏源处理。
+// 仅在 size>PART_SIZE 时的多 part 分支调用(见各调用点的 if(size>PART_SIZE) 守卫); 单 part 文件
+// 完全不请求 hashset(part_hashes 为空, 由 PartFile 构造器自合成 {file_hash}), 不受影响。
+bool hashset_matches_file_hash(const FileHash& file_hash, const std::vector<PartHash>& part_hashes) {
+  std::vector<std::byte> concat;
+  concat.reserve(part_hashes.size() * 16);
+  for(const auto& p : part_hashes) for(auto b : p.bytes()) concat.push_back(b);
+  return FileHash::from_bytes(crypto::md4(concat)) == file_hash;
+}
+
 struct FileSetup {
   std::vector<PartHash> part_hashes;
   std::vector<bool> peer_parts;
@@ -123,6 +140,8 @@ fetch_hashset_phase(peer::C2CConnection& conn,
   if(size > PART_SIZE){
     auto hs = co_await conn.request_hashset(hash, timeout);
     if(!hs) co_return tl::unexpected(hs.error());
+    // 审计 C5: 拒绝拼接 MD4 与 file_hash 不符的伪造 hashset, 不采纳, 按坏源处理。
+    if(!hashset_matches_file_hash(hash, *hs)) co_return tl::unexpected(make_error_code(errc::hash_mismatch));
     part_hashes = std::move(*hs);
   }
   co_return FileSetup{std::move(part_hashes), normalize_file_status_parts(std::move(fs->parts), size)};
@@ -390,6 +409,9 @@ fetch_hashset(boost::asio::any_io_executor ex,
   if(size > PART_SIZE){
     auto hs = co_await conn_opt->request_hashset(hash, timeout);
     if(!hs) co_return tl::unexpected(hs.error());
+    // 审计 C5: 拒绝拼接 MD4 与 file_hash 不符的伪造 hashset, 不采纳, 按坏源处理(setup 循环会
+    // 顺次尝试下一源, 见 run() 里 fetch_hashset 的调用循环)。
+    if(!hashset_matches_file_hash(hash, *hs)) co_return tl::unexpected(make_error_code(errc::hash_mismatch));
     part_hashes = std::move(*hs);
   }
   FetchResult r;
@@ -594,10 +616,15 @@ setup_source_phase(boost::asio::any_io_executor ex,
   if(!hr) co_return tl::unexpected(hr.error());
   auto fs = co_await conn_opt->request_file(hash, timeout);
   if(!fs) co_return tl::unexpected(fs.error());
-  // 单 part 文件跳过 hashset (aMule 不应答); 多 part 文件仍请求 (mock 序列要求, 结果丢弃)。
+  // 单 part 文件跳过 hashset (aMule 不应答); 多 part 文件仍请求 (mock 序列要求, 结果丢弃 —— 该
+  // part_hashes 本身不会被采纳进任何 PartFile, 见 fetch_hashset 的"鸡生蛋"注释)。
+  // 审计 C5: 即便结果被丢弃, 仍需校验拼接 MD4 与 file_hash 一致, 否则说谎的源会被当作正常源
+  // 继续参与下载(其块数据仍受 PartFile 逐 part MD4 保护, 但迟迟才会在真正传块时才暴露, 不如
+  // 在 setup 阶段就把它当坏源直接拒绝)。
   if(size > PART_SIZE){
     auto hs = co_await conn_opt->request_hashset(hash, timeout);
     if(!hs) co_return tl::unexpected(hs.error());
+    if(!hashset_matches_file_hash(hash, *hs)) co_return tl::unexpected(make_error_code(errc::hash_mismatch));
   }
   co_return PeerSetup{std::move(*conn_opt), std::move(fs->parts), hr->mule_info.udp_port};
 }
