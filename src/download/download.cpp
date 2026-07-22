@@ -408,6 +408,12 @@ inline constexpr std::chrono::milliseconds kReaskRaceMargin{500};
 // 里 `++retry > max_retries` 的计数方式)。达到上限后彻底放弃该源(转交编排监督, 见下), 而不是
 // 无限重连同一个可能已经不可达的源。
 inline constexpr std::size_t kMaxSourceReconnect = 3;
+// 编排监督(source_reask_supervisor)的"无源可用"有界放弃阈值(Task 6 review 修复 Important#1):
+// 连续这么多轮周期重问都既没合并到新源、又没有 transient 重试源、且当前无任何活跃 worker(源已
+// 彻底耗尽, 服务器也提供不了新源)时, 监督退出、run() 以源耗尽错误(first_err/io_error)返回, 而不是
+// 永久挂在 downloading/0B/s 白占一个并发下载槽。取 3(配合默认 3 分钟周期≈最多多等 ~9 分钟)给晚到
+// 的源留机会但有上界; 任一进展(合并到新源、有重试源、或仍有活跃 worker)即把计数清零重新计。
+inline constexpr std::size_t kMaxEmptyReaskCycles = 3;
 // 可取消等待(退避重连 / 监督重问定时器)的轮询切片粒度: 与其一次性睡满整段时长, 不如切成短片段
 // 循环, 每片之间重新检查 st.stopped()/st.alloc.complete()——保证 cancel/shutdown 或"文件已被
 // 其它源下完"能在一个切片内被发现, 而不是被整段退避/3 分钟定时器"吞掉"。取值参考本文件既有的
@@ -796,7 +802,7 @@ run_source_session(ed2k::peer::C2CConnection& conn, SharedState& st, std::vector
 // 完成由 st.complete 判定 (最后一块 mark_done 置位)。
 static boost::asio::awaitable<void>
 peer_worker(boost::asio::any_io_executor ex,
-            const ed2k::peer::PeerIdentity& source,
+            ed2k::peer::PeerIdentity source,   // 按值: 协程帧独立持有, 跨自身所有挂起点(重连退避)有效
             std::optional<ed2k::peer::C2CConnection> pre_conn,
             std::vector<bool> pre_parts,
             std::uint16_t pre_udp_port,
@@ -902,11 +908,13 @@ source_reask_supervisor(WorkerContext wc, SharedState& st,
                         std::chrono::milliseconds reask_interval,
                         std::chrono::milliseconds reconnect_backoff,
                         ResultCh& done_ch){
+  std::size_t empty_cycles = 0;   // 连续"无源可用"空转轮数(Task 6 review 修复 Important#1)
   for(;;){
     co_await cancellable_wait(st, wc.ex, reask_interval);
     if(st.stopped() || st.alloc.complete()) break;
     if(!wc.server_conn) break;   // 防御性: run() 只在有值时才会启动本协程, 正常不会走到这里
 
+    std::size_t spawned_this_cycle = 0;   // 本轮实际增补(新源 + 重试源)的 worker 数
     auto found = co_await wc.server_conn->get().get_sources(st.hash, st.size, timeout);
     if(st.stopped() || st.alloc.complete()) break;
     if(found){
@@ -918,6 +926,7 @@ source_reask_supervisor(WorkerContext wc, SharedState& st,
         peer::PeerIdentity identity{src, std::nullopt};
         known_sources.push_back(identity);
         spawn_worker(wc, identity, st, timeout, max_retries, reconnect_backoff, done_ch);
+        ++spawned_this_cycle;
       }
     }
     // get_sources 失败(服务器连接问题等)不致命: 忽略本轮合并, 下个周期继续尝试(eMule 惯例——
@@ -927,7 +936,20 @@ source_reask_supervisor(WorkerContext wc, SharedState& st,
       // 重试已弃的 transient 源: 取走当前池并清空(新 peer_worker 调用拿到全新重连预算)。
       auto retry_pool = std::move(st.transient_retry_pool);
       st.transient_retry_pool.clear();
-      for(auto& identity : retry_pool) spawn_worker(wc, identity, st, timeout, max_retries, reconnect_backoff, done_ch);
+      for(auto& identity : retry_pool){
+        spawn_worker(wc, identity, st, timeout, max_retries, reconnect_backoff, done_ch);
+        ++spawned_this_cycle;
+      }
+    }
+
+    // Important#1 修复: "无源可用"有界放弃(阈值/理由见 kMaxEmptyReaskCycles 注释)。本轮既没增补
+    // 任何 worker、当前也无活跃 worker → 源已耗尽且服务器/重试池都补不上, 记一轮空转; 连续达到
+    // 上限即退出监督, 交由 run() 收尾以源耗尽错误返回。任一进展(增补了 worker 或仍有活跃 worker)
+    // 清零重来——给晚到的源机会但有界。
+    if(spawned_this_cycle == 0 && st.active_workers == 0){
+      if(++empty_cycles >= kMaxEmptyReaskCycles) break;
+    } else {
+      empty_cycles = 0;
     }
   }
   st.supervisor_active = false;
