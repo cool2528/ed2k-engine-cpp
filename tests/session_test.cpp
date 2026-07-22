@@ -394,6 +394,8 @@ TEST(Session, DisconnectDuringActiveDownloadDoesNotUseAfterFree){
   cfg.data_dir = tmp_dir;
   cfg.per_server_timeout = 2000ms;
   cfg.task_io_timeout = 20000ms;
+  cfg.source_reask_interval = 100ms;   // 强制短周期: disconnect 后 supervisor 迅速对已 close 的 conn 发起
+                                       // get_sources(真正触发被测的 C2 seam), 而非默认 3 分钟内永不重问
   cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
   Session session(rt, cfg);
 

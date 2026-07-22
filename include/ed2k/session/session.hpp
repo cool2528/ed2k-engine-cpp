@@ -53,6 +53,9 @@ struct SessionConfig {
   //      独立的存活上限(≈30min, 随任何 inbound 刷新, st.stop/取消可提前退出), 不计入本值——
   //      排队是正常协议流程, 不应被这个"单次 RPC"超时打断。
   std::chrono::milliseconds task_io_timeout = std::chrono::seconds(60);
+  // 编排监督(Task 6 source_reask_supervisor)周期重问服务器源的间隔; 生产默认 3 分钟(eMule 惯例),
+  // 独立字段便于测试注入更短值。语义等同 download::kSourceReaskInterval。
+  std::chrono::milliseconds source_reask_interval = std::chrono::minutes(3);
   // 启用 Kad(DHT) 子系统: 用 data_dir/nodes.dat 做种子引导, 维护路由表并可被其它 Kad 节点发现,
   // shutdown 时把当前路由表落盘回 nodes.dat。当前不接入下载增源(find_sources) ——
   // 该功能会与 Kad 常驻的单读者 socket 争抢同一连接, 留待后续专项任务实现; 见 kad_status()。

@@ -435,7 +435,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     // 下载侧的 Kad 增源留待后续专项任务, 参照 Task 7 的单读者仲裁模式实现(该仲裁同时也能
     // 根治多个并发下载任务各自调用 find_sources 时相互抢占同一 socket 的问题)。
     auto dl = builder.build();
-    auto r = co_await dl.run(self->cfg.task_io_timeout, 3);
+    auto r = co_await dl.run(self->cfg.task_io_timeout, 3, self->cfg.source_reask_interval);
 
     self = weak.lock(); if(!self) co_return;
     t = self->find_alive(id, gen);

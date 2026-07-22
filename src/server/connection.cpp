@@ -44,8 +44,9 @@ struct ServerConnection::Impl {
   // 方案 C 让连接在 login 后转入空闲、由单个前台请求独占读取; 但 max_concurrent_tasks 默认 3, 且
   // 下载任务改用已连搜索服务器(self->login->conn)取源后, 多任务的 get_sources 会并发 send+pump_until
   // (recv)——asio 不允许同 socket 并发读, eD2k 响应又无请求 ID 会互相错投。容量 1 的 channel 作二元
-  // 信号量把前台请求串行化。connect_and_login/receive_events(登录+快照窗口)发生在连接刚建立、无并发
-  // 前台请求时, 不参与本门闸。
+  // 信号量把前台请求串行化。connect_and_login(登录)在连接刚建立、无并发前台请求时不参与本门闸;
+  // receive_events(connect_server 快照窗口)原也豁免, 但终审 C1 发现它会与"连接刚 emit connected 后
+  // 立即启动的下载"的 get_sources 并发 recv, 已纳入本门闸(见 receive_events 实现)。
   asio::awaitable<ServerRequestGate> acquire_request_gate(){
     co_await request_gate.async_receive(asio::use_awaitable);
     co_return ServerRequestGate{&request_gate};
