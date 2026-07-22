@@ -581,6 +581,15 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
       if(aich_active){
         auto rd = co_await conn.request_aich_proof(st.hash, *st.aich,
                                                    static_cast<std::uint16_t>(part_index), timeout);
+        // 架构决策#4 (review 修复): 等 AICH proof 期间也可能中途收到 QUEUERANKING——
+        // request_aich_proof 内部走 pump_until, 对 QUEUERANKING 早已映射为 errc::upload_queued
+        // (c2c_connection.cpp pump_until)。与下方 request_blocks(_i64) 分支同款: 原样传播该错误
+        // 给 peer_worker 的循环回 queue_wait_phase 重新排队, 而不是落入下面"校验失败"分支当作
+        // 数据损坏计入 max_retries——否则会在重试耗尽后误判为 block_corrupt 放弃该源。
+        if(!rd && rd.error() == make_error_code(errc::upload_queued)){
+          st.alloc.requeue_block(part_index, block_in_part);
+          co_return tl::unexpected(rd.error());
+        }
         bool ok = false;
         if(rd) ok = st.checker->verify_block(part_index, block_in_part, b.data,
                                              std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
@@ -600,8 +609,9 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
   co_return tl::expected<void,std::error_code>{};
 }
 
-// P0 架构决策#3: 排队等待循环。start_upload/accumulate_blocks 中途都可能得到 UploadQueued/
-// errc::upload_queued(见 c2c_connection.cpp 的 accumulate_blocks 中途降级, 架构决策#4)——本函数
+// P0 架构决策#3: 排队等待循环。start_upload/accumulate_blocks/AICH proof 等待中途都可能得到
+// UploadQueued/errc::upload_queued(见 c2c_connection.cpp 的 accumulate_blocks 中途降级, 与本文件
+// pull_blocks_phase AICH 分支对 request_aich_proof 的同款传播, 均属架构决策#4)——本函数
 // 统一处理"保持 TCP 连接、等到真正被接受(或彻底放弃)为止"这一段。
 //
 // 每轮循环并发等待两类事件之一(architecture decision #3 的"TWO events"): (a) TCP 帧: 用

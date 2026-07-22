@@ -671,6 +671,125 @@ TEST(Download, CancelWhileQueuedExitsPromptlyAsCancelledNotTimedOut){
   std::filesystem::remove_all(dir);
 }
 
+// === Task 5 review fix #1 (Important, 架构决策#4 完整性): AICH proof 等待期间的 QUEUERANKING ===
+// 之前只有 accumulate_blocks(块传输阶段)识别中途 QUEUERANKING 并映射为 errc::upload_queued 走回
+// queue_wait_phase; pull_blocks_phase 的 AICH 分支只看 request_aich_proof 返回值真假, 从不检查
+// rd.error(), 于是 QUEUERANKING(经 pump_until 早已映射为同一 errc::upload_queued)落进"校验失败"
+// 分支, 被当成数据损坏计入 max_retries, 耗尽后误判为 block_corrupt 放弃源。
+//
+// 本测试模拟"已被接受、正在传输中途"的降级(区别于 WaitsInUploadQueueThenAcceptsAndDownloads 测的
+// 初始排队): STARTUPLOADREQ 后立即 ACCEPTUPLOADREQ → AICHFILEHASHREQ 正常协商 → 首块
+// REQUESTPARTS/SENDINGPART 正常 → 该块的 AICHREQUEST 首次故意回 QUEUERANKING(模拟源把上传槽中途
+// 收回排队)。用与既有排队测试同款 100ms 观察窗口区分两种实现:
+//   - 有 bug 实现: AICH 分支不识别 upload_queued, 不等 ACCEPTUPLOADREQ 就立即用同一连接重下同一
+//     块——观察窗口命中, mock 判定为旧路径, 不再服务并断开连接, 使下载确定性失败(RED)。
+//   - 修复后实现: 原样传播 upload_queued, peer_worker 回 queue_wait_phase 被动等 TCP(纯被动分支
+//     不会主动发任何帧)——观察窗口静默, mock 送 ACCEPTUPLOADREQ 促其恢复, 之后 AICHREQUEST 正常
+//     应答, 下载完整完成(GREEN)。
+//
+// 文件大小取 AICH_BLOCK_SIZE+kQueueTestFileSize(单 part 两块): 若用单块文件, 该块叶标识符按
+// AICHChecker::verify_block 的 leaf_ident 规则恒为 1(根), 而 proof map 显式排除 identifier==1,
+// 永远验证不过——无法驱动"修复后应完整下载成功"这一路径, 故取两块规避此边界情形。
+TEST(Download, MidTransferQueueRankingDuringAichProofWaitReentersQueueWait){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_aich_queue_mid"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+  constexpr std::uint64_t kMidQueueFileSize = AICH_BLOCK_SIZE + kQueueTestFileSize;   // 单 part 双块
+  std::vector<std::byte> data(kMidQueueFileSize, std::byte(0x7A));
+  crypto::MD4 m; m.update(data);
+  auto fhash = FileHash::from_bytes(m.finish());
+  AICHHash root = aich_hash_bytes(data);
+  auto part0_recovery = recovery_for(data, 0);   // part 级 proof(两叶), 与 serve_aich_peer 同款按 part 缓存
+
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  bool premature_retry_seen = false;   // 旧 bug 特征: 不等 ACCEPTUPLOADREQ 就立即重下同一块
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                          // HELLO
+    { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+      co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+    co_await exchange_mule_mock(s, false, 0);              // 应答 udp_port=0 -> 排队等待走纯 TCP 被动分支
+    (void)co_await read_frame(s);                          // SETREQFILEID
+    { codec::ByteWriter w; w.hash16(fhash); w.u16(0);       // count=0: 对完整共享单 part 文件的既有约定
+      co_await send_pkt(s, op::FILESTATUS, w.take()); }
+    (void)co_await read_frame(s);                          // REQUESTFILENAME
+    { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+      co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+    (void)co_await read_frame(s);                          // STARTUPLOADREQ
+    co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});          // 立即接受: 测的是接受后的中途降级
+
+    bool degraded_once = false;
+    for(;;){
+      auto body = co_await read_frame(s);
+      if(body.empty()){ co_await keep_alive(s); co_return; }
+      std::uint8_t opcode = std::to_integer<std::uint8_t>(body[0]);
+      std::span<const std::byte> pl(body.data()+1, body.size()-1);
+      if(opcode == op::AICHFILEHASHREQ){
+        codec::ByteWriter w; w.hash16(fhash); w.hash20(root.bytes());
+        co_await send_pkt(s, op::AICHFILEHASHANS, w.take(), proto::eMule);
+        continue;
+      }
+      if(opcode == op::AICHREQUEST){
+        codec::ByteReader r(pl); (void)r.hash16();
+        std::uint16_t part_index = r.u16();
+        auto echoed_master = r.hash20();
+        if(!degraded_once){
+          degraded_once = true;
+          // 模拟源中途把该连接的上传槽收回排队(而非数据损坏): 回 QUEUERANKING 代替 AICHANSWER。
+          co_await send_pkt(s, op::QUEUERANKING, encode_queue_ranking(5));
+          // 观察窗口: 探测客户端是否不等 ACCEPTUPLOADREQ 就抢先发新请求(旧 bug 特征)。
+          std::array<std::byte,5> hdr;
+          auto [e1,n1] = co_await asio::async_read(s, asio::buffer(hdr),
+              asio::cancel_after(100ms, asio::as_tuple(asio::use_awaitable)));
+          (void)n1;
+          if(!e1){
+            // 窗口内收到新帧 = 旧 bug 路径(未等 ACCEPTUPLOADREQ 就抢先重下该块)。不再服务,
+            // 断开连接让本次下载确定性失败, 而不是侥幸靠本地重试蒙混过关。
+            premature_retry_seen = true;
+            co_return;
+          }
+          co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});   // 确认静默等待后促其从排队等待恢复
+          continue;
+        }
+        const auto& proof = part0_recovery;
+        codec::ByteWriter w; w.hash16(fhash); w.u16(part_index); w.hash20(echoed_master);
+        w.u16(static_cast<std::uint16_t>(proof.size()));
+        for(const auto& p : proof){ w.u16(static_cast<std::uint16_t>(p.identifier)); w.hash20(p.hash); }
+        w.u16(0);   // count32(非大文件路径)
+        co_await send_pkt(s, op::AICHANSWER, w.take(), proto::eMule);
+        continue;
+      }
+      if(opcode == op::REQUESTPARTS){
+        codec::ByteReader r(pl); (void)r.hash16();
+        std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
+        (void)s1;(void)s2;(void)e1;(void)e2;
+        if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+        std::size_t off = s0, len = e0 - s0;
+        codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
+        w.blob(std::span<const std::byte>(data).subspan(off, len));
+        co_await send_pkt(s, op::SENDINGPART, w.take());
+        continue;
+      }
+      // 其它 opcode 忽略
+    }
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(fhash).size(kMidQueueFileSize).aich(std::optional<AICHHash>(root))
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peer.port()}}).build();
+    auto r = co_await dl.run(5s, 3);
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, kMidQueueFileSize, fhash, {});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  EXPECT_FALSE(premature_retry_seen)
+      << "peer_worker must re-enter queue_wait_phase on mid-transfer QUEUERANKING during AICH-proof "
+         "wait, not treat it as a corrupt-block retry (Decision #4 must also cover the AICH-proof path)";
+  std::filesystem::remove_all(dir);
+}
+
 TEST(Download, RequiredObfuscationWithoutPeerHashFailsBeforeTcpDial) {
   IoRuntime rt;
   tcp::acceptor acceptor(rt.executor(), tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0));

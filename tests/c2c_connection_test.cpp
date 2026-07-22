@@ -414,6 +414,37 @@ TEST(C2CConnection, HandshakeWithMuleInfoCapsMuleSubStepIndependentlyOfLargerCal
     c.close(); co_return;
   });
 }
+// Task 5 review fix #3 (Minor): 对称于上面 HandshakeWithMuleInfoCapsMuleSubStepIndependentlyOf-
+// LargerCallerTimeout(initiator 侧), 证明 acceptor 侧同样独立于调用方超时封顶。既有的
+// HandshakeAcceptorWithMuleInfoDegradesToZeroPortWhenPeerLacksEmuleExtension 只传 150ms(小于
+// kMuleHandshakeTimeout), std::min(timeout, kMuleHandshakeTimeout) 恒取 150ms, 不管 std::min 是否
+// 真的存在都会得到同样的观测结果——只证明了最终退化结果(udp_port 降为 0), 未证明 acceptor 路径确有
+// 独立于调用方超时的封顶。这里镜像 initiator 侧同款测试结构, 故意传一个远大于
+// kMuleHandshakeTimeout 的 timeout(20s), 用耗时上界证明确实是子步自己的短超时在生效。
+TEST(C2CConnection, HandshakeAcceptorWithMuleInfoCapsMuleSubStepIndependentlyOfLargerCallerTimeout){
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([](tcp::socket s) -> asio::awaitable<void>{
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(peer_hello()));   // 主动发 HELLO(含前导0x10)
+    (void)co_await read_frame(s);                                        // 收 HELLOANSWER
+    co_await keep_alive(s); co_return;                                   // 刻意不发 EMULEINFO
+  });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    C2CConnection c(rt.executor());
+    auto cr = co_await c.connect(*IPv4::from_dotted("127.0.0.1"), peer.port(), 2s);
+    EXPECT_TRUE(cr.has_value()); if(!cr) co_return;
+    MuleInfo mine; mine.udp_port = 4662;
+    const auto started = std::chrono::steady_clock::now();
+    auto r = co_await c.handshake_acceptor_with_mule_info(peer_hello(), mine, 20s);   // 调用方允许 20s
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    EXPECT_EQ(r->hello.nickname, "peer");
+    EXPECT_EQ(r->mule_info.udp_port, 0u);
+    // 应在 kMuleHandshakeTimeout 附近降级, 远小于调用方传入的 20s——留充裕余量避免脆弱断言, 但足以
+    // 证明 acceptor 路径的 std::min 封顶确实生效, 而非等满调用方的 20s。
+    EXPECT_LT(elapsed, 10s);
+    c.close(); co_return;
+  });
+}
 TEST(C2CConnection, RequestFileStatus){
   IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
   peer.serve([](tcp::socket s) -> asio::awaitable<void>{
