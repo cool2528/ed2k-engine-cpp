@@ -342,15 +342,30 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     auto link = t->link;
     auto out_path = t->out_path;
 
-    auto lg = co_await app::login_with_rotation(ex, self->server_met_bytes, self->cfg.server_override,
-                                                self->login_params(), self->cfg.per_server_timeout);
-    self = weak.lock(); if(!self) co_return;
-    t = self->find_alive(id, gen);
-    if(!t){ self->on_task_coroutine_exit(id); co_return; }
-    if(stop && *stop){ self->on_task_coroutine_exit(id); co_return; }        // pause/cancel 已改状态, 不覆盖
-    if(!lg){ self->set_state(*t, TaskState::failed, lg.error()); self->on_task_coroutine_exit(id); co_return; }
+    // B2: 优先用已连接的搜索服务器取源(eD2k 源知识 per-server, 搜索所在服务器最可能有该文件的源;
+    // 独立轮换登录到随机服务器是"源太少/为零"的主因)。仅当未连接搜索服务器时才回退到独立轮换登录。
+    // owned_login 在回退路径持有该独立登录会话, 保证其连接生命周期覆盖到 dl.run 结束; 用已连服务器
+    // 时连接由 self->login 持有(self 在本协程各 co_await 后一直被 relock 持有, 收尾前不析构)。
+    std::optional<app::LoginSession> owned_login;
+    server::ServerConnection* src_conn = nullptr;
+    bool self_high_id = false;
+    if(self->login){
+      src_conn = &self->login->conn;
+      self_high_id = self->server_state.high_id;
+    } else {
+      auto lg = co_await app::login_with_rotation(ex, self->server_met_bytes, self->cfg.server_override,
+                                                  self->login_params(), self->cfg.per_server_timeout);
+      self = weak.lock(); if(!self) co_return;
+      t = self->find_alive(id, gen);
+      if(!t){ self->on_task_coroutine_exit(id); co_return; }
+      if(stop && *stop){ self->on_task_coroutine_exit(id); co_return; }        // pause/cancel 已改状态, 不覆盖
+      if(!lg){ self->set_state(*t, TaskState::failed, lg.error()); self->on_task_coroutine_exit(id); co_return; }
+      owned_login.emplace(std::move(*lg));
+      src_conn = &owned_login->conn;
+      self_high_id = owned_login->result.high_id;
+    }
 
-    auto gs = co_await lg->conn.get_sources(link.hash, link.size, self->cfg.per_server_timeout);
+    auto gs = co_await src_conn->get_sources(link.hash, link.size, self->cfg.per_server_timeout);
     self = weak.lock(); if(!self) co_return;
     t = self->find_alive(id, gen);
     if(!t){ self->on_task_coroutine_exit(id); co_return; }
@@ -359,6 +374,15 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     t->known_sources = gs->sources.size();
     if(gs->sources.empty()){
       self->set_state(*t, TaskState::failed, make_error_code(errc::file_not_found));
+      self->on_task_coroutine_exit(id); co_return;
+    }
+
+    // B3: 我方 LowID 自检。我方 LowID(!self_high_id)且所有源也都是 LowID 时, LowID<->LowID 无法直连、
+    // 服务器回调也需要一个 HighID 中介, 该下载协议上注定失败——快速失败并给专属错误码(both_lowid), 而
+    // 不是对每个 LowID 源发注定超时的回调白等到超时。只要我方是 HighID, 或源中有任一 HighID, 照常下载。
+    if(!self_high_id && std::all_of(gs->sources.begin(), gs->sources.end(),
+                                    [](const server::SourceEndpoint& s){ return s.low_id(); })){
+      self->set_state(*t, TaskState::failed, make_error_code(errc::both_lowid));
       self->on_task_coroutine_exit(id); co_return;
     }
 
@@ -386,7 +410,7 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
       .aich(std::nullopt)
       .sources(std::move(gs->sources))
       .obfuscation(self->cfg.obfuscation, self->cfg.user_hash)
-      .server(lg->conn)
+      .server(*src_conn)
       .disk_executor(self->rt.disk_executor())
       .stop_flag(stop)
       .on_progress([weak, id, gen](std::uint64_t done, std::uint64_t){

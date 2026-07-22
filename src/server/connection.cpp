@@ -2,6 +2,8 @@
 #include "ed2k/net/connection.hpp"
 #include "ed2k/net/framing.hpp"
 #include "ed2k/util/error.hpp"
+#include <boost/asio/experimental/channel.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <chrono>
 #include <map>
 #include <span>
@@ -16,15 +18,42 @@ struct ServerConnection::SubscriptionState {
   std::size_t next_id = 1;
 };
 
+// B2(Task 7): 前台请求串行化门闸的 RAII 令牌持有者。co_await acquire_request_gate() 取得,
+// 析构(正常 co_return / 异常 / 提前返回)时放回令牌, 保证任一时刻至多一个前台请求独占该连接。
+struct ServerRequestGate {
+  asio::experimental::channel<void(boost::system::error_code)>* ch = nullptr;
+  explicit ServerRequestGate(asio::experimental::channel<void(boost::system::error_code)>* c) noexcept : ch(c) {}
+  ~ServerRequestGate(){ if(ch) ch->try_send(boost::system::error_code{}); }
+  ServerRequestGate(const ServerRequestGate&) = delete;
+  ServerRequestGate& operator=(const ServerRequestGate&) = delete;
+  ServerRequestGate(ServerRequestGate&& o) noexcept : ch(o.ch){ o.ch = nullptr; }
+  ServerRequestGate& operator=(ServerRequestGate&&) = delete;
+};
+
 struct ServerConnection::Impl {
-  explicit Impl(asio::any_io_executor ex) : conn(ex), observers(std::make_shared<SubscriptionState>()) {}
+  explicit Impl(asio::any_io_executor ex)
+    : conn(ex), observers(std::make_shared<SubscriptionState>()), request_gate(ex, 1) {
+    // 初始塞一个令牌: 门闸起始态=空闲可用(仿 download.cpp 的 ReaskGate)。
+    request_gate.try_send(boost::system::error_code{});
+  }
 
   void dispatch_push(const net::Packet& pkt);
   asio::awaitable<tl::expected<net::Packet,std::error_code>>
     pump_until(std::uint8_t want, std::chrono::milliseconds budget);
+  // B2(Task 7): 串行化同一连接上的前台请求(search/search_more/get_sources/get_server_list)。
+  // 方案 C 让连接在 login 后转入空闲、由单个前台请求独占读取; 但 max_concurrent_tasks 默认 3, 且
+  // 下载任务改用已连搜索服务器(self->login->conn)取源后, 多任务的 get_sources 会并发 send+pump_until
+  // (recv)——asio 不允许同 socket 并发读, eD2k 响应又无请求 ID 会互相错投。容量 1 的 channel 作二元
+  // 信号量把前台请求串行化。connect_and_login/receive_events(登录+快照窗口)发生在连接刚建立、无并发
+  // 前台请求时, 不参与本门闸。
+  asio::awaitable<ServerRequestGate> acquire_request_gate(){
+    co_await request_gate.async_receive(asio::use_awaitable);
+    co_return ServerRequestGate{&request_gate};
+  }
 
   net::Connection conn;
   std::shared_ptr<SubscriptionState> observers;
+  asio::experimental::channel<void(boost::system::error_code)> request_gate;
 };
 
 ServerConnection::Subscription::Subscription(std::weak_ptr<SubscriptionState> state, std::size_t id) noexcept
@@ -140,6 +169,7 @@ ServerConnection::connect_and_login_via_proxy(const infra::ProxyConfig& proxy,
 
 asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
 ServerConnection::search(const SearchExpr& expr, std::chrono::milliseconds timeout){
+  auto gate = co_await impl_->acquire_request_gate();   // B2: 串行化同一连接的前台请求
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::SEARCHREQUEST; req.payload = encode_search(expr);
   auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
@@ -150,6 +180,7 @@ ServerConnection::search(const SearchExpr& expr, std::chrono::milliseconds timeo
 
 asio::awaitable<tl::expected<std::vector<SearchResultItem>,std::error_code>>
 ServerConnection::search_more(std::chrono::milliseconds timeout){
+  auto gate = co_await impl_->acquire_request_gate();   // B2: 串行化同一连接的前台请求
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::QUERYMORERESULTS;
   auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
@@ -160,6 +191,7 @@ ServerConnection::search_more(std::chrono::milliseconds timeout){
 
 asio::awaitable<tl::expected<FoundSources,std::error_code>>
 ServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono::milliseconds timeout){
+  auto gate = co_await impl_->acquire_request_gate();   // B2: 串行化同一连接的前台请求(多下载任务并发取源)
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::GETSOURCES; req.payload = encode_get_sources(h, size);
   auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());
@@ -169,6 +201,7 @@ ServerConnection::get_sources(const FileHash& h, std::uint64_t size, std::chrono
 }
 asio::awaitable<tl::expected<std::vector<std::pair<IPv4,std::uint16_t>>,std::error_code>>
 ServerConnection::get_server_list(std::chrono::milliseconds timeout){
+  auto gate = co_await impl_->acquire_request_gate();   // B2: 串行化同一连接的前台请求
   net::Packet req; req.protocol = net::proto::eDonkey; req.opcode = op::GETSERVERLIST; req.payload = encode_get_server_list();
   auto sr = co_await impl_->conn.send(req);
   if(!sr) co_return tl::unexpected(sr.error());

@@ -8,7 +8,7 @@ enum class errc {
   connect_failed, connection_closed, timed_out, packet_too_large, decompress_failed,
   login_rejected, server_protocol_error,
   file_not_found = 17, upload_queued, block_corrupt, ip_filtered, tls_error,
-  cancelled
+  cancelled, both_lowid
 };
 std::error_code make_error_code(errc) noexcept;
 }

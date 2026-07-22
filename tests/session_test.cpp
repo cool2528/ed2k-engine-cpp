@@ -240,6 +240,127 @@ TEST(Session, AddDownloadCompletesWithProgressAndEvents){
   std::filesystem::remove_all(tmp_dir);
 }
 
+// B3 (Task 7): mock server 登录返回 LowID(我方 id<0x1000000) + FOUNDSOURCES 全是 LowID 源。
+static asio::awaitable<void> serve_login_lowid_with_lowid_source(tcp::socket s, const MockFile& mf){
+  (void)co_await read_frame(s);   // LOGINREQUEST
+  { codec::ByteWriter w; w.u32(0x00000119u); w.u32(0x0119u);   // IDCHANGE: id=0x119 < 0x1000000 → 我方 LowID
+    co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+  (void)co_await read_frame(s);   // GETSOURCES
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
+    w.u32(0x00000200u); w.u16(4662);   // 源 id=0x200 < 0x1000000 → LowID 源
+    co_await send_pkt(s, ed2k::server::op::FOUNDSOURCES, w.take()); }
+  co_await keep_alive(s);
+  co_return;
+}
+
+// B3: 我方 LowID + 所有源都是 LowID → run_task 必须以 errc::both_lowid 快速失败(不对注定失败的
+// LowID 回调白等到 task_io_timeout)。任务未 connect_server, 走 run_task 的轮换登录回退路径,
+// self_high_id 取自 login_with_rotation 的 IDCHANGE(此处为 LowID)。
+TEST(Session, LowIdSelfAndAllLowIdSourcesFastFailsBothLowId){
+  auto mf = make_mock_file(0x55, 0x66);
+  IoRuntime rt;
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_login_lowid_with_lowid_source(std::move(s), mf); co_return; });
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_both_lowid";
+  std::filesystem::create_directories(tmp_dir);
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 3000ms;
+  cfg.task_io_timeout = 20000ms;   // 若未快速失败会一直等回调到这么久; 下方计时断言间接证明是快速失败
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session(rt, cfg);
+
+  Ed2kFileLink link; link.name="t.bin"; link.size=PART*2; link.hash=mf.fhash;
+  auto t0 = std::chrono::steady_clock::now();
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    std::uint64_t task_id = session.add_download(link, tmp_dir);
+    EXPECT_NE(task_id, 0u);
+    asio::steady_timer timer(rt.context());
+    for(int i=0;i<200;++i){
+      auto snap = session.query(task_id);
+      if(snap && snap->state == TaskState::failed) break;
+      timer.expires_after(50ms);
+      co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(task_id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::failed);
+    EXPECT_EQ(snap->error, make_error_code(ed2k::errc::both_lowid))
+        << "we are LowID and every source is LowID → must fast-fail both_lowid";
+    co_return;
+  });
+  auto elapsed = std::chrono::steady_clock::now() - t0;
+  EXPECT_LT(elapsed, std::chrono::seconds(10)) << "both_lowid must be a prompt fast-fail, not a timeout wait";
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// B2 (Task 7): 单连接依次处理 connect_server 的登录与随后 run_task 在同一连接上发来的 GETSOURCES
+// (复用 self->login), 应答含一个 HighID 源的 FOUNDSOURCES。连接空闲窗口(方案 C 快照)期间双方各自
+// recv, 靠 connect_server 的快照超时(<=per_server_timeout)打破, 之后 run_task 才发 GETSOURCES。
+static asio::awaitable<void> serve_login_then_reused_getsources(tcp::socket s, const MockFile& mf, std::uint16_t peer_port){
+  (void)co_await read_frame(s);   // LOGINREQUEST (connect_server)
+  { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);   // IDCHANGE: HighID(我方)
+    co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+  (void)co_await read_frame(s);   // GETSOURCES (run_task, 复用 self->login 连接)
+  { codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
+    w.u32(0x0100007Fu); w.u16(peer_port);   // HighID 源
+    co_await send_pkt(s, ed2k::server::op::FOUNDSOURCES, w.take()); }
+  co_await keep_alive(s);
+  co_return;
+}
+
+// B2: run_task 必须用已连接的搜索服务器(self->login)取源, 而不是新登录一个轮换服务器。让 MockServer
+// 只 serve 一个连接: connect_server 建立它; 若 run_task 复用该连接则下载成功, 若另起轮换登录则需要
+// 第二个连接(mock 不提供)→ 下载失败。下载成功即证明复用了已连服务器。
+TEST(Session, DownloadUsesConnectedSearchServerForSources){
+  auto mf = make_mock_file(0x55, 0x66);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_login_then_reused_getsources(std::move(s), mf, peer.port()); co_return; });
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_use_connected";
+  std::filesystem::create_directories(tmp_dir);
+  auto out = tmp_dir / "t.bin";
+  std::filesystem::remove(out); std::filesystem::remove(out.string()+".part.met");
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 2000ms;   // 快照窗口上限, 尽快进入空闲让 run_task 取源
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session(rt, cfg);
+
+  Ed2kFileLink link; link.name="t.bin"; link.size=PART*2; link.hash=mf.fhash;
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto cr = co_await session.connect_server(std::nullopt);   // 建立 self->login = 唯一的 mock 连接
+    EXPECT_TRUE(cr.has_value()) << (cr ? "" : cr.error().message());
+    if(!cr) co_return;
+    std::uint64_t task_id = session.add_download(link, tmp_dir);
+    EXPECT_NE(task_id, 0u);
+    asio::steady_timer timer(rt.context());
+    for(int i=0;i<600;++i){
+      auto snap = session.query(task_id);
+      if(snap && (snap->state==TaskState::completed || snap->state==TaskState::failed)) break;
+      timer.expires_after(50ms);
+      co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(task_id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::completed) << snap->error.message()
+        << " (run_task must reuse the connected self->login server for get_sources)";
+    co_return;
+  });
+  ASSERT_TRUE(std::filesystem::exists(out));
+  EXPECT_EQ(std::filesystem::file_size(out), PART*2);
+  std::filesystem::remove_all(tmp_dir);
+}
+
 TEST(Session, QueryAllListsTasksAndUnknownIdReturnsNullopt){
   IoRuntime rt;
   SessionConfig cfg;

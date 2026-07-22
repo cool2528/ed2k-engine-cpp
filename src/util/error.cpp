@@ -28,6 +28,7 @@ struct Ed2kCategory : std::error_category {
       case errc::block_corrupt: return "block corrupt";
       case errc::ip_filtered: return "ip filtered";
       case errc::cancelled: return "operation cancelled";
+      case errc::both_lowid: return "both client and all sources are low id";
     }
     return "unknown ed2k error";
   }
