@@ -293,6 +293,11 @@ Download::run(std::chrono::milliseconds timeout){
   auto dispatched = co_await dispatch_blocks_phase(conn_, pf, hash_, size_,
                                                    std::move(setup->peer_parts), timeout);
   if(!dispatched) co_return tl::unexpected(dispatched.error());
+  // 关键安全网(C6 后): dispatch_blocks_phase 采用 3 块流水线批处理后, 若源中途只服务了部分块
+  // (如 1-of-3 后 OUTOFPARTREQS), 单源 legacy 路径无重排队基础设施, 会写入已到的块、游标越过未服务
+  // 的块并正常返回(不在本次 run 内重试)——本 pf.complete() 门是"不误报成功"的唯一保证: 只要有 part
+  // 的 MD4 未通过/字节缺失就以 io_error 返回。重构 Download::run() 时切勿删除此门(否则 partial-batch
+  // 会退化为静默假成功)。多源 pull_blocks_phase 自身会重排队, 不依赖此门。
   if(!pf.complete()) co_return tl::unexpected(make_error_code(errc::io_error));
   co_return tl::expected<void,std::error_code>{};
 }
