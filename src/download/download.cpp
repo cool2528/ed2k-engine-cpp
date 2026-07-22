@@ -1066,10 +1066,20 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   // 的最后一步都是 try_send 一个 token, 因此每次能让本循环条件变化的状态转移都配对一次 token,
   // 不会永久卡在 async_receive 上; 详见 worker finish()/supervisor 收尾处注释)。
   // 结果判定沿用既有逻辑: complete 优先于 stopped, 其次上报 first_err(worker 里记录的首个错误)。
+  // 审计 C2: 成功判定必须用 st.pf.complete()(PartFile 逐 part MD4 校验通过), 不能用
+  // st.alloc.complete()(BlockAllocator 仅表示"块已写入", 与 MD4 是否通过无关)。alloc 是
+  // run() 私有的调度记账, 只反映"块是否已分配/写过"——C1 修复后, 一个 part 的某块 MD4 校验
+  // 失败会重置该 part 在 PartFile 里的记账(block_done/part_filled/part_done 归零), 但不会、
+  // 也无法追溯重置 alloc 里此前已对同 part 其它块置位的 done_ 位; 该 part 后续任何一次(哪怕只
+  // 一块)重写都会让 alloc 认为整块/整 part/整文件已完成, 而此时 PartFile 可能仍未凑够字节数
+  // 触发那次决定性的 MD4 校验——alloc.complete()==true 而 pf.complete()==false 由此产生。
+  // 用 alloc.complete() 判成功会在这种分歧下把"未校验/损坏"误报为"成功"(对下载器而言是最坏的
+  // 结果); pf.complete() 才是"这份数据真的通过 MD4"的唯一可信来源。pf.complete()==false 时
+  // 直落到下面既有的 stopped()/first_err 判定, 不再新增分支。
   while(st.active_workers > 0 || st.supervisor_active){
     (void)co_await done_ch.async_receive(boost::asio::use_awaitable);
   }
-  if(st.alloc.complete()) co_return tl::expected<void,std::error_code>{};
+  if(st.pf.complete()) co_return tl::expected<void,std::error_code>{};
   if(st.stopped()) co_return tl::unexpected(make_error_code(errc::cancelled));
   co_return tl::unexpected(st.first_err.value_or(make_error_code(errc::io_error)));
 }

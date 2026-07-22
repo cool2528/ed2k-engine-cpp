@@ -1439,6 +1439,135 @@ TEST(Download, SupervisorGivesUpWhenSourcesExhausted){
   std::filesystem::remove_all(dir);
 }
 
+// P1 Task 3(审计 C2)回归: 构造 alloc.complete()==true 而 pf.complete()==false 的真实分歧,
+// 证明 run() 改用 pf.complete() 判定成功后, 不会在这种情况下误报"下载成功"。
+//
+// 构造原理: 单 part、恰 3 块的文件(每块整好 AICH_BLOCK_SIZE, 无 AICH 协商 → 直通
+// write_block_async, 只靠 part 级 MD4 兜底)。源 A/B 对块2 全程只供坏数据(从未有人供出正确
+// 内容), 对其余块供正确数据。首次凑满整 part 触发 MD4 校验 → 必然失败 → C1 重置该 part 全部
+// 记账(block_done/part_filled/part_done 归零), 对应那次写入返回 block_corrupt(非
+// is_transient, 该源终止放弃)。BlockAllocator::done_ 是 run() 私有的独立记账, 不受 C1 重置
+// 影响——先前已成功写入的块在 alloc 里仍标 done, 只有触发失败的那一块被 requeue。
+//
+// 周期重问(50ms)注入第二个源, 对(仅剩的)那一块再次写入: write_block_async 这次只把这一块的
+// 字节数累加进 part_filled(reset 后从 0 起, 远小于整 part 大小), 永远追不上"part 已填满"的
+// 判定阈值——该 part 的 MD4 校验从此再也不会被触发, 这次写入无条件"成功"返回。于是
+// alloc.mark_block_done 被调用, alloc 认为整个(单 part)文件 complete()==true; 但
+// PartFile::part_done[0] 仍是 false(该 part 从未真正通过 MD4), 磁盘上块2 的字节其实一直是
+// 坏数据, 从未被验证。旧实现(run() 末尾用 st.alloc.complete() 判成功)会在此刻误报成功。
+TEST(Download, MultiSourceAllocCompleteButPartFileIncompleteIsNotSuccess){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_alloc_pf_divergence";
+  std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path); std::filesystem::remove(path.string()+".part.met");
+
+  constexpr std::uint64_t kBlk = AICH_BLOCK_SIZE;
+  constexpr std::uint64_t kFileSize = 3 * kBlk;            // 单 part, 恰 3 整块, 无部分块边界
+  constexpr std::uint64_t kCorruptOff = 2 * kBlk;          // 块2: 全程无人供出其正确数据
+  std::vector<std::byte> data(kFileSize, std::byte(0x11));     // "真相"内容(仅块0/块1 及算 hash 用)
+  crypto::MD4 m; m.update(data);
+  auto fhash = FileHash::from_bytes(m.finish());
+  std::vector<std::byte> corrupt_block(kBlk, std::byte(0xEE));  // A/B 对块2 蓄意供的坏数据
+
+  // 单 part 简单上传流程(跳过排队, 立即 accept); 对块2 的 REQUESTPARTS 恒回坏数据,
+  // 其余块回正确数据。A/B 共用同一份逻辑(参数通过闭包捕获)。
+  auto serve_with_bad_block2 = [&](tcp::socket s) -> asio::awaitable<void> {
+    (void)co_await read_frame(s);                            // HELLO
+    { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
+      co_await send_pkt(s, op::HELLOANSWER, encode_hello(h)); }
+    co_await exchange_mule_mock(s, false, 0);
+    (void)co_await read_frame(s);                            // SETREQFILEID
+    { codec::ByteWriter w; w.hash16(fhash); w.u16(0);         // count=0: 完整共享单 part 文件
+      co_await send_pkt(s, op::FILESTATUS, w.take()); }
+    (void)co_await read_frame(s);                            // REQUESTFILENAME
+    { codec::ByteWriter w; w.hash16(fhash); w.u32(4); w.blob(bytes({'n','a','m','e'}));
+      co_await send_pkt(s, op::REQFILENAMEANSWER, w.take()); }
+    (void)co_await read_frame(s);                            // STARTUPLOADREQ
+    co_await send_pkt(s, op::ACCEPTUPLOADREQ, {});
+    for(;;){
+      auto body = co_await read_frame(s);                    // REQUESTPARTS
+      if(body.empty()){ co_await keep_alive(s); co_return; }
+      codec::ByteReader r(std::span<const std::byte>(body).subspan(1));
+      (void)r.hash16();
+      std::uint32_t s0=r.u32(), s1=r.u32(), s2=r.u32(), e0=r.u32(), e1=r.u32(), e2=r.u32();
+      (void)s1;(void)s2;(void)e1;(void)e2;
+      if(s0==0 && e0==0){ co_await keep_alive(s); co_return; }
+      std::size_t off = s0, len = e0 - s0;
+      codec::ByteWriter w; w.hash16(fhash); w.u32(s0); w.u32(e0);
+      if(static_cast<std::uint64_t>(off) == kCorruptOff) w.blob(std::span<const std::byte>(corrupt_block).subspan(0, len));
+      else w.blob(std::span<const std::byte>(data).subspan(off, len));
+      co_await send_pkt(s, op::SENDINGPART, w.take());
+    }
+  };
+
+  IoRuntime rt;
+  ed2k::test::MockPeer peerA(rt.context());
+  peerA.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_with_bad_block2(std::move(s)); co_return; });
+  ed2k::test::MockPeer peerB(rt.context());
+  bool peer_b_connected = false;
+  peerB.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    peer_b_connected = true;
+    co_await serve_with_bad_block2(std::move(s)); co_return; });
+
+  // mock 搜索服务器: 每次 GETSOURCES 都回一个仅含 B 的 FOUNDSOURCES, 驱动周期重问在 A 终止后
+  // 补入 B(与 PeriodicRequeryAddsNewSourceAndCompletes 同款机制)。
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);                            // LOGINREQUEST
+    co_await send_pkt(s, server::op::IDCHANGE, idchange_payload(0x01000000u, 0x0119u));
+    for(;;){
+      auto body = co_await read_frame(s);                    // GETSOURCES
+      if(body.empty()) co_return;
+      codec::ByteWriter w; w.hash16(fhash); w.u8(1);
+      w.u32(0x0100007Fu); w.u16(peerB.port());
+      co_await send_pkt(s, server::op::FOUNDSOURCES, w.take());
+    }
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    server::ServerConnection sc(rt.executor());
+    server::LoginParams p; p.nickname="u"; p.client_port=0;
+    p.user_hash=*UserHash::from_hex("0123456789abcdeffedcba9876543210");
+    auto lr = co_await sc.connect_and_login(*IPv4::from_dotted("127.0.0.1"), srv.port(), p, 3000ms);
+    EXPECT_TRUE(lr.has_value()); if(!lr) co_return;
+
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(fhash).size(kFileSize).aich(std::nullopt)
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peerA.port()}})   // 仅 A, B 靠周期重问加入
+                .server(sc)
+                .build();
+    auto r = co_await dl.run(15s, 3, 50ms, kSourceReconnectBackoff);
+    EXPECT_FALSE(r.has_value())
+        << "block 2 was never verified by any source -- run() must not report success just because "
+           "BlockAllocator's private bookkeeping considers every block written";
+    if(r.has_value()) co_return;
+    EXPECT_EQ(r.error(), make_error_code(errc::block_corrupt));
+    co_return;
+  });
+
+  EXPECT_TRUE(peer_b_connected) << "test setup requires B to actually rejoin via periodic requery";
+
+  // 直接证据: 磁盘上块2 仍是坏数据(全程无人供出正确内容), 从头重建的 PartFile 也判定未完成——
+  // 与 run() 的失败结果一致; 而 alloc 的私有记账会认为"全部块已写"——这正是本测试要暴露的分歧。
+  {
+    std::ifstream f(path, std::ios::binary);
+    ASSERT_TRUE(f.is_open());
+    std::vector<std::byte> buf(kBlk);
+    f.seekg(static_cast<std::streamoff>(kCorruptOff));
+    f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(kBlk));
+    ASSERT_EQ(static_cast<std::size_t>(f.gcount()), static_cast<std::size_t>(kBlk));
+    EXPECT_TRUE(std::equal(buf.begin(), buf.end(), corrupt_block.begin()))
+        << "block 2 on disk should still be the corrupt bytes -- no source ever supplied the real data";
+  }
+  {
+    download::PartFile pf(path, kFileSize, fhash, {});
+    EXPECT_FALSE(pf.complete())
+        << "a freshly reconstructed PartFile must also see this file as incomplete/unverified";
+  }   // 显式收窄作用域: pf 析构关闭文件句柄, 否则下面 remove_all 在 Windows 上会因文件占用而抛异常
+
+  std::filesystem::remove_all(dir);
+}
+
 // === P4c-3 M3 验收 (异步磁盘 I/O) ===
 // 功能: Builder.disk_executor 注入真实 disk 线程池 → write_block_async 走卸载路径 (状态/I/O 分离)。
 // 断言多源并发 + 异步磁盘路径下文件完整 + part-MD4 通过 (无竞态/腐败)。
