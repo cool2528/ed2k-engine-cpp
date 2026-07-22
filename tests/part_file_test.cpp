@@ -54,6 +54,44 @@ TEST(PartFile, WrongPartDataFails){
   }
   std::filesystem::remove_all(dir);
 }
+// audit C1: MD4 校验失败必须重置该 part 的记账状态 (block_done 全 false + part_filled=0),
+// 否则 :164 的幂等短路会让重下同一批块被静默丢弃 —— 损坏字节永久留盘, 该 part 永不可验。
+// 场景: 先写满一个 part 的全部块 (内容与期望 hash 不符) -> 触发 MD4 校验并失败 -> 断言该 part
+// 所有块被重新标记为未完成 -> 再用正确数据重写同一批块 -> 应能重新触发 MD4 并通过、整体 complete。
+TEST(PartFile, MD4MismatchResetsPartStateForRedownload){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_md4_reset"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto correct = make_part_data(0x11, PART);
+  auto corrupt = make_part_data(0xFF, PART);   // 内容不同 -> 组装后 MD4 与期望值不符
+  auto h0 = md4_of(correct);                    // part 的真实期望 hash (仅 correct 数据能通过)
+  {
+  PartFile pf(path, PART, *FileHash::from_hex("00112233445566778899aabbccddeeff"), {h0});
+  std::size_t nb = static_cast<std::size_t>((PART + AICH_BLK - 1) / AICH_BLK);
+  // 1) 写入损坏数据的全部块: 末块写入时 part 攒满触发 MD4 校验, 应失败 (block_corrupt)。
+  for(std::size_t b=0; b<nb; ++b){
+    std::uint64_t s = b*AICH_BLK, e = std::min(s+AICH_BLK, PART);
+    auto w = pf.write_block(static_cast<std::uint32_t>(s), static_cast<std::uint32_t>(e),
+                   std::span(corrupt).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)));
+    if(b+1 == nb) EXPECT_FALSE(w.has_value()) << "末块写入应触发 MD4 校验并因内容损坏而失败";
+  }
+  EXPECT_FALSE(pf.complete());
+  // 2) 状态应被重置: 该 part 的所有块应重新变为未完成 (block_done 全 false)。
+  for(std::size_t b=0; b<nb; ++b)
+    EXPECT_FALSE(pf.is_block_done(0, b)) << "block " << b << " 应在 MD4 失败后被重置为未完成";
+  auto pend = pf.pending_blocks();
+  EXPECT_EQ(pend.size(), nb) << "MD4 失败后该 part 全部块应重新变为待下载";
+  // 3) 重下正确数据: 若 part_filled 未归零 (bug), 重写会导致累计字节数永远无法再等于整 part 长度,
+  //    MD4 校验将不会再触发, complete() 会永久为 false —— 这正是本用例要捕获的回归。
+  for(std::size_t b=0; b<nb; ++b){
+    std::uint64_t s = b*AICH_BLK, e = std::min(s+AICH_BLK, PART);
+    auto w = pf.write_block(static_cast<std::uint32_t>(s), static_cast<std::uint32_t>(e),
+                   std::span(correct).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)));
+    EXPECT_TRUE(w.has_value()) << "block " << b << " 重下正确数据应成功写入";
+  }
+  EXPECT_TRUE(pf.complete()) << "重下正确数据后该 part 应重新通过 MD4 校验并整体完成";
+  }
+  std::filesystem::remove_all(dir);
+}
 TEST(PartFile, ResumeSkipsVerifiedPart){
   auto dir = std::filesystem::temp_directory_path()/"ed2k_p4a_test3"; std::filesystem::create_directories(dir);
   auto path = dir/"f";

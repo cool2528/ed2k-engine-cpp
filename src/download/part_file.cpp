@@ -186,8 +186,16 @@ tl::expected<void,std::error_code> PartFile::Impl::write_block(std::uint64_t sta
       if(static_cast<std::uint64_t>(f.gcount()) != (pend - pstart)) return tl::unexpected(make_error_code(errc::io_error));
       if(p >= part_hashes.size()) return tl::unexpected(make_error_code(errc::block_corrupt));  // 对端 hashset 不足
       crypto::MD4 m; m.update(buf);
-      if(PartHash::from_bytes(m.finish()) != part_hashes[p])
+      if(PartHash::from_bytes(m.finish()) != part_hashes[p]){
+        // audit C1: MD4 不符 = 已写入的字节损坏。重置该 part 的记账状态 (block_done 全 false +
+        // part_filled 归零; part_done 此分支必为 false, 显式置位保持防御性), 使其全部块可重新下载
+        // 并再次校验; 否则 :164 的幂等短路会让重下同一批块被静默丢弃 —— 损坏字节永久留盘, 该 part
+        // 永不可验。仅重置内存记账, 不动盘上字节 (重下的块写入时会自然覆盖损坏数据)。
+        block_done[p].assign(blocks_in_part(p), false);
+        part_filled[p] = 0;
+        part_done[p] = false;
         return tl::unexpected(make_error_code(errc::block_corrupt));
+      }
       part_done[p] = true;
       save_met();   // M2: part 完成 → 持久化 .part.met (崩溃后此 part 无需重哈希)
     }
