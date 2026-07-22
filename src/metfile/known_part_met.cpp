@@ -17,6 +17,11 @@ constexpr std::uint8_t FT_FILESIZE_HI=0x3A;
 constexpr std::uint8_t FT_GAPSTART=0x09;
 constexpr std::uint8_t FT_GAPEND=0x0A;
 constexpr std::uint8_t FT_INTERNAL_GAPS=0xF0;
+// E1: 私有扩展 tag(非 aMule 标准), 携带未完成 part 的块级完成位图。写在标准 aMule tag 列表内
+// 的一个 Blob tag 里(数字 name_id, 与 FT_INTERNAL_GAPS 同一"私有扩展"惯例)——不认识此 tag 的
+// 解析器(包括未来某个不含本字段的旧版引擎)会把它当成普通未知 tag 原样保留在 PartFileState::tags
+// 里, 不影响 magic/gaps/size 等标准字段解析, 天然向后兼容。
+constexpr std::uint8_t FT_INTERNAL_PARTIAL_BLOCKS=0xF1;
 
 void encode_entry_common(ByteWriter& w, const FileHash& h, std::span<const PartHash> parts){
   w.hash16(h);
@@ -47,6 +52,53 @@ struct GapPair {
   std::optional<std::uint64_t> start;
   std::optional<std::uint64_t> end;
 };
+
+// E1: partial_blocks 编码为单个 Blob tag(FT_INTERNAL_PARTIAL_BLOCKS), 布局:
+//   u32 entry_count; 每 entry: u32 part_index, u32 block_count, ceil(block_count/8) 字节
+//   (LSB-first 按位打包, 与 FILESTATUS 位图 decode_file_status 同一约定)。
+// 与 FT_INTERNAL_GAPS 一样把"多条目"打包进一个 blob, 而非每条目一个 tag(gaps 用 GAPSTART_i/
+// GAPEND_i 是为了兼容 aMule 自身格式; partial_blocks 是本引擎私有扩展, 无需迁就 aMule 的按索引
+// 命名 tag 约定, 单 blob 更紧凑)。定义须置于 parse_amule_part_met/write_part_met 之前(两者
+// 均调用本节两个函数)。
+Tag encode_partial_blocks_tag(const std::vector<std::pair<std::uint32_t,std::vector<std::uint8_t>>>& partial_blocks){
+  ByteWriter bw;
+  bw.u32(static_cast<std::uint32_t>(partial_blocks.size()));
+  for(const auto& [part_index, blocks] : partial_blocks){
+    bw.u32(part_index);
+    bw.u32(static_cast<std::uint32_t>(blocks.size()));
+    std::vector<std::uint8_t> packed((blocks.size() + 7) / 8, 0);
+    for(std::size_t i=0;i<blocks.size();++i)
+      if(blocks[i]) packed[i/8] = static_cast<std::uint8_t>(packed[i/8] | (1u << (i%8)));
+    for(auto byte : packed) bw.u8(byte);
+  }
+  Tag t; t.name_id = FT_INTERNAL_PARTIAL_BLOCKS; t.value = bw.take();
+  return t;
+}
+
+// 解码失败(越界/损坏)一律返回空 vector, 与 met 整体的"陈旧/损坏则忽略, 不崩溃"防御风格一致
+// ——上层 PartFile::try_load_met 对空 partial_blocks 的处理等同"该 part 无块级信息可恢复"。
+std::vector<std::pair<std::uint32_t,std::vector<std::uint8_t>>> decode_partial_blocks_blob(std::span<const std::byte> blob){
+  std::vector<std::pair<std::uint32_t,std::vector<std::uint8_t>>> out;
+  ByteReader r(blob);
+  std::uint32_t entry_count = r.u32();
+  if(entry_count > 1000000) return {};
+  for(std::uint32_t e=0; e<entry_count && r.ok(); ++e){
+    std::uint32_t part_index = r.u32();
+    std::uint32_t block_count = r.u32();
+    if(block_count > 1000000) return {};
+    std::size_t nbytes = (static_cast<std::size_t>(block_count) + 7) / 8;
+    auto packed = r.blob(nbytes);
+    if(!r.ok() || packed.size() != nbytes) return {};
+    std::vector<std::uint8_t> blocks(block_count, 0);
+    for(std::uint32_t i=0;i<block_count;++i){
+      std::uint8_t byte = std::to_integer<std::uint8_t>(packed[i/8]);
+      if(byte & (1u << (i%8))) blocks[i] = 1;
+    }
+    out.emplace_back(part_index, std::move(blocks));
+  }
+  if(!r.ok()) return {};
+  return out;
+}
 
 tl::expected<PartFileState,std::error_code> parse_internal_part_met(ByteReader& r){
   (void)r.u32(); // date
@@ -82,6 +134,10 @@ tl::expected<PartFileState,std::error_code> parse_amule_part_met(ByteReader& r){
     }
     if(t.name_id == FT_FILESIZE_HI && is_integer_tag(t)){
       size_high = tag_int(t);
+      continue;
+    }
+    if(t.name_id == FT_INTERNAL_PARTIAL_BLOCKS && std::holds_alternative<std::vector<std::byte>>(t.value)){
+      p.partial_blocks = decode_partial_blocks_blob(std::get<std::vector<std::byte>>(t.value));
       continue;
     }
     if(t.has_string_name() && is_integer_tag(t)){
@@ -142,7 +198,8 @@ void write_named_int_tag(ByteWriter& w, const std::string& name, std::uint64_t v
 }
 
 bool is_part_met_generated_tag(const Tag& t){
-  if(t.name_id == FT_INTERNAL_GAPS || t.name_id == FT_FILESIZE || t.name_id == FT_FILESIZE_HI) return true;
+  if(t.name_id == FT_INTERNAL_GAPS || t.name_id == FT_FILESIZE || t.name_id == FT_FILESIZE_HI
+     || t.name_id == FT_INTERNAL_PARTIAL_BLOCKS) return true;
   if(t.has_string_name()){
     return parse_gap_index(t.name_str, FT_GAPSTART).has_value()
         || parse_gap_index(t.name_str, FT_GAPEND).has_value();
@@ -188,7 +245,10 @@ std::vector<std::byte> write_part_met(const PartFileState& p){
   const bool has_filename = std::any_of(tags.begin(), tags.end(), [](const codec::Tag& t){
     return t.name_id == FT_FILENAME;
   });
-  w.u32(std::uint32_t(tags.size() + (has_filename ? 0 : 1) + 1 + p.gaps.size()*2));
+  // E1: partial_blocks 非空时额外写一个 Blob tag(见 encode_partial_blocks_tag); 为空时不写,
+  // 保持与旧格式字节级一致(现有 round-trip 测试/固定 fixture 不受影响)。
+  const bool has_partial_blocks = !p.partial_blocks.empty();
+  w.u32(std::uint32_t(tags.size() + (has_filename ? 0 : 1) + 1 + p.gaps.size()*2 + (has_partial_blocks ? 1 : 0)));
   write_taglist(w, tags);
   if(!has_filename) write_id_string_tag(w, FT_FILENAME, "part");
   write_id_int_tag(w, FT_FILESIZE, file_size, large);
@@ -196,6 +256,7 @@ std::vector<std::byte> write_part_met(const PartFileState& p){
     write_named_int_tag(w, gap_name(FT_GAPSTART, i), p.gaps[i].first, large);
     write_named_int_tag(w, gap_name(FT_GAPEND, i), p.gaps[i].second, large);
   }
+  if(has_partial_blocks) write_tag(w, encode_partial_blocks_tag(p.partial_blocks));
   return w.take();
 }
 tl::expected<PartFileState,std::error_code> parse_part_met(std::span<const std::byte> data){

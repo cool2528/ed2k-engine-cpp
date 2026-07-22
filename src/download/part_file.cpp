@@ -43,6 +43,13 @@ struct PartFile::Impl {
   std::vector<std::uint64_t> part_filled;  // 每 part 已写入字节数，用于增量组装后触发 MD4 校验
   std::vector<std::vector<bool>> block_done;  // block_done[part][block_in_part]; 块不跨 part 边界
   std::fstream f;
+  // E1: 块级落盘节流计数器 —— 每 kSaveMetBlockInterval 个新完成块调用一次 save_met(), 使 part
+  // 尚未整体完成前也能定期把已下载块级进度落盘(而非只在 part 完成/显式 flush 时才落盘), 降低
+  // 崩溃/异常退出时的重下代价。16 块 ≈ 16×AICH_BLOCK_SIZE ≈ 2.81MiB, 在"落盘 I/O 次数"与
+  // "崩溃丢失窗口大小"间取的折中值(每 part 53 块的场景下, 一个 part 完成前大约再多出 3 次
+  // 这样的中途落盘)。
+  static constexpr std::size_t kSaveMetBlockInterval = 16;
+  std::size_t blocks_since_save = 0;
 
   // 数据 part 数 = ceil(size/PART_SIZE)。aMule GetPartCount() 同此 (块分配/完成判定基准)。
   // part_hashes 可能多 1 (Red 变体: 文件恰为 PART_SIZE 整数倍时 aMule 追加空尾 part MD4(""),
@@ -107,7 +114,28 @@ bool PartFile::Impl::try_load_met(){
     if(!gap_overlaps && data_sz >= pend){
       part_done[i] = true; part_filled[i] = pend - pstart;
       block_done[i].assign(blocks_in_part(i), true);
-    }   // else: 保持 init 的 false (partial/截断 part → 重下)
+      continue;
+    }
+    // E1: part 未整体完成(gap 覆盖或数据被截断)→ 尝试恢复块级进度, 使 resume 不必整 part 重下。
+    // 与上面整 part 分支同一截断防御阈值(data_sz>=pend): 文件曾被截短到此 part 终点之前时,
+    // 已落盘的块内容无法保证仍在盘上, 保守放弃恢复(回退到当前行为: 全 pending, 触发整 part 重下)。
+    // 恢复的块仅标记 done, 不置 part_done(该 part 是否真正完整仍由 part 满时的 MD4 校验决定,
+    // 与"同一次运行内下载中途"的块级 done 语义完全一致, 见 write_block 顶部块状态信任模型注释)。
+    if(data_sz >= pend){
+      auto it = std::find_if(r->partial_blocks.begin(), r->partial_blocks.end(),
+                             [i](const auto& e){ return e.first == static_cast<std::uint32_t>(i); });
+      if(it != r->partial_blocks.end() && it->second.size() == blocks_in_part(i)){
+        std::uint64_t filled = 0;
+        for(std::size_t b=0; b<it->second.size(); ++b){
+          if(!it->second[b]) continue;
+          block_done[i][b] = true;
+          std::uint64_t bstart = pstart + static_cast<std::uint64_t>(b) * AICH_BLOCK_SIZE;
+          std::uint64_t bend = std::min(bstart + AICH_BLOCK_SIZE, pend);
+          filled += (bend - bstart);
+        }
+        part_filled[i] = filled;
+      }
+    }   // else: 保持 init 的 false (partial/截断 part 且无可信块级信息 → 整 part 重下)
   }
   return true;
 }
@@ -134,13 +162,25 @@ void PartFile::Impl::rehash_all(){
     if(part_done[p]) block_done[p].assign(blocks_in_part(p), true);
   }
 }
-// 落盘 .part.met: gaps() 为缺失整 part 区间 (与 part 粒度状态模型一致)。
+// 落盘 .part.met: gaps() 为缺失整 part 区间 (part 粒度); partial_blocks 补充"未完成但已有块
+// 进度"的 part 的块级位图(E1), 使 resume 能跳过已下载块而非整 part 重下。
 void PartFile::Impl::save_met() const {
   ed2k::PartFileState st;
   st.hash = file_hash;
   st.part_hashes = part_hashes;
   st.size = size;
   st.gaps = gaps();
+  // E1: 仅未完成且至少有一块已下载的 part 才落盘块位图(全 pending 的 part 落盘等同旧行为的
+  // "不写", 保持 met 文件大小/字节内容与改动前一致 —— 常见的"整文件刚开始下载"场景不受影响)。
+  for(std::size_t p=0; p<part_done.size(); ++p){
+    if(part_done[p]) continue;
+    bool any_done = false;
+    for(bool d : block_done[p]) if(d){ any_done = true; break; }
+    if(!any_done) continue;
+    std::vector<std::uint8_t> bits(block_done[p].size());
+    for(std::size_t b=0;b<block_done[p].size();++b) bits[b] = block_done[p][b] ? 1 : 0;
+    st.partial_blocks.emplace_back(static_cast<std::uint32_t>(p), std::move(bits));
+  }
   auto bytes = ed2k::write_part_met(st);
   std::ofstream m(met_path, std::ios::binary | std::ios::trunc);
   if(!m.is_open()) return;
@@ -165,6 +205,9 @@ tl::expected<void,std::error_code> PartFile::Impl::write_block(std::uint64_t sta
   f.seekp(start);
   f.write(reinterpret_cast<const char*>(data.data()), data.size());
   block_done[part][bip] = true;
+  // E1: 块级落盘节流 —— 每 kSaveMetBlockInterval 个新完成块落盘一次, 覆盖 part 尚未整体完成
+  // 前的中途进度(避免只靠 part 完成/显式 flush 才落盘, 崩溃窗口过大)。
+  if(++blocks_since_save >= kSaveMetBlockInterval){ save_met(); blocks_since_save = 0; }
   // 按 part 边界切分 [start, end) 累计 part_filled 并触发 MD4 (per-part 块恒单 part)。
   std::uint64_t cur = start;
   std::uint64_t finish = end;
@@ -194,10 +237,15 @@ tl::expected<void,std::error_code> PartFile::Impl::write_block(std::uint64_t sta
         block_done[p].assign(blocks_in_part(p), false);
         part_filled[p] = 0;
         part_done[p] = false;
+        // E1: 立即落盘该重置, 避免此前(周期性落盘)残留的、把该 part 部分块标记为 done 的旧
+        // .part.met 继续存在 —— 否则崩溃后 resume 会信任那些"实际已知损坏"的块级记录。
+        save_met();
+        blocks_since_save = 0;
         return tl::unexpected(make_error_code(errc::block_corrupt));
       }
       part_done[p] = true;
       save_met();   // M2: part 完成 → 持久化 .part.met (崩溃后此 part 无需重哈希)
+      blocks_since_save = 0;
     }
   }
   return {};
@@ -225,6 +273,8 @@ PartFile::Impl::write_block_async(std::uint64_t start, std::uint64_t end, std::s
   // 2) 跳回网络线程变更状态
   co_await boost::asio::post(net_ex, boost::asio::bind_executor(net_ex, boost::asio::use_awaitable));
   block_done[part][bip] = true;
+  // E1: 块级落盘节流(镜像 sync write_block); 已在网络线程(状态变更仅网络线程), 直接同步落盘。
+  if(++blocks_since_save >= kSaveMetBlockInterval){ save_met(); blocks_since_save = 0; }
   std::uint64_t cur = start, finish = end;
   std::optional<std::size_t> filled_part;
   while(cur < finish){
@@ -264,10 +314,14 @@ PartFile::Impl::write_block_async(std::uint64_t start, std::uint64_t end, std::s
       block_done[p].assign(blocks_in_part(p), false);
       part_filled[p] = 0;
       part_done[p] = false;
+      // E1: 立即落盘该重置(镜像 sync write_block), 避免残留的旧 .part.met 继续信任这些已知损坏的块。
+      save_met();
+      blocks_since_save = 0;
       co_return tl::unexpected(make_error_code(errc::block_corrupt));
     }
     part_done[p] = true;
     save_met();   // M2: 网络线程同步写 met (小文件)
+    blocks_since_save = 0;
   }
   co_return tl::expected<void,std::error_code>{};
 }
@@ -339,6 +393,7 @@ std::vector<std::pair<std::size_t,std::size_t>> PartFile::pending_blocks() const
 }
 bool PartFile::complete() const noexcept { return impl_->complete(); }
 std::vector<std::pair<std::uint64_t,std::uint64_t>> PartFile::gaps() const { return impl_->gaps(); }
+void PartFile::save_met() const { impl_->save_met(); }
 tl::expected<ed2k::share::KnownFile,std::error_code> PartFile::to_known_file() const {
   return impl_->to_known_file();
 }

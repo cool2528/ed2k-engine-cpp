@@ -90,8 +90,13 @@ std::string to_string(const Ed2kFileLink&);
 ```cpp
 // server.met
 tl::expected<ServerMet, std::error_code> parse_server_met(std::span<const std::byte>);
-// .part.met (aMule 0xE0/0xE2 format; legacy internal gap blobs still parse)
-struct PartFileState { FileHash hash; std::vector<PartHash> part_hashes; std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps; };
+// .part.met (aMule 0xE0/0xE2 format; legacy internal gap blobs still parse). E1: besides whole-part
+// gaps, an incomplete part that already has some blocks written carries a private extension tag
+// (0xF1) with its per-block completion bitmap, so resume can skip already-downloaded blocks instead
+// of re-fetching the whole part; old .part.met files without that tag still load (no in-flight
+// blocks assumed, matching pre-E1 behavior).
+struct PartFileState { FileHash hash; std::vector<PartHash> part_hashes; std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps;
+                       std::vector<std::pair<std::uint32_t,std::vector<std::uint8_t>>> partial_blocks; };
 tl::expected<PartFileState, std::error_code> parse_part_met(std::span<const std::byte>);
 std::vector<std::byte> write_part_met(const PartFileState&);
 ```
@@ -122,6 +127,8 @@ class PartFile {
   bool complete() const noexcept;
   std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps() const;
   bool is_block_done(std::size_t part, std::size_t block_in_part) const noexcept;
+  void save_met() const;  // E1: explicit flush (pause/cancel/shutdown call this before teardown);
+                          // also throttled automatically every 16 completed blocks and on MD4 mismatch reset
 };
 
 class BlockAllocator {  // per-part block model; blocks never cross a part boundary
@@ -459,7 +466,10 @@ queued --(scheduler picks up)--> connecting --(source found)--> downloading --(c
                                                                           will observe via query())
 ```
 `resume()` accepts `paused` or `failed`; both re-enter `queued` and resume from the task's
-`.part.met` (no re-hash of already-verified parts). `cancel()` is accepted from any state and
+`.part.met` (no re-hash of already-verified parts). E1: an in-flight part that was only partially
+downloaded when `pause()`/`cancel()`/`shutdown()` interrupted it also resumes from its last
+persisted block, not from scratch — see the `PartFileState.partial_blocks` note above.
+`cancel()` is accepted from any state and
 removes the task from the registry; `remove_files=true` additionally deletes the downloaded data
 and `.part.met`, deferred until the task's in-flight coroutine has fully exited (so a task mid
 network I/O never has its backing file yanked out from under it).

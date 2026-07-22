@@ -325,6 +325,60 @@ TEST(PartFile, StalePartMetHashMismatchIgnored){
   std::filesystem::remove_all(dir);
 }
 
+// === E1: 块级 .part.met 续传 ===
+// 审计 E1: save_met() 此前只落盘整 part 粒度的 gaps(), 未完成 part 内已写入的块级进度不落盘。
+// 暂停/取消丢失协程后, resume 只能靠 gaps() 判断"part 未完成"→ 该 part 全部块(含已下载的)重下,
+// 对大文件多源下载浪费严重。本测试验证: 显式 save_met() 落盘未完成 part 的块位图, 重新打开后
+// 已写入块被正确恢复为 done(不重下), 仅剩余块 pending; 补齐剩余块后 part 仍能正常触发 MD4 完成。
+// 写入模式故意不连续(0..24 常规块 + 末块 52 短块 143360B), 同时覆盖"非前缀恢复模式"与"末块
+// 长度不同于常规块"两个 part_filled 记账边界。
+TEST(PartFile, ResumePersistsPartialBlockProgress){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_partial_persist"; std::filesystem::create_directories(dir);
+  auto path = dir/"f";
+  auto d0 = make_part_data(0x11, PART);
+  auto h0 = md4_of(d0);
+  auto fh = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  std::size_t nb = static_cast<std::size_t>((PART + AICH_BLK - 1) / AICH_BLK);
+  ASSERT_EQ(nb, 53u);
+  std::vector<std::size_t> written_blocks;
+  for(std::size_t b=0;b<=24;++b) written_blocks.push_back(b);
+  written_blocks.push_back(52);   // 末块(143360B, 短于常规 AICH_BLK), 与前缀不连续
+  {
+    PartFile pf(path, PART, fh, {h0});
+    for(std::size_t b : written_blocks){
+      std::uint64_t s = b*AICH_BLK, e = std::min(s+AICH_BLK, PART);
+      auto w = pf.write_block(static_cast<std::uint32_t>(s), static_cast<std::uint32_t>(e),
+                     std::span(d0).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)));
+      EXPECT_TRUE(w.has_value()) << "block " << b;
+    }
+    EXPECT_FALSE(pf.complete());   // part 未整体完成(缺 25..51)
+    for(std::size_t b : written_blocks) EXPECT_TRUE(pf.is_block_done(0,b)) << "block " << b;
+    for(std::size_t b=25;b<=51;++b) EXPECT_FALSE(pf.is_block_done(0,b)) << "block " << b;
+    pf.save_met();   // 显式 flush(暂停/取消路径的落盘时机), 落盘块级位图(E1)
+  }
+  // 重新打开(模拟 resume): 已写块应恢复为 done(不重下); 仅 25..51 pending。
+  {
+    PartFile pf(path, PART, fh, {h0});
+    EXPECT_FALSE(pf.complete());
+    for(std::size_t b : written_blocks)
+      EXPECT_TRUE(pf.is_block_done(0,b)) << "resume 后 block " << b << " 应恢复为 done(此前已落盘)";
+    for(std::size_t b=25;b<=51;++b)
+      EXPECT_FALSE(pf.is_block_done(0,b)) << "block " << b << " 未写入, 应仍为 pending";
+    auto pend = pf.pending_blocks();
+    EXPECT_EQ(pend.size(), 27u) << "resume 后仅剩余 25..51 共 27 块应 pending(不应整 part 重下 53 块)";
+    for(auto [p,b] : pend){ EXPECT_EQ(p, 0u); EXPECT_GE(b, 25u); EXPECT_LE(b, 51u); }
+    // 补齐剩余块: part 应能正常触发 MD4 并完成(证 part_filled 记账在恢复后仍正确累计)。
+    for(std::size_t b=25;b<=51;++b){
+      std::uint64_t s = b*AICH_BLK, e = std::min(s+AICH_BLK, PART);
+      auto w = pf.write_block(static_cast<std::uint32_t>(s), static_cast<std::uint32_t>(e),
+                     std::span(d0).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(e-s)));
+      EXPECT_TRUE(w.has_value()) << "block " << b;
+    }
+    EXPECT_TRUE(pf.complete()) << "补齐剩余块后 part 应通过 MD4 校验并完成";
+  }
+  std::filesystem::remove_all(dir);
+}
+
 TEST(PartFile, AmulePartPathLoadsSiblingPartMet){
   auto dir = std::filesystem::temp_directory_path()/"ed2k_pf_amule_sibling_met"; std::filesystem::create_directories(dir);
   auto path = dir/"001.part";

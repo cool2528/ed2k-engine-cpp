@@ -35,6 +35,10 @@ class PartFile {
   std::vector<std::pair<std::size_t,std::size_t>> pending_blocks() const;          // (part, block_in_part)
   bool complete() const noexcept;
   std::vector<std::pair<std::uint64_t,std::uint64_t>> gaps() const;
+  // E1: 显式落盘 .part.met(块级 block_done 位图 + part 粒度 gaps)。除内部节流的周期性落盘外,
+  // 供暂停/取消/关闭路径在协程退出、本对象析构前调用一次, 避免仅存于内存的块级下载进度丢失
+  // (否则 resume 时无法区分"整 part 未下"与"已下大半", 只能整 part 重下)。幂等、可重复调用。
+  void save_met() const;
   tl::expected<ed2k::share::KnownFile,std::error_code> to_known_file() const;
  private:
   struct Impl;

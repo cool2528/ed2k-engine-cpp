@@ -1122,6 +1122,16 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   while(st.active_workers > 0 || st.supervisor_active){
     (void)co_await done_ch.async_receive(boost::asio::use_awaitable);
   }
+  // E1: st.pf 即将随本函数返回而析构(局部变量) —— 无论下面走成功/暂停(cancelled)/错误哪个分支,
+  // 都必须先把当前块级进度显式落盘, 否则 Session::pause()/cancel()(设 st.stop 后由本函数
+  // 这个收尾点自然退出, 见 session.cpp pause/cancel/shutdown 均只是置位 stop 标志、由下载协程
+  // 协作式退出)会丢失内存态里"未完成 part 已下载的块", resume 时只能整 part(9.28MiB)重下。
+  // 选择在此处显式调用而非让 PartFile 析构器顺带做: (1) 本函数三个出口共用同一收尾点, 单点
+  // 覆盖 pause/cancel/shutdown 三条路径, 不必在 session.cpp 各处分别打点; (2) 此刻明确身处
+  // 网络线程(协程恢复于 self.ex), 若改为析构器里做, 其正确性会隐式绑定"PartFile 恰好总在网络
+  // 线程被析构"这一约定——该约定目前成立、但不由类型系统保证, 未来若 PartFile 被移到别处析构
+  // (例如非网络线程持有后 drop)容易被无声破坏; 显式调用更不易在演进中被破坏。
+  st.pf.save_met();
   if(st.pf.complete()) co_return tl::expected<void,std::error_code>{};
   if(st.stopped()) co_return tl::unexpected(make_error_code(errc::cancelled));
   co_return tl::unexpected(st.first_err.value_or(make_error_code(errc::io_error)));
