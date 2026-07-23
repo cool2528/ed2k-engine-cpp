@@ -174,14 +174,17 @@ TEST(C2CConnection, PreferredSilentEncryptedAttemptFallsBackPlainWithinBudget) {
   run_coro(rt, [&]() -> asio::awaitable<void> {
     const auto start = std::chrono::steady_clock::now();
     C2CConnection c(rt.executor());
+    // 预算 600ms: 本机实测全程 ~227ms(静默期 150ms + 回退), 300ms 预算在 CI 虚拟 runner
+    // 的调度抖动下会越界(arm64 macos runner 实际翻车过), 放宽到 4 倍裕量仍能证明
+    // "预算内快速回退"而非挂到任意长。
     auto r = co_await c.connect(loopback_identity(
         acceptor.local_endpoint().port(), obfuscation_test_hash()),
-        ObfuscationPolicy::preferred, 300ms);
+        ObfuscationPolicy::preferred, 600ms);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
     EXPECT_EQ(accepts, 2u);
     EXPECT_FALSE(c.encrypted());
-    EXPECT_LT(elapsed, 300ms);
+    EXPECT_LT(elapsed, 600ms);
     c.close();
     co_return;
   });
