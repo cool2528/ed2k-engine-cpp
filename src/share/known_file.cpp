@@ -66,7 +66,10 @@ std::uint32_t mtime_unix_seconds(const std::filesystem::path& p) {
   std::error_code ec;
   const auto ftime = std::filesystem::last_write_time(p, ec);
   if(ec) return 0;
-  const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+  // 不用 std::chrono::clock_cast:libc++ 未实现该 C++20 特性(macOS 部署目标下编译失败)。
+  // 以 file_clock 与 system_clock 的当前时刻差值换算,秒级精度下偏差可忽略。
+  const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+      ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
   return static_cast<std::uint32_t>(
       std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count());
 }
