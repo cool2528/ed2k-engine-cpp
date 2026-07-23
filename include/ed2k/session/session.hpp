@@ -186,7 +186,7 @@ class ED2K_EXPORT Session {
   // 发布, 但不会启动入站上传 listener(仅记一条 warn 日志, 返回值仍为成功)——这是当前
   // (Phase 0)的已知限制: 二者不能在同一时刻共用监听, 占用方结束后需再次调用本方法才能重试
   // 启动分享 listener(见 Global Constraints 与 src/session/session.cpp 内
-  // Impl::download_listener_count 的详细注释)。
+  // Impl::download_listener 的详细注释)。
   boost::asio::awaitable<tl::expected<void, std::error_code>>
     set_shared_dirs(std::vector<std::filesystem::path> dirs);
   std::vector<SharedFileInfo> shared_files() const;

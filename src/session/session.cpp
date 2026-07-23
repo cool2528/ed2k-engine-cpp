@@ -158,19 +158,26 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   bool known_met_loaded = false;
   share::KnownFileDB known_met_cache;
   // 入站上传连接监听; sharing_active=true 时非空。与下载侧的 LowID 回调 listener 双向互斥
-  // 共用同一个 cfg.tcp_port(见 run_task 内的正向门控 + 下面 download_listener_count 的反向门控)。
+  // 共用同一个 cfg.tcp_port(见 run_task 内的正向门控 + 下面 download_listener 的反向门控)。
   std::optional<peer::InboundListener> share_listener;
   bool sharing_active = false;
-  // 下载侧当前存活的 LowID InboundListener 数量: run_task 自己 bind cfg.tcp_port 成功时递增,
-  // 该协程收尾(唯一退出点, 见 run_task 末尾)时递减。用计数而非布尔是因为多个 LowID 下载任务
-  // 理论上可并发存在(各自独立的 InboundListener 实例, 靠 SO_REUSEADDR 共存, 见下方说明)。
-  // 这是双向互斥门控的反向一半: set_shared_dirs 据此判断 cfg.tcp_port 当前是否已被下载侧
-  // listener 占用——InboundListener 构造时设置了 SO_REUSEADDR, 若不做这层门控, 在 Windows 上
-  // 对同一端口的第二次 bind 会"成功"而不是失败, 导致两个 acceptor 同时监听同一端口, OS 在两条
-  // accept 路径间随机路由入站连接, 彻底破坏"下载 listener 与分享 listener 互斥"这条不变量
+  // D3(下载 TASK 间端口互斥): 下载侧当前存活的 LowID InboundListener(若有)。多个并发 LowID
+  // 下载任务共享同一个实例, 而不是像修复前那样各自独立 emplace 一个——InboundListener 构造设置
+  // 了 SO_REUSEADDR, 若每个任务各自 bind 同一 cfg.tcp_port, 在 Windows 上第二次 bind 会"成功"
+  // 而不是失败, 两个 acceptor 同时监听同一端口, 入站连接被 OS 任意路由给其中一个, 另一个任务的
+  // worker 只能一直等到超时(D1 修复的是同一任务内多 worker 共享一个 listener 时的 crossing,
+  // 这里是 TASK 级的同一个问题)。做法: run_task 需要 listener 时先尝试 lock() 这个弱引用, 命中
+  // 则复用已有实例(其 waiters_ registry 天然按 D1 的规则在多个 worker/多个 task 间路由, 见
+  // inbound_listener.hpp/.cpp, 对 task 数量无感知); 未命中(尚无人创建, 或上一个持有者已全部退出
+  // 导致其析构)才真正 emplace 一个新实例并把 shared_ptr 发布到这里。Impl 本身只弱引用, 不延长
+  // 生命周期——真正的 owner 是当前各自持有 shared_ptr 副本的 run_task 协程(与 C2 之
+  // shared_ptr<LoginSession> 同构): 最后一个协程退出、引用计数归零时该实例自动析构 + 关闭
+  // acceptor, 不需要手动计数或收尾, 也就不存在"忘记对称递减"的风险。
+  // 这也是双向互斥门控的反向一半: set_shared_dirs 据此(!expired())判断 cfg.tcp_port 当前是否
+  // 已被下载侧 listener 占用, 彻底避免"两个 acceptor 同时监听同一端口"这条不变量被破坏
   // (2026-07 复审发现并修复; Phase 0 采用保守降级: 检测到冲突时分享的目录扫描/服务器发布仍然
   // 正常完成, 只是本轮不启动入站上传 listener, 见 set_shared_dirs 内的门控分支)。
-  int download_listener_count = 0;
+  std::weak_ptr<peer::InboundListener> download_listener;
   // set_shared_dirs 挂起(逐目录 disk hop)期间, 若又有一次更晚的调用抢先完成, 用代次让本次
   // 恢复后的写回安静作废, 避免两次并发调用互相覆盖 db/shared_dirs(与 server_generation 同构)。
   std::uint32_t share_generation = 0;
@@ -487,19 +494,31 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     // LowID 源回调需要 listener; bind 失败(端口占用)时保持为空, worker 守卫优雅跳过 LowID。
     // 分享启用时 cfg.tcp_port 已被 share_listener 独占监听(见 Impl::share_listener), 这里不再
     // 重复 bind 同一端口(Global Constraints: 下载 listener 与分享 listener 互斥), LowID 源同样
-    // 优雅跳过。emplace 成功后递增 download_listener_count, 供 set_shared_dirs 做反向门控
-    // (见 Impl::download_listener_count 注释); 本协程只有下面唯一一个退出点(第 359 行的
-    // "self = weak.lock(); if(!self) co_return;" 之后一路直通 on_task_coroutine_exit), 在那里
-    // 对称地递减——若 self 已为空(Impl 已析构)则该 Impl 上的计数不再有意义, 无需处理。
+    // 优雅跳过。
+    // D3(下载 TASK 间端口互斥): 与其它并发 LowID 下载任务共享同一个 InboundListener 实例,
+    // 而不是各自 emplace 一个各自 bind 同一 cfg.tcp_port(旧代码在 Windows 上因 SO_REUSEADDR
+    // 静默允许第二次 bind、导致入站连接被 OS 任意路由给其中一个 acceptor、另一个任务的 worker
+    // 永远等不到连接; 见 Impl::download_listener 注释)。先 lock() 弱引用尝试复用其它并发任务
+    // 已经建好的实例——命中即安全共享, 因为 D1 的 waiters_ 登记表/单读者 accepter 本就是按
+    // Waiter(expected_ip 或 FIFO)路由, 对"这个 worker 属于哪个 task"完全无感知, 天然支持跨
+    // task 共享同一个 accept 循环。未命中(尚无人创建, 或此前的持有者已全部退出导致实例已析构)
+    // 时才真正 emplace 一个新实例, 并把 shared_ptr 发布到 self->download_listener(弱引用)供
+    // 后续任务复用。listener 是本协程持有的 shared_ptr 局部变量(与 shared_login 同构): 协程
+    // 结束(任何退出路径, 包括第 359 行 "self = weak.lock(); if(!self) co_return;" 之后的提前
+    // 返回)时随协程帧一起自动析构, 不需要像旧的 int 计数那样手动对称递减, 也就不存在"忘记
+    // 递减"的风险——多个任务同时持有时, 只有最后一个释放的那个才会真正关闭 acceptor。
     bool has_low_id = std::any_of(gs->sources.begin(), gs->sources.end(),
                                   [](const server::SourceEndpoint& s){ return s.low_id(); });
-    std::optional<peer::InboundListener> listener;
+    std::shared_ptr<peer::InboundListener> listener;
     if(has_low_id && !self->sharing_active){
-      try {
-        listener.emplace(ex, self->cfg.tcp_port);
-        ++self->download_listener_count;
+      listener = self->download_listener.lock();
+      if(!listener){
+        try {
+          listener = std::make_shared<peer::InboundListener>(ex, self->cfg.tcp_port);
+          self->download_listener = listener;
+        }
+        catch(const std::exception&) { /* 端口被占 — LowID 源跳过 */ listener.reset(); }
       }
-      catch(const std::exception&) { /* 端口被占 — LowID 源跳过 */ }
     }
 
     // B4: Kad 增源接入下载。不能直接把 self->kad 注入 MultiSourceDownload::Builder——
@@ -564,9 +583,8 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
         self->set_state(*t, TaskState::failed, r.error());
       }
     }
-    // 对称递减 download_listener_count(与上面 emplace 成功时的递增配对); listener 是否持有值
-    // 精确对应"本协程是否曾经递增过", 覆盖成功/失败/取消全部三种结局(唯一退出点, 见上方注释)。
-    if(listener) --self->download_listener_count;
+    // D3: listener(shared_ptr 局部变量)在此随协程帧结束自动析构, 引用计数自动回收, 不需要像
+    // 旧的 int 计数那样手动对称递减(覆盖成功/失败/取消全部三种结局, 见上方 listener 创建处注释)。
     self->on_task_coroutine_exit(id);
     co_return;
   }
@@ -1128,20 +1146,21 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
     self->sharing_active = false;
     if(self->share_listener) self->share_listener->close();
     self->share_listener.reset();
-  } else if(!self->share_listener && self->download_listener_count > 0){
+  } else if(!self->share_listener && !self->download_listener.expired()){
     // 反向门控(双向互斥的另一半): cfg.tcp_port 当前正被下载侧的 LowID InboundListener 占用
-    // (见 Impl::download_listener_count 注释)。InboundListener 构造设置了 SO_REUSEADDR, 若在
+    // (见 Impl::download_listener 注释)。InboundListener 构造设置了 SO_REUSEADDR, 若在
     // 这里无条件 emplace, 在 Windows 上第二次 bind 会"成功"而不是失败, 形成两个 acceptor 同时
     // 监听同一端口, 破坏互斥保证——因此宁可保守降级: 本轮扫描/发布仍然正常完成(对调用方而言
     // set_shared_dirs 依旧返回成功), 只是不启动入站上传 listener, sharing_active 保持 false。
     // Phase 0 已知限制: 下载 LowID 与分享的入站上传不能在同一时刻共用监听——占用下载listener
     // 的任务全部结束后, 需要调用方再次调用 set_shared_dirs 才能重新尝试启动分享 listener,
-    // 本方法自身不会自动重试。
+    // 本方法自身不会自动重试。use_count() 现在反映的是"当前有多少个并发下载任务在共享同一个
+    // 实例"(D3: 弱引用不计入内), 与旧的 download_listener_count 语义等价。
     spdlog::warn("Session::set_shared_dirs: tcp_port {} is currently held by {} active "
                  "download LowID listener(s); scan/publish still applied, but the inbound "
                  "upload listener was NOT started this round (call set_shared_dirs again "
                  "once the download(s) finish).",
-                 self->cfg.tcp_port, self->download_listener_count);
+                 self->cfg.tcp_port, self->download_listener.use_count());
   } else if(!self->share_listener){
     try {
       self->share_listener.emplace(net_ex, self->cfg.tcp_port);

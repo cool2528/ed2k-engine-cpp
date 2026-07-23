@@ -293,11 +293,11 @@ TEST(SessionShare, UploadStatsNewFieldsDefaultZero){
 // SO_REUSEADDR, 若不做门控, Windows 上第二次 bind 会"成功"而不是失败, 两个 acceptor 同时监听
 // 同一端口, 破坏互斥不变量——这正是 brief 复审要求修复的问题)。
 //
-// 这里只能黑盒验证"扫描/发布仍按预期完成且不报错"这一半可观察契约(Impl::download_listener_count
+// 这里只能黑盒验证"扫描/发布仍按预期完成且不报错"这一半可观察契约(Impl::download_listener
 // 是私有实现细节, 没有、也不打算为测试新增公共访问器); "listener 确实没有被第二次 bind"这一半
 // 更难在不扩大公共 API 的前提下做稳定的黑盒断言(SO_REUSEADDR 在 Windows 上的语义使得从测试侧
 // 尝试探测端口占用情况本身就不可靠, 容易做出 flaky 或误导性的判定), 因此按 brief 允许的"难以
-// 稳定构造则跳过并说明"处理, 依赖代码走查(见 session.cpp 内 download_listener_count 相关注释与
+// 稳定构造则跳过并说明"处理, 依赖代码走查(见 session.cpp 内 download_listener 相关注释与
 // task-9-report.md 的自审记录)确认反向分支的正确性。
 TEST(SessionShare, SetSharedDirsDegradesGracefullyWhileDownloadListenerActive){
   const auto hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
@@ -334,7 +334,7 @@ TEST(SessionShare, SetSharedDirsDegradesGracefullyWhileDownloadListenerActive){
     EXPECT_NE(task_id, 0u);
     // 轮询直到进入 downloading: run_task 在这之前已经完成了(可能的) LowID listener bind
     // (见 session.cpp::run_task, listener 创建早于 set_state(downloading)), 因此一旦观察到
-    // downloading 就能保证 download_listener_count 已经是最终值。
+    // downloading 就能保证 download_listener(弱引用)是否 expired() 已经是最终值。
     asio::steady_timer timer(rt.context());
     for(int i = 0; i < 250; ++i){
       auto snap = session.query(task_id);
