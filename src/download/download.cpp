@@ -465,8 +465,15 @@ fetch_hashset(boost::asio::any_io_executor ex,
     if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
     auto cb = co_await server_conn->get().callback_request(source.endpoint.id, timeout);
     if(!cb) co_return tl::unexpected(cb.error());
+    // D1: accept_peer 新增 expected_ip 形参, 用于同一 InboundListener 被多个 worker(多个并发
+    // LowID 源)共享等待时按源 IP 精确路由入站连接(见 inbound_listener.hpp/.cpp 注释)。此处传
+    // std::nullopt——eD2k GETSOURCES 对 LowID 源只给不透明 id+port(SourceEndpoint), 协议层面
+    // 拿不到源的真实 IP, 无法预先告知期望值; InboundListener 内部退化为按登记顺序 FIFO 分派给
+    // 同样未指定期望的等待者, 仍然消除了修复前"多个协程各自裸 accept 竞态"导致的乱序错配,
+    // 只是无法在多个并发 LowID 源之间逐一核验身份(需要握手 HELLO 里的 client_id 这类更强信号,
+    // 但那要等连接已经派给某个 worker 之后才能读到, 超出本任务范围)。
     auto acc = co_await listener->get().accept_peer(local_user_hash, obfuscation_policy, timeout,
-                                                     ip_filter, ip_filter_level);
+                                                     ip_filter, ip_filter_level, std::nullopt);
     if(!acc) co_return tl::unexpected(acc.error());
     conn_opt.emplace(std::move(*acc));
     accepted = true;
@@ -679,8 +686,10 @@ setup_source_phase(boost::asio::any_io_executor ex,
     if(!server_conn || !listener) co_return tl::unexpected(make_error_code(errc::connect_failed));
     auto cb = co_await server_conn->get().callback_request(source.endpoint.id, timeout);
     if(!cb) co_return tl::unexpected(cb.error());
+    // D1: expected_ip 传 std::nullopt, 理由同 fetch_hashset 里的同名调用(eD2k 协议对 LowID 源
+    // 拿不到真实 IP), 见该处注释。
     auto acc = co_await listener->get().accept_peer(local_user_hash, obfuscation_policy, timeout,
-                                                     ip_filter, ip_filter_level);
+                                                     ip_filter, ip_filter_level, std::nullopt);
     if(!acc) co_return tl::unexpected(acc.error());
     conn_opt.emplace(std::move(*acc));
     accepted = true;
