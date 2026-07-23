@@ -155,7 +155,7 @@ TEST(PartFile, IncrementalBlocksCompletePart){
     std::size_t blk = 184320;
     for(std::size_t off=0; off<PART; off+=blk){
       std::uint32_t start = std::uint32_t(off);
-      std::uint32_t end = std::uint32_t(std::min(off+blk, PART));
+      std::uint32_t end = std::uint32_t(std::min<std::uint64_t>(off+blk, PART));
       EXPECT_TRUE(pf.write_block(start, end, std::span(d0).subspan(off, end-start)).has_value());
     }
     EXPECT_TRUE(pf.complete());   // 所有 per-part 块写齐 -> part MD4 校验通过
