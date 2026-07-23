@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(ed2kengine LANGUAGES CXX VERSION 2.7.3)
+project(ed2kengine LANGUAGES CXX VERSION 2.7.4)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
