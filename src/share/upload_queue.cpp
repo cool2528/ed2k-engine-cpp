@@ -3,10 +3,11 @@
 
 namespace ed2k::share {
 
-UploadQueue::UploadQueue(std::size_t max_slots, const ClientCredits* credits, const infra::FriendList* friends)
-  : max_slots_(max_slots), credits_(credits), friends_(friends) {}
+UploadQueue::UploadQueue(std::size_t max_slots, const ClientCredits* credits,
+                        const infra::FriendList* friends, std::size_t max_queued)
+  : max_slots_(max_slots), credits_(credits), friends_(friends), max_queued_(max_queued) {}
 
-UploadQueueDecision UploadQueue::enqueue(const UserHash& user_hash, const FileHash& file_hash) {
+UploadQueueDecision UploadQueue::enqueue(const UserHash& user_hash, const FileHash& file_hash, IPv4 ip) {
   if(has_slot(user_hash)) return {UploadQueueState::accepted, 0};
   const auto queued_it = std::find_if(queued_.begin(), queued_.end(), [&](const Entry& e) {
     return e.user_hash == user_hash;
@@ -22,12 +23,15 @@ UploadQueueDecision UploadQueue::enqueue(const UserHash& user_hash, const FileHa
             static_cast<std::uint16_t>(std::distance(queued_.begin(), queued_it) + 1)};
   }
 
-  Entry entry{user_hash, file_hash};
   if(active_.size() < max_slots_ && queued_.empty()) {
-    active_.push_back(entry);
+    active_.push_back({user_hash, file_hash, ip});
     return {UploadQueueState::accepted, 0};
   }
+  // P2c A7: 队列已满(queued_ 已达 max_queued_ 容量上限)——不插入, 让调用方答 QUEUEFULL 而非把
+  // 这个新请求方派进一个它永远等不到晋升的队列尾巴。
+  if(queued_.size() >= max_queued_) return {UploadQueueState::full, 0};
 
+  Entry entry{user_hash, file_hash, ip};
   auto insert_at = queued_.end();
   const bool new_friend = friends_ && friends_->is_friend_slot(user_hash);
   const auto new_score = credits_ ? credits_->score(user_hash) : 0;
@@ -76,6 +80,13 @@ std::uint16_t UploadQueue::rank(const UserHash& user_hash) const {
     if(queued_[i].user_hash == user_hash) return static_cast<std::uint16_t>(i + 1);
   }
   return 0;
+}
+
+std::optional<UserHash> UploadQueue::find_queued(IPv4 ip, const FileHash& file_hash) const {
+  for(const auto& e : queued_) {
+    if(e.ip == ip && e.file_hash == file_hash) return e.user_hash;
+  }
+  return std::nullopt;
 }
 
 } // namespace ed2k::share

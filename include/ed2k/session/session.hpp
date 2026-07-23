@@ -56,6 +56,18 @@ struct SessionConfig {
   // 编排监督(Task 6 source_reask_supervisor)周期重问服务器源的间隔; 生产默认 3 分钟(eMule 惯例),
   // 独立字段便于测试注入更短值。语义等同 download::kSourceReaskInterval。
   std::chrono::milliseconds source_reask_interval = std::chrono::minutes(3);
+  // P2c A8: 本会话(作为下载方时)排队等待循环里"TCP 静默多久才发一次 UDP REASKFILEPING 保活"的
+  // 周期; 生产默认 60s(eMule 惯例, 语义等同 peer::kReaskInterval, 此处不直接引用该常量以避免
+  // session.hpp 新增对 peer_reask.hpp 的头文件依赖)。测试可传短值, 避免真实等待一整分钟才走到
+  // engine-to-engine 排队/reask 场景。
+  std::chrono::milliseconds peer_reask_interval = std::chrono::seconds(60);
+  // P2c A7: 本会话(作为分享/上传方时)同时上传的活跃槽位数上限; 默认沿用旧硬编码值 10
+  // (eMule 传统默认)。
+  std::size_t max_upload_slots = 10;
+  // P2c A7: 上传排队队列长度上限——超出后 STARTUPLOADREQ/REASKFILEPING 均判定为 QUEUEFULL 而非
+  // 正常入队/维持排名, 促使下载方放弃该源而不是傻等一个进不去的队列。默认不限(SIZE_MAX, 保持
+  // 与引入本字段之前完全一致的行为); 测试可传很小的值确定性触发 QUEUEFULL。
+  std::size_t max_upload_queue_length = SIZE_MAX;
   // 启用 Kad(DHT) 子系统: 用 data_dir/nodes.dat 做种子引导, 维护路由表并可被其它 Kad 节点发现,
   // shutdown 时把当前路由表落盘回 nodes.dat。下载增源(find_sources)已接入(B4): run_task 从
   // 主路由表快照 peers 后, 新建一个独立 socket 的 ephemeral KadNetwork 专供该次下载查询, 不与

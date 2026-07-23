@@ -17,6 +17,7 @@
 #include "ed2k/server/connection.hpp"  // ServerConnection (M3 LowID callback)
 #include "ed2k/peer/c2c_connection.hpp"
 #include "ed2k/peer/inbound_listener.hpp"  // InboundListener (M3 LowID callback)
+#include "ed2k/peer/peer_reask.hpp"    // peer::kReaskInterval (P2c A8: run() 排队保活周期默认值)
 namespace ed2k::kad {
 class KadNetwork;
 struct KadSearchEntry;
@@ -140,10 +141,14 @@ class MultiSourceDownload {
   [[deprecated("Use Builder.disk_executor()")]]
   void set_disk_executor(boost::asio::any_io_executor ex);
 
+  // peer_reask_interval(P2c A8): 排队等待循环里"TCP 静默多久才发一次 UDP REASKFILEPING 保活"的
+  // 周期; 生产默认 peer::kReaskInterval(60s, eMule 惯例)。测试可传短值, 避免真实等待一整分钟
+  // 才走到 engine-to-engine 排队/reask 场景(见 session_test.cpp 的 EngineToEngine 用例)。
   boost::asio::awaitable<tl::expected<void,std::error_code>> run(
     std::chrono::milliseconds total_timeout, std::size_t max_retries = 3,
     std::chrono::milliseconds source_reask_interval = kSourceReaskInterval,
-    std::chrono::milliseconds source_reconnect_backoff = kSourceReconnectBackoff);
+    std::chrono::milliseconds source_reconnect_backoff = kSourceReconnectBackoff,
+    std::chrono::milliseconds peer_reask_interval = peer::kReaskInterval);
 
   MultiSourceDownload(const MultiSourceDownload&) = delete;
   MultiSourceDownload& operator=(const MultiSourceDownload&) = delete;

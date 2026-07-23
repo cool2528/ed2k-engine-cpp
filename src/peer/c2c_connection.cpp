@@ -314,6 +314,11 @@ C2CConnection::Impl::pump_until_upload_result(std::chrono::milliseconds budget){
       if(!rank) co_return tl::unexpected(rank.error());
       co_return UploadOutcome{UploadQueued{*rank}};
     }
+    // P2c A7: 队列满(见 upload_session.cpp 的 UploadQueueState::full 分支), 仅在 eMule 协议标记下
+    // 识别(0x93 在 eDonkey/TCP 命名空间另有 MULTIPACKETANSWER 含义, 本引擎未使用后者, 但仍按标记
+    // 收紧匹配, 不无条件吞任意协议下的该字节)。
+    if(pkt.opcode == ed2k::peer::op::QUEUEFULL && pkt.protocol == ed2k::net::proto::eMule)
+      co_return UploadOutcome{UploadQueueFull{}};
     if(pkt.opcode == ed2k::peer::op::FILEREQANSNOFIL) co_return tl::unexpected(make_error_code(errc::file_not_found));
     continue;
   }

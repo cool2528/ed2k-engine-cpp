@@ -99,10 +99,13 @@ peer::HelloInfo default_hello(peer::ObfuscationPolicy policy = peer::Obfuscation
   return mine;
 }
 
-// 我方在 mule-info 握手中通告的信息。udp_port 保持默认值 0: 本引擎的上传/分享侧
-// (share::UploadSession) 尚未实现入站 UDP reask 应答 (设计文档 P2 的 A8), 在那之前如实
-// 通告"不可达", 避免让对端 (若把我方当上传源) 误判我方支持 UDP reask。其余字段沿用
-// MuleInfo 的默认值 (已是符合 aMule 惯例的协议标识)。
+// 我方"作为下载方连出去"时在 mule-info 握手中通告的信息。udp_port 保持默认值 0: 本函数是纯
+// free function, 无法感知本进程当前是否也在分享(即 Session::Impl::share_udp_ 是否绑定成功、
+// 绑在哪个端口)——那是 P2c A8 的范围(share::UploadSession 已实现入站 UDP reask 应答, 见
+// upload_session.cpp::handle() 的 EMULEINFO 分支 + session.cpp::udp_reask_loop), 但那个真实
+// 端口号只有 Session::Impl 知道, 这里如实通告"不可达"是安全的保守值, 不影响 A8 本身(A8 是
+// "我方接受入站上传请求时能否应答 REASKFILEPING", 与"我方发起下载时通告什么 udp_port"是两个
+// 方向, 互不依赖)。其余字段沿用 MuleInfo 的默认值(已是符合 aMule 惯例的协议标识)。
 peer::MuleInfo default_mule_info() {
   return peer::MuleInfo{};
 }
@@ -899,8 +902,10 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
 // 统一处理"保持 TCP 连接、等到真正被接受(或彻底放弃)为止"这一段。
 //
 // 每轮循环并发等待两类事件之一(architecture decision #3 的"TWO events"): (a) TCP 帧: 用
-// conn.wait_upload_outcome(kReaskInterval) 等到下一个 ACCEPTUPLOADREQ/新 QUEUERANKING/错误,
-// 或干等满 kReaskInterval 收不到任何东西(超时)。(b) 若 (a) 超时且源通告了 UDP 端口
+// conn.wait_upload_outcome(peer_reask_interval) 等到下一个 ACCEPTUPLOADREQ/新 QUEUERANKING/错误,
+// 或干等满 peer_reask_interval 收不到任何东西(超时)。peer_reask_interval 生产默认
+// peer::kReaskInterval(60s, 见调用方 run()/peer_worker 的参数默认值), 测试可传短值避免真实
+// 等待(P2c A8 engine-to-engine 测试用此缩短排队保活周期)。(b) 若 (a) 超时且源通告了 UDP 端口
 // (source_udp_port!=0), 串行化(架构决策#1, 经 ReaskGate)发起一次 reask_source, 同时不放弃 TCP
 // 监听——用 awaitable_operators 的 || 竞速"继续等 TCP"和"这次 reask", 让 ACCEPTUPLOADREQ 若恰好
 // 在 reask 往返期间到达也能被立刻捕捉; reask 自身的预算(kReaskCallTimeout)严格小于竞速中 TCP
@@ -918,7 +923,8 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
 // st.stop/取消 → errc::cancelled; 连接层面真实错误(如 connection_closed) → 原样放弃该源。
 static boost::asio::awaitable<tl::expected<void,std::error_code>>
 queue_wait_phase(ed2k::peer::C2CConnection& conn, SharedState& st,
-                 std::uint16_t source_udp_port, IPv4 source_ip) {
+                 std::uint16_t source_udp_port, IPv4 source_ip,
+                 std::chrono::milliseconds peer_reask_interval) {
   using namespace boost::asio::experimental::awaitable_operators;
   using clock_type = std::chrono::steady_clock;
   auto liveness_deadline = clock_type::now() + kQueueWaitMax;
@@ -935,6 +941,10 @@ queue_wait_phase(ed2k::peer::C2CConnection& conn, SharedState& st,
     }
     if(std::holds_alternative<ed2k::peer::UploadAccepted>(*outcome))
       return tl::expected<void,std::error_code>{};
+    // P2c A7: 对端队列已满(见 UploadOutcome::UploadQueueFull)——与 UDP reask 侧的 QUEUEFULL 同一
+    // 语义, 放弃该源(瞬时性, errc::upload_queued, Task 6 编排监督可稍后重试), 不当作"继续排队"。
+    if(std::holds_alternative<ed2k::peer::UploadQueueFull>(*outcome))
+      return tl::unexpected(make_error_code(errc::upload_queued));
     liveness_deadline = clock_type::now() + kQueueWaitMax;   // Queued: 收到新排名, 刷新存活期
     return std::nullopt;
   };
@@ -943,7 +953,7 @@ queue_wait_phase(ed2k::peer::C2CConnection& conn, SharedState& st,
     if(st.stopped()) co_return tl::unexpected(make_error_code(errc::cancelled));
     if(clock_type::now() >= liveness_deadline) co_return tl::unexpected(make_error_code(errc::timed_out));
 
-    auto tcp_result = co_await conn.wait_upload_outcome(peer::kReaskInterval);
+    auto tcp_result = co_await conn.wait_upload_outcome(peer_reask_interval);
     if(auto done = classify(tcp_result)) co_return *done;
     if(tcp_result) continue;                 // Queued(已刷新存活期): 直接下一轮, 不必 reask
     // 走到这里 = 本轮 kReaskInterval 内 TCP 静默无新帧(tcp_result 持有 timed_out)。
@@ -980,11 +990,16 @@ queue_wait_phase(ed2k::peer::C2CConnection& conn, SharedState& st,
 static boost::asio::awaitable<tl::expected<void,std::error_code>>
 run_source_session(ed2k::peer::C2CConnection& conn, SharedState& st, std::vector<bool> fs_parts,
                    std::uint16_t source_udp_port, IPv4 source_ip,
-                   std::chrono::milliseconds timeout, std::size_t max_retries){
+                   std::chrono::milliseconds timeout, std::size_t max_retries,
+                   std::chrono::milliseconds peer_reask_interval){
   auto upload = co_await start_upload_phase(conn, st.hash, timeout);
   if(!upload) co_return tl::unexpected(upload.error());
+  // P2c A7: 首次 STARTUPLOADREQ 即被答 QUEUEFULL(源队列已满, 见 UploadSession 的 max_queued 容量
+  // 上限)——与排队中途 reask/TCP 收到 QUEUEFULL 同一放弃语义, 不当作可排队重试。
+  if(std::holds_alternative<peer::UploadQueueFull>(*upload))
+    co_return tl::unexpected(make_error_code(errc::upload_queued));
   if(std::holds_alternative<peer::UploadQueued>(*upload)){
-    auto waited = co_await queue_wait_phase(conn, st, source_udp_port, source_ip);
+    auto waited = co_await queue_wait_phase(conn, st, source_udp_port, source_ip, peer_reask_interval);
     if(!waited) co_return tl::unexpected(waited.error());
   }
 
@@ -998,7 +1013,7 @@ run_source_session(ed2k::peer::C2CConnection& conn, SharedState& st, std::vector
     // 中途被源打回排队 (架构决策#4, accumulate_blocks 新识别的信号): 回排队等待循环而非直接放弃
     // 该源。此路径未解出具体新排名(保持 accumulate_blocks 改动最小化), queue_wait_phase 不需要
     // 排名输入, 无影响。
-    auto requeued = co_await queue_wait_phase(conn, st, source_udp_port, source_ip);
+    auto requeued = co_await queue_wait_phase(conn, st, source_udp_port, source_ip, peer_reask_interval);
     if(!requeued) co_return tl::unexpected(requeued.error());
     // 重新被接受: 循环回去继续 pull_blocks_phase(同一连接/文件, aich_active 不变无需重新协商)。
   }
@@ -1027,6 +1042,7 @@ peer_worker(boost::asio::any_io_executor ex,
             ed2k::peer::ObfuscationPolicy obfuscation_policy,
             std::optional<UserHash> local_user_hash,
             std::chrono::milliseconds reconnect_backoff,
+            std::chrono::milliseconds peer_reask_interval,
             ResultCh& done_ch){
   auto finish = [&](std::error_code ec){
     st.set_error(ec);        // 首个失败错误 (单网络线程 → 无竞争)
@@ -1047,7 +1063,7 @@ peer_worker(boost::asio::any_io_executor ex,
     tl::expected<void,std::error_code> result;
     if(setup){
       result = co_await run_source_session(setup->conn, st, setup->fs_parts, setup->source_udp_port,
-                                           source_ip, timeout, max_retries);
+                                           source_ip, timeout, max_retries, peer_reask_interval);
     } else {
       result = tl::unexpected(setup.error());
     }
@@ -1074,6 +1090,10 @@ peer_worker(boost::asio::any_io_executor ex,
 // 本文件既有惯例(fetch_hashset/setup_source_phase/peer_worker 均以摊平字段传参, 而非传 Impl&),
 // 用这个小结构体收敛 Task 6 新增两处调用点(spawn_worker/source_reask_supervisor)的公共字段,
 // 不改动既有函数签名。全部字段按值持有(shared_ptr/optional<reference_wrapper> 拷贝代价低)。
+// peer_reask_interval(P2c A8 新增): 同属"整次下载不变"的配置, 直接放进本结构体而非像
+// reconnect_backoff 那样另开一个直传参数——这样 spawn_worker/source_reask_supervisor 的既有
+// 调用点(4 处: run() 初始批次 2 处 + source_reask_supervisor 内新源/重试源 2 处)都不必逐一新增
+// 实参, 只需在 run() 构造 wc 时填一次。
 struct WorkerContext {
   boost::asio::any_io_executor ex;
   std::optional<std::reference_wrapper<ed2k::server::ServerConnection>> server_conn;
@@ -1082,6 +1102,7 @@ struct WorkerContext {
   std::uint8_t ip_filter_level;
   ed2k::peer::ObfuscationPolicy obfuscation_policy;
   std::optional<UserHash> local_user_hash;
+  std::chrono::milliseconds peer_reask_interval;
 };
 
 // 启动一个新的 peer_worker(Task 6): 递增 active_workers 后 co_spawn, 供 run() 的初始批次与
@@ -1098,7 +1119,7 @@ spawn_worker(const WorkerContext& wc, const ed2k::peer::PeerIdentity& source, Sh
     peer_worker(wc.ex, source, std::move(pre_conn), std::move(pre_parts), pre_udp_port, st,
                 timeout, max_retries, wc.server_conn, wc.listener,
                 wc.ip_filter, wc.ip_filter_level, wc.obfuscation_policy,
-                wc.local_user_hash, reconnect_backoff, done_ch),
+                wc.local_user_hash, reconnect_backoff, wc.peer_reask_interval, done_ch),
     boost::asio::detached);
 }
 
@@ -1172,7 +1193,8 @@ boost::asio::awaitable<tl::expected<void,std::error_code>>
 MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
                          std::size_t max_retries,
                          std::chrono::milliseconds source_reask_interval,
-                         std::chrono::milliseconds source_reconnect_backoff){
+                         std::chrono::milliseconds source_reconnect_backoff,
+                         std::chrono::milliseconds peer_reask_interval){
   auto& self = *impl_;
   // B4: peers 由调用方显式传入(self.kad_peers), 不再从 kad_network 自己的路由表取——
   // kad_network 常见是调用方新建的 ephemeral 实例(独立 socket, 不与常驻 Kad 读者抢包,
@@ -1239,7 +1261,7 @@ MultiSourceDownload::run(std::chrono::milliseconds total_timeout,
   // try_send 是非阻塞的 fire-and-forget, 容量不足会静默丢 token 导致 run() 的收尾等待永久挂起,
   // 故宁可预留充分)。
   WorkerContext wc{self.ex, self.server_conn, self.listener, self.ip_filter, self.ip_filter_level,
-                   self.obfuscation_policy, self.local_user_hash};
+                   self.obfuscation_policy, self.local_user_hash, peer_reask_interval};
   ResultCh done_ch(self.ex, n_workers + kDoneChannelHeadroom);
   for(std::size_t i = setup_idx; i < self.sources.size(); ++i){
     if(i == setup_idx){

@@ -1035,3 +1035,151 @@ TEST(Session, UdpGlobalSourcesFallbackUsedWhenServerReturnsNoSources){
   EXPECT_EQ(std::filesystem::file_size(out), PART*2);
   std::filesystem::remove_all(tmp_dir);
 }
+
+// P2c(Task 9): engine-to-engine 队列/reask 全链路。两个真实 Session: U 分享(max_upload_slots=1,
+// 逼迫排队)+ D 下载(极短 peer_reask_interval, 逼真走 UDP reask 保活而非等生产默认 60s)。用一个
+// 原始 TCP 客户端(occupier)预占 U 的唯一上传槽位, D 随后连接必然排队而非直接被接受; D 的短
+// reask 间隔驱使其在 TCP 静默后发 REASKFILEPING, U 的 UDP 应答器(A8)回 REASKACK(当前排名);
+// occupier 断开释放槽位后, U 的 UploadSession 在下一次排队短轮询(A8 的自我提升机制, 见
+// upload_session.cpp::run() 实现注释)里发现槽位已空、主动下发 ACCEPTUPLOADREQ, D 的
+// queue_wait_phase 据此转入下载、完整拉取多块文件并按内容逐字节比对。
+// RED(改动前): U 从不应答 REASKFILEPING(A8 缺失), 也没有任何机制在槽位释放后把排队中的 D
+// 晋升为 active(UploadQueue::tick() 生产代码从未调用)——D 会一直排队直到 kQueueWaitMax(30min)
+// 才超时放弃, 本用例的完成断言会失败(经 git stash 验证, 见 report)。
+TEST(Session, EngineToEngineQueuedDownloadCompletesAfterReaskAndSlotRelease){
+  auto share_dir = std::filesystem::temp_directory_path() / "ed2k_e2e_share";
+  auto data_dir_u = std::filesystem::temp_directory_path() / "ed2k_e2e_data_u";
+  auto data_dir_d = std::filesystem::temp_directory_path() / "ed2k_e2e_data_d";
+  std::filesystem::remove_all(share_dir);
+  std::filesystem::remove_all(data_dir_u);
+  std::filesystem::remove_all(data_dir_d);
+  std::filesystem::create_directories(share_dir);
+  std::filesystem::create_directories(data_dir_u);
+  std::filesystem::create_directories(data_dir_d);
+
+  // ~3.5 个 AICH block(184320B/块, 单 part, 远小于 PART_SIZE): 真正走多次 REQUESTPARTS/
+  // SENDINGPART 拉取, 而不是 1 字节文件, 但仍保持测试在 loopback 上快速完成。
+  const auto data_size = static_cast<std::size_t>(3 * 184320 + 777);
+  std::vector<std::byte> data(data_size);
+  { std::uint32_t x = 0xE2E00001u;
+    for(std::size_t i = 0; i < data_size; ++i){
+      x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+      data[i] = std::byte(x & 0xFFu);
+    }
+  }
+  const auto shared_path = share_dir / "e2e_payload.bin";
+  { std::ofstream f(shared_path, std::ios::binary|std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size())); }
+
+  IoRuntime rt;
+
+  // Session U: 上传方。max_upload_slots=1 强制排队场景; UDP reask 应答由本任务(A8)提供。
+  constexpr std::uint16_t kSessionUPort = 48192;   // 与既有用例(48173-48177, 48191)不同的专用端口
+  SessionConfig cfg_u;
+  cfg_u.data_dir = data_dir_u;
+  cfg_u.tcp_port = kSessionUPort;
+  cfg_u.max_upload_slots = 1;
+  Session session_u(rt, cfg_u);
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    std::vector<std::filesystem::path> dirs{share_dir};
+    auto r = co_await session_u.set_shared_dirs(std::move(dirs));
+    EXPECT_TRUE(r.has_value()) << (r ? "" : r.error().message());
+    co_return;
+  });
+  auto shared = session_u.shared_files();
+  ASSERT_EQ(shared.size(), 1u);
+  const auto hash = shared[0].hash;
+  const auto size = shared[0].size;
+  EXPECT_EQ(size, data.size());
+
+  // Session D: 下载方。极短 peer_reask_interval 逼真走 UDP reask 保活(而非等生产默认 60s)。
+  // mock 服务器只登录并回 0 源(满足 run_task 的登录前提, 避免误连真实互联网服务器); 真源来自
+  // 下面的链接内嵌 s=IP 源提示(B6a, 本 phase Task 6 已落地)。
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    (void)co_await read_frame(s);   // LOGINREQUEST
+    { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+      co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+    (void)co_await read_frame(s);   // GETSOURCES
+    { codec::ByteWriter w; w.hash16(hash); w.u8(0);
+      co_await send_pkt(s, ed2k::server::op::FOUNDSOURCES, w.take()); }
+    co_await keep_alive(s);
+    co_return;
+  });
+
+  SessionConfig cfg_d;
+  cfg_d.data_dir = data_dir_d;
+  cfg_d.per_server_timeout = 3000ms;
+  cfg_d.task_io_timeout = 20000ms;
+  cfg_d.peer_reask_interval = 200ms;   // 生产默认 60s; 缩短到 200ms 让排队保活在测试时间尺度内发生
+  cfg_d.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session_d(rt, cfg_d);
+
+  Ed2kFileLink link;
+  link.name = "e2e_payload.bin"; link.size = size; link.hash = hash;
+  link.sources.push_back("127.0.0.1:" + std::to_string(kSessionUPort));   // B6a: 链接内嵌源提示
+
+  auto out_path = data_dir_d / "e2e_payload.bin";
+  std::uint64_t task_id = 0;
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    // occupier: 原始 TCP 客户端预占 Session U 的唯一上传槽位(HELLO→STARTUPLOADREQ→
+    // ACCEPTUPLOADREQ), 之后长时间静默持有连接不放, 逼迫随后而来的 Session D 真正排队而非
+    // 直接被接受。
+    tcp::socket occupier(rt.context());
+    {
+      auto [ec] = co_await occupier.async_connect(
+          tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), kSessionUPort), asio::as_tuple(asio::use_awaitable));
+      EXPECT_FALSE(ec); if(ec) co_return;
+      ed2k::peer::HelloInfo h; h.nickname = "occupier";
+      h.user_hash = *UserHash::from_hex("ffffffffffffffffffffffffffffffff");
+      co_await send_pkt(occupier, ed2k::peer::op::HELLO, ed2k::peer::encode_hello_packet(h));
+      auto hello_ans = co_await read_frame(occupier);
+      EXPECT_FALSE(hello_ans.empty()); if(hello_ans.empty()) co_return;
+      EXPECT_EQ(std::to_integer<std::uint8_t>(hello_ans[0]), ed2k::peer::op::HELLOANSWER);
+      co_await send_pkt(occupier, ed2k::peer::op::STARTUPLOADREQ, ed2k::peer::encode_start_upload(hash));
+      auto ans = co_await read_frame(occupier);
+      EXPECT_FALSE(ans.empty()); if(ans.empty()) co_return;
+      EXPECT_EQ(std::to_integer<std::uint8_t>(ans[0]), ed2k::peer::op::ACCEPTUPLOADREQ);
+    }
+
+    task_id = session_d.add_download(link, data_dir_d);
+    EXPECT_NE(task_id, 0u);
+
+    // 持有槽位一段时间(>= 2 个 peer_reask_interval 周期), 确保 Session D 真的排队并至少完成
+    // 一次真实的 UDP REASKFILEPING/REASKACK 往返(A8), 而不是侥幸抢在它排队之前就释放槽位。
+    asio::steady_timer hold(rt.context());
+    hold.expires_after(500ms);
+    co_await hold.async_wait(asio::use_awaitable);
+    occupier.close();   // 释放槽位: 驱动 Session U 的排队短轮询(A8 的自我提升机制)晋升 Session D
+
+    for(int i = 0; i < 600; ++i){
+      auto snap = session_d.query(task_id);
+      EXPECT_TRUE(snap.has_value());
+      if(!snap) co_return;
+      if(snap->state == TaskState::completed || snap->state == TaskState::failed) break;
+      asio::steady_timer poll(rt.context());
+      poll.expires_after(50ms);
+      co_await poll.async_wait(asio::use_awaitable);
+    }
+    auto snap = session_d.query(task_id);
+    EXPECT_TRUE(snap.has_value()); if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::completed)
+        << snap->error.message()
+        << " (engine-to-engine queued download must complete via A8 reask-answer + slot-release promotion)";
+    EXPECT_EQ(snap->bytes_done, data.size());
+    co_return;
+  });
+
+  ASSERT_TRUE(std::filesystem::exists(out_path));
+  ASSERT_EQ(std::filesystem::file_size(out_path), data.size());
+  {
+    std::ifstream f(out_path, std::ios::binary);
+    std::vector<char> downloaded((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    ASSERT_EQ(downloaded.size(), data.size());
+    EXPECT_TRUE(std::equal(downloaded.begin(), downloaded.end(), reinterpret_cast<const char*>(data.data())))
+        << "downloaded bytes do not match the shared source file";
+  }
+  std::filesystem::remove_all(share_dir);
+  std::filesystem::remove_all(data_dir_u);
+  std::filesystem::remove_all(data_dir_d);
+}

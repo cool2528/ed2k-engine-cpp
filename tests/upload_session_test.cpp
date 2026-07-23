@@ -679,6 +679,87 @@ TEST(UploadSession, QueuesStartUploadWhenSlotsAreFull){
   });
 }
 
+// P2c A7: 上传队列(active+queued)都已达容量上限时, 新对端的 STARTUPLOADREQ 应得到 QUEUEFULL,
+// 而非被无限制地追加进一个永远排不到晋升的等待队列尾巴。
+TEST(UploadSession, RespondsQueueFullWhenUploadQueueAtCapacity){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  KnownFile f;
+  f.hash = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  f.aich_root = *AICHHash::from_base32("A2IU2MP7W3D2Q3E2VJPHADW6T5S4HJE3");
+  f.name = "queued.bin";
+  f.size = 1;
+  db.add(f);
+  UploadQueue queue(1, nullptr, nullptr, /*max_queued=*/1);
+  // 预先占满槽位(1)+排队队列(1), 让下面测试用的第三个请求方撞到容量上限。
+  queue.enqueue(*UserHash::from_hex("ffffffffffffffffffffffffffffffff"), f.hash);
+  queue.enqueue(*UserHash::from_hex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), f.hash);
+  ASSERT_EQ(queue.queued_size(), 1u);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), &queue);
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    co_await send_pkt(s, op::STARTUPLOADREQ, encode_start_upload(f.hash));
+    auto ans = co_await read_packet(s);
+    EXPECT_EQ(ans.opcode, op::QUEUEFULL);
+    EXPECT_EQ(ans.protocol, ed2k::net::proto::eMule);
+    s.close();
+    co_return;
+  });
+}
+
+// P2c A8: 上传会话应答对端(下载方)发来的 EMULEINFO, 通告构造时配置的 udp_reask_port——供下载方
+// 捕获后据此对我方发 UDP REASKFILEPING(见 download.cpp::setup_source_phase 对 mule_info.udp_port
+// 的既有捕获逻辑)。
+TEST(UploadSession, AnswersEmuleInfoWithConfiguredUdpReaskPort){
+  ed2k::net::IoRuntime rt;
+  KnownFileDB db;
+  UploadQueue queue(1);
+
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    UploadSession session(std::move(s), db, hello("server"), rt.disk_executor(), &queue, nullptr, nullptr,
+                          /*udp_reask_port=*/4672);
+    (void)co_await session.run(2s);
+    co_return;
+  });
+
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    tcp::socket s(rt.context());
+    auto [ec] = co_await s.async_connect(tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), peer.port()), asio::as_tuple(asio::use_awaitable));
+    EXPECT_FALSE(ec); if(ec) co_return;
+    co_await send_pkt(s, op::HELLO, encode_hello_packet(hello("client")));
+    auto hello_ans = co_await read_packet(s);
+    EXPECT_EQ(hello_ans.opcode, op::HELLOANSWER);
+    MuleInfo mine;
+    co_await send_pkt(s, op::EMULEINFO, encode_mule_info(mine), ed2k::net::proto::eMule);
+    auto mule_ans = co_await read_packet(s);
+    EXPECT_EQ(mule_ans.opcode, op::EMULEINFOANSWER);
+    EXPECT_EQ(mule_ans.protocol, ed2k::net::proto::eMule);
+    auto decoded = decode_mule_info(mule_ans.payload);
+    EXPECT_TRUE(decoded.has_value()); if(!decoded) co_return;
+    EXPECT_EQ(decoded->udp_port, 4672u);
+    // EMULEINFO 不应打断后续正常请求(handle() 内实现为普通分支, 非阻塞式 pump_until 等待,
+    // 见 upload_session.cpp 注释)——紧接着的 STARTUPLOADREQ 应正常得到应答。
+    co_await send_pkt(s, op::STARTUPLOADREQ, encode_start_upload(*FileHash::from_hex("00000000000000000000000000000000")));
+    auto not_found = co_await read_packet(s);
+    EXPECT_EQ(not_found.opcode, op::FILEREQANSNOFIL);
+    s.close();
+    co_return;
+  });
+}
+
 TEST(UploadSession, AcceptsQueuedPeerAfterSlotReleaseOnReask){
   ed2k::net::IoRuntime rt;
   KnownFileDB db;

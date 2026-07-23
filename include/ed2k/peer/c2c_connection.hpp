@@ -44,7 +44,12 @@ struct C2CHandshakeResult {
 // 当作失败放弃该源。
 struct UploadAccepted {};
 struct UploadQueued { std::uint16_t rank; };
-using UploadOutcome = std::variant<UploadAccepted, UploadQueued>;
+// P2c A7: 对端(上传源)排队队列已满, 拒绝把我方派进队列(OP_QUEUEFULL)。与 UploadQueued 一样是
+// eD2k 协议下的正常路径(非连接层错误), 但语义上等价于"该源此刻此路不通"——调用方应像
+// peer_reask.hpp 的 ReaskQueueFull 一样放弃该源(errc::upload_queued, 瞬时性, 可稍后重试),
+// 而不是像 UploadQueued 那样保持连接继续等。
+struct UploadQueueFull {};
+using UploadOutcome = std::variant<UploadAccepted, UploadQueued, UploadQueueFull>;
 
 // mule 扩展信息交换子步(握手内)的独立短超时(P0 排队等待重构, 三层超时架构第②层)——不复用
 // 调用方传入的完整 per-op timeout(生产环境 SessionConfig::task_io_timeout 默认 60s)。纯 eDonkey

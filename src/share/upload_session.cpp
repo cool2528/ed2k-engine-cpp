@@ -15,6 +15,11 @@ namespace asio = boost::asio;
 namespace {
 constexpr std::uint64_t sending_part_chunk_size = 10240;
 constexpr std::uint64_t preview_frame_size = 256ull * 1024ull;
+// P2c A8: run() 排队态短轮询间隔(见 run() 实现注释)。刻意与下载侧 kReaskInterval(60s)/
+// kUploadQueuePollInterval 各自独立解耦——这里只是"多快检查一次自己是否轮到了", 不是协议往返
+// 预算, 取值参考本文件既有惯例(session.cpp accept_loop 1s、InboundListener kAcceptPollSlice
+// 20ms)——150ms 足够快地发现槽位释放, 又不至于空转过密。
+constexpr std::chrono::milliseconds kUploadQueuePollInterval{150};
 using Digest = std::array<std::byte, 20>;
 
 Digest sha1_cat(const Digest& l, const Digest& r) {
@@ -153,14 +158,16 @@ UploadSession::UploadSession(asio::ip::tcp::socket&& socket,
                              asio::any_io_executor disk_executor,
                              UploadQueue* queue,
                              UploadBandwidthThrottler* throttler,
-                             ClientCredits* credits)
+                             ClientCredits* credits,
+                             std::uint16_t udp_reask_port)
   : conn_(std::move(socket)),
     files_(files),
     self_(std::move(self)),
     disk_executor_(std::move(disk_executor)),
     queue_(queue),
     throttler_(throttler),
-    credits_(credits) {}
+    credits_(credits),
+    udp_reask_port_(udp_reask_port) {}
 
 void UploadSession::set_ip_filter(std::shared_ptr<const infra::IPFilter> filter, std::uint8_t level) {
   ip_filter_ = std::move(filter);
@@ -196,6 +203,24 @@ UploadSession::send_not_found(const ed2k::FileHash& hash) {
 
 asio::awaitable<tl::expected<void, std::error_code>>
 UploadSession::handle(const ed2k::net::Packet& pkt) {
+  // P2c A8: 应答对端(下载方)在 HELLO/HELLOANSWER 之后可能发来的 EMULEINFO, 通告我方真实的
+  // UDP reask 端口(udp_reask_port_)。刻意实现为 handle() 里"这个 opcode 就这么处理"的一条
+  // 普通分支, 而不是像 handshake_with_mule_info/handshake_acceptor_with_mule_info 那样在
+  // 握手内部专门 pump_until(EMULEINFO, kMuleHandshakeTimeout) 阻塞等待——那样做会在"对端根本
+  // 不发 EMULEINFO"的场景(既有测试大量使用的裸 HELLO 客户端)里, 把对端紧随其后发来的下一个
+  // 真实请求包(如 STARTUPLOADREQ)当"等待期间的噪声"静默吞掉, 直到整个 mule 子步超时才继续,
+  // 拖慢且破坏既有测试的握手后第一包语义。现在的写法:发不发 EMULEINFO 都不影响后续任何一个
+  // 包的处理顺序, 对端不发就什么都不做(udp_port 由对端保持默认值 0, 优雅降级为纯 TCP 被动)。
+  if(pkt.opcode == ed2k::peer::op::EMULEINFO && pkt.protocol == ed2k::net::proto::eMule) {
+    ed2k::peer::MuleInfo mine;
+    mine.udp_port = udp_reask_port_;
+    ed2k::net::Packet ans;
+    ans.protocol = ed2k::net::proto::eMule;
+    ans.opcode = ed2k::peer::op::EMULEINFOANSWER;
+    ans.payload = ed2k::peer::encode_mule_info(mine);
+    co_return co_await conn_.send_packet(ans);
+  }
+
   if(pkt.opcode == ed2k::peer::op::MULTIPACKET || pkt.opcode == ed2k::peer::op::MULTIPACKET_EXT) {
     ed2k::codec::ByteReader r(pkt.payload);
     auto hash = r.hash16();
@@ -305,13 +330,30 @@ UploadSession::handle(const ed2k::net::Packet& pkt) {
     ans.protocol = ed2k::net::proto::eDonkey;
     if(!queue_ || !peer_) {
       ans.opcode = ed2k::peer::op::ACCEPTUPLOADREQ;
+      is_queued_ = false;
     } else {
-      auto decision = queue_->enqueue(peer_->user_hash, *decoded);
+      // ip 供 P2c A8 的 UDP REASKFILEPING 应答按 (ip, file_hash) 反查本条排队记录用(remote_ip()
+      // 取不到时——非 IPv4/已断连——退化为默认 IPv4{}, 该记录只是暂时无法被 UDP reask 命中,
+      // 不影响 TCP 侧 accepted/queued/full 判定本身)。
+      auto decision = queue_->enqueue(peer_->user_hash, *decoded, conn_.remote_ip().value_or(IPv4{}));
       if(decision.state == UploadQueueState::accepted) {
         ans.opcode = ed2k::peer::op::ACCEPTUPLOADREQ;
+        is_queued_ = false;
+      } else if(decision.state == UploadQueueState::full) {
+        // P2c A7: 队列已满——答 QUEUEFULL(与 UDP reask 侧同一 opcode/协议标记, 见
+        // c2c_connection.cpp::pump_until_upload_result 的 UploadQueueFull 解码), 不入队、不占用
+        // is_queued_ 轮询路径。
+        ans.protocol = ed2k::net::proto::eMule;
+        ans.opcode = ed2k::peer::op::QUEUEFULL;
+        is_queued_ = false;
       } else {
         ans.opcode = ed2k::peer::op::QUEUERANKING;
         ans.payload = ed2k::peer::encode_queue_ranking(decision.rank);
+        // P2c A8: 记住"排队中"状态与具体文件, 供 run() 主循环短轮询期间重新调用 queue_->enqueue()
+        // 检查槽位是否已释放(见该函数注释)——这是让排队晋升在"没有任何一方重发 STARTUPLOADREQ/
+        // 没有专门的跨协程通知通道"时依然会发生的唯一途径, 与 UDP reask 的到达与否解耦。
+        is_queued_ = true;
+        queued_hash_ = *decoded;
       }
     }
     co_return co_await conn_.send_packet(ans);
@@ -514,11 +556,37 @@ UploadSession::run(std::chrono::milliseconds timeout) {
   auto hs = co_await handshake(timeout);
   if(!hs) co_return tl::unexpected(hs.error());
   while(true) {
-    auto rp = co_await conn_.recv_packet(timeout);
+    // P2c A8: 排队中(is_queued_)时把 recv_packet 的等待预算收紧为短轮询(kUploadQueuePollInterval)
+    // ——不是为了收对端的包(排队期间对端不会重发 STARTUPLOADREQ, 只可能被动等或走 UDP reask),
+    // 而是借每次超时的机会重新调用 queue_->enqueue() 检查槽位是否已释放。这是本引擎让"排队晋升"
+    // 在没有专门跨协程通知通道时依然会发生的机制——与 D1 式等待者注册表不同, 这里不需要仲裁多个
+    // 等待者, 单纯是"定期问一下自己是否轮到了", 故用最简单的短超时轮询(同 accept_loop/kad_run
+    // 既有惯例), 不引入新的 channel/通知原语。非排队态行为与改动前完全一致(用调用方传入的完整
+    // per-op timeout, 超时即视为连接层错误向上抛出)。
+    const auto wait_budget = is_queued_ ? std::min(timeout, kUploadQueuePollInterval) : timeout;
+    auto rp = co_await conn_.recv_packet(wait_budget);
     if(!rp) {
       if(rp.error() == make_error_code(errc::connection_closed)) {
         if(queue_ && peer_) queue_->remove(peer_->user_hash);
         co_return tl::expected<void, std::error_code>{};
+      }
+      if(is_queued_ && rp.error() == make_error_code(errc::timed_out)) {
+        // 排队中的短轮询超时: 非致命, 重新检查槽位是否已释放; 若已晋升则主动下发 ACCEPTUPLOADREQ
+        // (对端此刻可能正被动等 TCP、也可能正等 UDP REASKACK/下一轮再来问, 两者都不冲突: 已晋升
+        // 之后再来的 REASKFILEPING 只会在 UDP 应答里看到同一个"已不在队列"结果, 见
+        // session.cpp::udp_reask_loop 与 UploadQueue::find_queued 的语义)。
+        if(queue_ && peer_ && queued_hash_) {
+          auto decision = queue_->enqueue(peer_->user_hash, *queued_hash_);
+          if(decision.state == UploadQueueState::accepted) {
+            is_queued_ = false;
+            ed2k::net::Packet ans;
+            ans.protocol = ed2k::net::proto::eDonkey;
+            ans.opcode = ed2k::peer::op::ACCEPTUPLOADREQ;
+            auto sr = co_await conn_.send_packet(ans);
+            if(!sr) co_return tl::unexpected(sr.error());
+          }
+        }
+        continue;   // 本轮是超时, 没有真实的包需要交给 handle()
       }
       co_return tl::unexpected(rp.error());
     }

@@ -21,6 +21,8 @@
 #include "ed2k/kad/network.hpp"
 #include "ed2k/kad/nodes_dat.hpp"
 #include "ed2k/metfile/server_met.hpp"
+#include "ed2k/net/udp_socket.hpp"
+#include "ed2k/peer/c2c_messages.hpp"
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/server/connection.hpp"
 #include "ed2k/server/udp_connection.hpp"
@@ -181,15 +183,19 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
   // set_shared_dirs 挂起(逐目录 disk hop)期间, 若又有一次更晚的调用抢先完成, 用代次让本次
   // 恢复后的写回安静作废, 避免两次并发调用互相覆盖 db/shared_dirs(与 server_generation 同构)。
   std::uint32_t share_generation = 0;
-  // 默认最大同时上传连接数; 项目当前无独立配置项, 沿用 eMule 传统默认值。
-  static constexpr std::size_t default_upload_slots = 10;
   share::ClientCredits credits;
-  share::UploadQueue upload_queue{default_upload_slots, &credits};
+  // P2c A7: 槽位数/队列长度上限现由 cfg.max_upload_slots/cfg.max_upload_queue_length 配置(默认值
+  // 与改动前的硬编码 10/不限完全一致); cfg 声明早于本成员, 默认成员初始化器里引用它安全
+  // (与下面引用 credits 同一模式)。
+  share::UploadQueue upload_queue{cfg.max_upload_slots, &credits, nullptr, cfg.max_upload_queue_length};
   std::size_t active_uploads = 0;
   // 上传速率采样(与下载采样同一协程内做差分)
   std::uint64_t upload_speed_bps = 0;
   std::uint64_t upload_last_sample_bytes = 0;
   std::chrono::steady_clock::time_point upload_last_sample_time{};
+  // P2c A8: 入站 UDP reask 应答 socket; sharing_active=true 时非空(与 share_listener 同生命周期,
+  // 绑定同一端口号——UDP/TCP 端口号是独立命名空间, 不冲突; udp_reask_loop 是其唯一读者)。
+  std::optional<net::UdpSocket> share_udp_;
 
   Impl(net::IoRuntime& rt_arg, SessionConfig cfg_arg)
     : rt(rt_arg), cfg(std::move(cfg_arg)) {
@@ -567,7 +573,11 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     if(listener) builder.listener(*listener);
     if(query_node) builder.kad_network(*query_node).kad_peers(std::move(kad_peers_snapshot));
     auto dl = builder.build();
-    auto r = co_await dl.run(self->cfg.task_io_timeout, 3, self->cfg.source_reask_interval);
+    // P2c A8: peer_reask_interval 是第 5 个形参, 必须先显式给出第 4 个(source_reconnect_backoff)
+    // 才能定位到它——用其生产默认值 kSourceReconnectBackoff, 与改动前行为一致; 真正新增的是
+    // 最后的 self->cfg.peer_reask_interval(生产默认沿用 peer::kReaskInterval, 测试可缩短)。
+    auto r = co_await dl.run(self->cfg.task_io_timeout, 3, self->cfg.source_reask_interval,
+                             download::kSourceReconnectBackoff, self->cfg.peer_reask_interval);
 
     self = weak.lock(); if(!self) co_return;
     t = self->find_alive(id, gen);
@@ -680,13 +690,51 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     if(!self || self->shutting_down) co_return;
     ++self->active_uploads;
     {
+      // P2c A8: 只有 share_udp_ 真正绑定成功时才通告一个会响应的 udp_port——否则如实通告 0
+      // (对端优雅降级为纯 TCP 被动等待, 见 default_mule_info() 里对称的注释)。
+      const std::uint16_t udp_port = self->share_udp_ ? self->share_listener->local_port() : std::uint16_t{0};
       share::UploadSession session(std::move(socket), self->db, self->hello_info(),
-                                   self->rt.disk_executor(), &self->upload_queue, nullptr, &self->credits);
+                                   self->rt.disk_executor(), &self->upload_queue, nullptr, &self->credits,
+                                   udp_port);
       (void)co_await session.run(std::chrono::seconds(60));
     }
     self = weak.lock();
     if(self) --self->active_uploads;
     co_return;
+  }
+
+  // P2c A8/A7: 入站 UDP reask 应答循环(镜像 accept_loop 的 weak_ptr + 短超时轮询退出检查模式,
+  // 见该函数注释)。share_udp_ 全程只有本协程一个读者独占 recv_from, 不存在并发读同一 UDP
+  // socket 的问题(与 InboundListener::accept_matched 修复前要根治的那一类问题同源, 这里从一
+  // 开始就只有单一读者, 不需要 D1 式的等待者分发)。每个数据报同步处理完再收下一个——reask 往返
+  // 本身极轻量(查表 + 回一个几字节的包), 不需要为并发应答专门拆协程。
+  static asio::awaitable<void> udp_reask_loop(std::weak_ptr<Impl> weak){
+    for(;;){
+      auto self = weak.lock();
+      if(!self || self->shutting_down || !self->sharing_active || !self->share_udp_) co_return;
+      auto received = co_await self->share_udp_->recv_from(std::chrono::seconds(1));
+      self = weak.lock();
+      if(!self || self->shutting_down || !self->sharing_active || !self->share_udp_) co_return;
+      if(!received) continue;   // 超时/瞬时错误: 继续下一轮轮询(借此重新检查停止条件)
+      auto& [pkt, sender] = *received;
+      if(pkt.protocol != net::proto::eMule || pkt.opcode != peer::op::REASKFILEPING) continue;
+      auto hash = peer::decode_reask_file_ping(pkt.payload);
+      if(!hash) continue;                        // 畸形载荷: 静默丢弃(UDP 无连接, 不值得为此中断循环)
+      if(!sender.address().is_v4()) continue;
+      const auto sender_ip = IPv4::from_host(sender.address().to_v4().to_uint());
+      net::Packet ans;
+      ans.protocol = net::proto::eMule;
+      // A8: 命中排队中的记录 → 答当前排名(REASKACK, 与 TCP 侧 QUEUERANKING 同一 payload 格式,
+      // decode_queue_ranking 两处复用)。A7: 未命中(队列已满导致从未入队, 或记录已不存在)→
+      // 答 QUEUEFULL, 促使下载方放弃本源而不是无限等一个不会来的排名。
+      if(auto user_hash = self->upload_queue.find_queued(sender_ip, *hash)){
+        ans.opcode = peer::op::REASKACK;
+        ans.payload = peer::encode_reask_ack(self->upload_queue.rank(*user_hash));
+      } else {
+        ans.opcode = peer::op::QUEUEFULL;
+      }
+      (void)co_await self->share_udp_->send_to(sender, ans);
+    }
   }
 
   TaskSnapshot snapshot(const TaskEntry& t) const {
@@ -734,6 +782,9 @@ void Session::shutdown() noexcept {
   // 同理主动关闭分享 listener, 促使 accept_loop 挂起的 accept() 尽快因 acceptor 已关闭而返回
   // 错误唤醒退出, 不必等到 1s 轮询超时才发现 shutting_down。
   if(impl_->share_listener) impl_->share_listener->close();
+  // P2c A8: 同理主动关闭 UDP reask 应答 socket, 促使 udp_reask_loop 挂起的 recv_from 尽快因 socket
+  // 已关闭而返回错误唤醒退出。
+  if(impl_->share_udp_) impl_->share_udp_->close();
 }
 
 std::uint64_t Session::add_download(const Ed2kFileLink& link, const std::filesystem::path& save_dir){
@@ -1146,6 +1197,10 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
     self->sharing_active = false;
     if(self->share_listener) self->share_listener->close();
     self->share_listener.reset();
+    // P2c A8: 同步释放 UDP reask 应答 socket, 促使 udp_reask_loop 挂起的 recv_from 尽快因 socket
+    // 已关闭而返回错误唤醒退出(与上面 share_listener 的收尾同一模式), 不必等到 1s 轮询超时。
+    if(self->share_udp_) self->share_udp_->close();
+    self->share_udp_.reset();
   } else if(!self->share_listener && !self->download_listener.expired()){
     // 反向门控(双向互斥的另一半): cfg.tcp_port 当前正被下载侧的 LowID InboundListener 占用
     // (见 Impl::download_listener 注释)。InboundListener 构造设置了 SO_REUSEADDR, 若在
@@ -1169,8 +1224,19 @@ Session::set_shared_dirs(std::vector<std::filesystem::path> dirs){
                    self->cfg.tcp_port, e.what());
       co_return tl::unexpected(make_error_code(errc::connect_failed));
     }
+    // P2c A8: UDP reask 应答 socket 绑定同一端口号(TCP/UDP 端口号是独立命名空间, 不冲突)。
+    // 绑定失败(极少见)不应拖垮整个分享启动——降级为 share_udp_=空, run_upload 据此如实通告
+    // udp_port=0(对端优雅退化为纯 TCP 被动等待, 与 mule 握手协商失败的既有降级路径一致)。
+    try {
+      self->share_udp_.emplace(net_ex, self->share_listener->local_port());
+    } catch(const std::exception& e){
+      spdlog::warn("Session::set_shared_dirs: UDP reask responder bind on port {} failed: {}",
+                   self->share_listener->local_port(), e.what());
+      self->share_udp_.reset();
+    }
     self->sharing_active = true;
     asio::co_spawn(self->rt.context(), Impl::accept_loop(weak), asio::detached);
+    if(self->share_udp_) asio::co_spawn(self->rt.context(), Impl::udp_reask_loop(weak), asio::detached);
   }
   // else: listener 已在运行, 本次调用只重新扫描, 不重启监听。
 
