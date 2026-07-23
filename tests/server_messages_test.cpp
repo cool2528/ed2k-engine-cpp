@@ -42,6 +42,40 @@ TEST(ServerMessages, EncodeGetSources){
   want.insert(want.end(), s.begin(), s.end());
   EXPECT_EQ(out, want);
 }
+// B5: 文件 > 4GiB(0xFFFFFFFF)时, GETSOURCES 的 32 位 size 字段截断会环绕成一个很小的值,
+// 导致服务器按错误的(极小)文件大小去查源。eD2k 大文件约定: 32 位 size 字段写 0,
+// 紧跟真实的 64 位 size(而非把 size 截断塞进 32 位字段)。
+TEST(ServerMessages, EncodeGetSourcesBeyond4GiBUses64BitSizeForm){
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  const std::uint64_t large_size = 0x100000001ULL;              // 4GiB + 1 字节, 截断成 32 位会环绕成 1
+  auto out = encode_get_sources(h, large_size);
+
+  std::vector<std::byte> want = hex("00112233445566778899aabbccddeeff");
+  auto zero_field = bytes({0,0,0,0});                            // 32 位 size 字段固定写 0(大文件哨兵)
+  want.insert(want.end(), zero_field.begin(), zero_field.end());
+  auto size64 = bytes({1,0,0,0, 1,0,0,0});                       // 0x100000001 的小端 u64 编码, 紧跟真实的 64 位 size
+  want.insert(want.end(), size64.begin(), size64.end());
+
+  EXPECT_EQ(out, want);
+  EXPECT_EQ(out.size(), 16u + 4u + 8u);                           // hash16 + u32(0) + u64(size) = 28 字节
+  // 明确断言不会环绕成被截断的小值: 若仍是旧的 32 位截断实现, 第 17-20 字节会是 {1,0,0,0}(0x100000001 截断)
+  std::vector<std::byte> wrapped_20_bytes = hex("00112233445566778899aabbccddeeff");
+  auto wrapped_size = bytes({1,0,0,0});
+  wrapped_20_bytes.insert(wrapped_20_bytes.end(), wrapped_size.begin(), wrapped_size.end());
+  EXPECT_NE(out, wrapped_20_bytes);
+}
+// 边界: 恰好 0xFFFFFFFF(4GiB - 1 字节)可以无损塞进 32 位字段, 不需要 64 位扩展形式,
+// 只有严格大于 0xFFFFFFFF 才切换到 64 位形式。
+TEST(ServerMessages, EncodeGetSourcesAtUint32MaxStaysInCompact32BitForm){
+  auto h = *FileHash::from_hex("00112233445566778899aabbccddeeff");
+  auto out = encode_get_sources(h, 0xFFFFFFFFULL);
+
+  std::vector<std::byte> want = hex("00112233445566778899aabbccddeeff");
+  auto s = bytes({0xFF,0xFF,0xFF,0xFF});
+  want.insert(want.end(), s.begin(), s.end());
+  EXPECT_EQ(out, want);
+  EXPECT_EQ(out.size(), 16u + 4u);                                // 紧凑形式, 无 64 位扩展
+}
 TEST(ServerMessages, EncodeCallbackRequest){
   EXPECT_EQ(encode_callback_request(0x12345678), bytes({0x78,0x56,0x34,0x12}));
 }

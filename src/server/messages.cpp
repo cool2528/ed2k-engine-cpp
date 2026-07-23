@@ -27,7 +27,17 @@ std::vector<std::byte> encode_login(const LoginParams& p){
 }
 std::vector<std::byte> encode_search(const SearchExpr& e){ return serialize_search(e); }
 std::vector<std::byte> encode_get_sources(const FileHash& h, std::uint64_t size){
-  ByteWriter w; w.hash16(h); w.u32(static_cast<std::uint32_t>(size)); return w.take();
+  ByteWriter w; w.hash16(h);
+  // eD2k GETSOURCES 大文件约定: size > 0xFFFFFFFF(>4GiB)时直接把 32 位 size 字段截断会环绕成
+  // 一个很小的值(服务器按错误的极小文件大小去查源)。约定做法是 32 位 size 字段写 0(大文件哨兵),
+  // 紧跟真实的 64 位 size；<=4GiB 时保持原有紧凑的 32 位形式不变。
+  if(size > 0xFFFFFFFFull){
+    w.u32(0);
+    w.u64(size);
+  } else {
+    w.u32(static_cast<std::uint32_t>(size));
+  }
+  return w.take();
 }
 std::vector<std::byte> encode_callback_request(std::uint32_t client_id){
   ByteWriter w; w.u32(client_id); return w.take();
