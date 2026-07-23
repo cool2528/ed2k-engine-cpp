@@ -1,6 +1,11 @@
 name: build
 
-# R0-2/R0-3 CI. Matrix build (Windows MSVC + Ubuntu GCC) via vcpkg manifest mode.
+# R0-2/R0-3 CI. Matrix build (Windows MSVC + Ubuntu GCC + macOS Clang) via vcpkg manifest mode.
+#
+# macOS pins CMAKE_OSX_DEPLOYMENT_TARGET=11.0 to match downstream GDownload:
+# libc++ availability checks only fire with an old deployment target, which is
+# how std::format / std::chrono::clock_cast incompatibilities stay caught here
+# instead of surfacing in downstream release builds.
 # Live tests skip by default (no ED2K_LIVE) — they need a real eMule server (R0-1).
 #
 # vcpkg: a fresh full clone is pinned to the vcpkg.json builtin-baseline commit
@@ -66,6 +71,15 @@ jobs:
             consumer_dir: build/consumer-linux-release
             consumer_configure_args: -DCMAKE_BUILD_TYPE=Release
             consumer_exe: build/consumer-linux-release/ed2k_consumer
+          - os: macos-latest
+            preset: macos-release
+            binary_dir: build/macos-release
+            configuration: Release
+            install_dir: build/stage-macos-release
+            dependency_dir: build/macos-release/vcpkg_installed/arm64-osx
+            consumer_dir: build/consumer-macos-release
+            consumer_configure_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+            consumer_exe: build/consumer-macos-release/ed2k_consumer
 
     steps:
       - uses: actions/checkout@v4
@@ -111,6 +125,10 @@ jobs:
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
 
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}

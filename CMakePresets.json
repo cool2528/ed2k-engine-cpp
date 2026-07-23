@@ -38,13 +38,27 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "macos-release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-release",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "BUILD_SHARED_LIBS": "OFF",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
+      }
     }
   ],
   "buildPresets": [
     { "name": "default", "configurePreset": "default", "configuration": "Debug" },
     { "name": "linux", "configurePreset": "linux" },
     { "name": "default-release", "configurePreset": "default-release", "configuration": "Release" },
-    { "name": "linux-release", "configurePreset": "linux-release" }
+    { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "macos-release", "configurePreset": "macos-release" }
   ],
   "testPresets": [
     { "name": "default", "configurePreset": "default", "configuration": "Debug",
@@ -54,6 +68,8 @@
     { "name": "default-release", "configurePreset": "default-release", "configuration": "Release",
       "output": { "outputOnFailure": true } },
     { "name": "linux-release", "configurePreset": "linux-release",
+      "output": { "outputOnFailure": true } },
+    { "name": "macos-release", "configurePreset": "macos-release",
       "output": { "outputOnFailure": true } }
   ]
 }
