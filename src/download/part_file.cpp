@@ -8,6 +8,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/this_coro.hpp>
+#include <boost/asio/strand.hpp>
 namespace ed2k::download {
 namespace {
 std::filesystem::path part_met_path_for(const std::filesystem::path& path) {
@@ -43,6 +44,16 @@ struct PartFile::Impl {
   std::vector<std::uint64_t> part_filled;  // 每 part 已写入字节数，用于增量组装后触发 MD4 校验
   std::vector<std::vector<bool>> block_done;  // block_done[part][block_in_part]; 块不跨 part 边界
   std::fstream f;
+  // audit C9: 本 PartFile 专属的 disk strand —— f 是多源并发写同一 PartFile 时共享的磁盘资源
+  // (见 write_block_async 顶部注释: 多 worker 可并发对同一 PartFile 发起磁盘跳转)。经此 strand
+  // 序列化全部 disk 线程侧的 f 访问(seekp/write/seekg/read/flush), 使正确性不再仅依赖"disk 线程池
+  // 恒为单线程"这一契约(IoRuntime::disk_pool_thread_count, 见 DiskPoolIsSingleThreadByContract) ——
+  // 纵使该池未来被配置为多线程, 落在同一 strand 上的 handler 仍严格互斥执行, 不会出现 seekp/write
+  // 交叉导致的错位写入(defense in depth, 不依赖易被无意改动的常量)。write_block_async 首次调用时
+  // 按传入的 disk_ex 懒初始化(该协程同步起始段发生在网络线程, 与 SharedState "仅网络线程访问"的
+  // 约束一致, 无需额外加锁); 此后同一 PartFile 生命周期内的所有磁盘跳转均复用该 strand。
+  // 同步路径 write_block() 不经 disk_ex 卸载(调用方线程本身就是唯一访问者), 不涉及本 strand。
+  std::optional<boost::asio::strand<boost::asio::any_io_executor>> disk_strand;
   // E1: 块级落盘节流计数器 —— 每 kSaveMetBlockInterval 个新完成块调用一次 save_met(), 使 part
   // 尚未整体完成前也能定期把已下载块级进度落盘(而非只在 part 完成/显式 flush 时才落盘), 降低
   // 崩溃/异常退出时的重下代价。16 块 ≈ 16×AICH_BLOCK_SIZE ≈ 2.81MiB, 在"落盘 I/O 次数"与
@@ -253,8 +264,9 @@ tl::expected<void,std::error_code> PartFile::Impl::write_block(std::uint64_t sta
 // P4c-3 M3: 异步写盘 (raccoon 路径用)。状态/I/O 分离 —
 //   状态 (block_done/part_filled/part_done) 仅网络线程变更; f 写/readback + MD4 经 disk_ex 卸载。
 // 两段 post: →disk 执行 I/O →net 改状态。part 满时第三段: →disk readback+MD4 →net 翻 part_done+save_met。
-// 单 disk 线程串行 f → 无竞态; 多 worker 并发同 part 块时, readback 触发必在各块写盘完成后
-// (part_filled==plen 要求各块已计数, 而计数在各自 post(disk) 完成后) → readback 见完整 part。
+// audit C9: 三处磁盘跳转均经本 PartFile 专属的 disk_strand 互斥(见 disk_strand 成员声明处注释)串行
+// f 访问, 不依赖 disk 线程池是否单线程; 多 worker 并发同 part 块时, readback 触发必在各块写盘完成后
+// (part_filled==plen 要求各块已计数, 而计数在各自磁盘跳转完成后) → readback 见完整 part。
 boost::asio::awaitable<tl::expected<void,std::error_code>>
 PartFile::Impl::write_block_async(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data,
                             boost::asio::any_io_executor disk_ex){
@@ -265,9 +277,14 @@ PartFile::Impl::write_block_async(std::uint64_t start, std::uint64_t end, std::s
     co_return tl::expected<void,std::error_code>{};
   if(block_done[part][bip]) co_return tl::expected<void,std::error_code>{};   // 幂等
 
-  // 1) 磁盘写卸载到 disk_ex (disk 线程)。bind_executor 强制 resume 于 disk_ex
-  //    (默认 post(ex, use_awaitable) resume 于协程关联 ex=net, 不卸载)。
-  co_await boost::asio::post(disk_ex, boost::asio::bind_executor(disk_ex, boost::asio::use_awaitable));
+  // audit C9: 懒初始化本 PartFile 的 disk strand(仅首次调用按传入 disk_ex 构造, 之后复用同一个),
+  // 下面两处磁盘跳转均经该 strand 而非裸 disk_ex —— 详见 disk_strand 成员声明处注释。
+  if(!disk_strand) disk_strand.emplace(disk_ex);
+  auto& disk_strand_ex = *disk_strand;
+
+  // 1) 磁盘写卸载到 disk_strand_ex (disk 线程, 经 strand 互斥)。bind_executor 强制 resume 于
+  //    disk_strand_ex (默认 post(ex, use_awaitable) resume 于协程关联 ex=net, 不卸载)。
+  co_await boost::asio::post(disk_strand_ex, boost::asio::bind_executor(disk_strand_ex, boost::asio::use_awaitable));
   f.seekp(start);
   f.write(reinterpret_cast<const char*>(data.data()), data.size());
   // 2) 跳回网络线程变更状态
@@ -292,7 +309,7 @@ PartFile::Impl::write_block_async(std::uint64_t start, std::uint64_t end, std::s
     std::size_t p = *filled_part;
     std::uint64_t pstart = static_cast<std::uint64_t>(p) * PART_SIZE;
     std::uint64_t pend = std::min((static_cast<std::uint64_t>(p)+1)*PART_SIZE, size);
-    co_await boost::asio::post(disk_ex, boost::asio::bind_executor(disk_ex, boost::asio::use_awaitable));   // disk 线程
+    co_await boost::asio::post(disk_strand_ex, boost::asio::bind_executor(disk_strand_ex, boost::asio::use_awaitable));   // disk 线程 (经 strand 互斥)
     std::vector<std::byte> buf(pend - pstart);
     f.flush();
     f.seekg(pstart);

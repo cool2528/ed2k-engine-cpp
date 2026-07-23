@@ -17,6 +17,7 @@
 #include <boost/asio/write.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/cancel_after.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include "ed2k/download/download.hpp"
 #include "ed2k/download/part_file.hpp"
 #include "ed2k/download/block_allocator.hpp"
@@ -1993,6 +1994,61 @@ TEST(Download, MultiSourceAsyncDiskOffload){
   });
   std::filesystem::remove_all(dir);
 }
+// === C9 (audit): PartFile 磁盘操作经 strand 序列化, 正确性不依赖 disk 线程池单线程契约 ===
+// 结构: 不经 IoRuntime(其 disk_pool 固定单线程, 见 DiskPoolIsSingleThreadByContract 契约断言),
+// 而是直接构造一个真正多线程(8 线程)的 boost::asio::thread_pool 作为 disk 执行器传给
+// Builder.disk_executor —— Builder/write_block_async 只接受泛型 any_io_executor, 并不要求
+// 该执行器必须来自 IoRuntime, 故这样构造不违反上述契约, 却能验证纵使 disk 池未来被配置为
+// 多线程, write_block_async 内部对同一 PartFile 的所有磁盘跳转(seekp/write/readback)仍严格
+// 互斥。6 源并发下载同一 2-part 文件(106 个块 + 2 次 part 满 readback, 共 108 次磁盘跳转),
+// 相比 MultiSourceAsyncDiskOffload(2 源 + 单线程 disk 池, 天然无竞态窗口)更充分地对 C9 修复
+// 要保证的并发场景加压。断言用两层: pf.complete()(每 part MD4 通过)+ 逐字节比对盘上内容与
+// 期望内容(更强 oracle —— 纵使某次竞态巧合未触发 MD4 失配, 错位写入仍会被字节比对捕获)。
+TEST(Download, MultiSourceAsyncDiskOffloadSerializedUnderMultiThreadDiskPool){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_ms_async_disk_mt"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  IoRuntime rt;
+  constexpr int kSources = 6;
+  std::vector<std::unique_ptr<ed2k::test::MockPeer>> peers;
+  for(int i=0;i<kSources;++i) peers.push_back(std::make_unique<ed2k::test::MockPeer>(rt.context()));
+  for(auto& p : peers){
+    p->serve([&full, &mf](tcp::socket s) -> asio::awaitable<void>{
+      co_await serve_full_peer(std::move(s), full, mf.fhash, {mf.h0, mf.h1}); co_return;
+    });
+  }
+  asio::thread_pool stress_disk_pool(8);   // 真正多线程 disk 执行器, 独立于 IoRuntime
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    std::vector<SourceEndpoint> eps;
+    for(auto& p : peers) eps.push_back(SourceEndpoint{0x0100007Fu, p->port()});
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(mf.fhash).size(PART*2).aich(std::nullopt)
+                .sources(eps)
+                .disk_executor(stress_disk_pool.get_executor())
+                .build();
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()) << (r? "" : r.error().message());
+    if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  // dl.run() 的协程只在全部磁盘跳转的 co_await 均已 resume 后才继续/返回 —— 此刻 stress_disk_pool
+  // 上不应再有在制品; join() 应立即返回, 顺带作为额外的跨线程可见性屏障。
+  stress_disk_pool.join();
+  {
+    std::ifstream check(path, std::ios::binary);
+    std::vector<char> on_disk((std::istreambuf_iterator<char>(check)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(on_disk.size(), full.size());
+    bool identical = on_disk.size() == full.size() &&
+      std::equal(on_disk.begin(), on_disk.end(), full.begin(), [](char c, std::byte b){
+        return static_cast<unsigned char>(c) == std::to_integer<unsigned char>(b);
+      });
+    EXPECT_TRUE(identical) << "多线程 disk 池下并发写入的盘上内容必须与期望内容逐字节一致(无竞态错位)";
+  }
+  std::filesystem::remove_all(dir);
+}
 // 结构: disk_executor 运行于独立线程 (≠ io_context::run 网络线程) → 磁盘 I/O/MD4 不阻塞网络线程。
 // spec §5.6 心跳断言的更稳健替代 (非时序, 不 flaky): 证 disk 卸载架构成立。
 TEST(Download, DiskExecutorRunsOnSeparateThread){
@@ -2007,10 +2063,17 @@ TEST(Download, DiskExecutorRunsOnSeparateThread){
   EXPECT_NE(net_id, disk_id) << "disk_executor 必须运行于独立线程 (M3 卸载前提)";
 }
 
+// audit C9 后: PartFile::f_ 的互斥不再仅靠"disk 线程池恒为单线程"这一契约来保证 —— write_block_async
+// 内部现经本 PartFile 专属的 strand 序列化全部磁盘跳转(见 part_file.cpp disk_strand 成员声明处注释 +
+// MultiSourceAsyncDiskOffloadSerializedUnderMultiThreadDiskPool 用例, 该用例直接以 8 线程 disk 池验证
+// 了这点)。IoRuntime 的 disk_pool 目前仍保持单线程, 但这只是简单性/性能上的选择(避免无谓的线程数),
+// 而非正确性前提; 该常量此后即便调大, PartFile 一侧也不会因此产生竞态。断言仍保留(记录当前选择的
+// 线程数 + 防止无意改动此常量本身导致行为变化), 但注释不再声称"改 >1 必须先加 strand"(已经加了)。
 TEST(Download, DiskPoolIsSingleThreadByContract){
   static_assert(IoRuntime::disk_pool_thread_count == 1);
   EXPECT_EQ(IoRuntime::disk_pool_thread_count, 1u)
-    << "PartFile f_ 由单 disk 线程串行访问; 改 >1 必须先加 strand";
+    << "disk 池当前保持单线程(简单性/性能选择); PartFile::f_ 的互斥现由其自身 disk_strand 保证, "
+       "不再是该值必须恒为 1 的正确性前提(见 MultiSourceAsyncDiskOffloadSerializedUnderMultiThreadDiskPool)";
 }
 
 // audit C1 (async 路径): write_block_async 是 MultiSourceDownload 生产主路径实际调用的写入,

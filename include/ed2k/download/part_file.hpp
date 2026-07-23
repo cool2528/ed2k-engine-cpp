@@ -26,7 +26,10 @@ class PartFile {
   std::vector<std::uint32_t> missing_parts_peer_has(const std::vector<bool>& peer_parts) const;
   tl::expected<void,std::error_code> write_block(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data);
   // P4c-3 M3: async disk write. State (block_done_/part_filled_/part_done_) is only mutated on the
-  // network thread; f_ write/readback + MD4 are offloaded via disk_ex (single disk thread serializes f_, no races).
+  // network thread; f_ write/readback + MD4 are offloaded via disk_ex.
+  // audit C9: all disk-hop work for one PartFile is funneled through a strand owned by this PartFile,
+  // so f_ access is serialized regardless of how many threads disk_ex's pool has (defense in depth;
+  // correctness no longer depends on the disk pool staying single-threaded).
   // When disk_ex == network thread ex, degrades to post(net) synchronous equivalent (default test path).
   boost::asio::awaitable<tl::expected<void,std::error_code>>
     write_block_async(std::uint64_t start, std::uint64_t end, std::span<const std::byte> data,

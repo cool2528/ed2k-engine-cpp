@@ -19,8 +19,12 @@ class IoRuntime {
   IoRuntime& operator=(IoRuntime&&) = delete;
 
   boost::asio::any_io_executor executor();
-  // P4c-3 M3/R1-3 S3: disk/hash offload thread pool (single-threaded, inherently serializes f_ access; no strand needed).
-  // Must add a strand or other serialization guard on PartFile::f_ before increasing to >1 thread.
+  // P4c-3 M3/R1-3 S3: disk/hash offload thread pool. Stays single-threaded (disk_pool_thread_count) as a
+  // simplicity/perf choice, not a correctness requirement any more: audit C9 gave PartFile its own strand
+  // over disk_ex, so PartFile::f_ access is serialized even if this pool were configured multi-threaded
+  // (defense in depth). Other disk_executor() consumers (UploadSession, Statistics::async_flush) open a
+  // fresh local stream per call rather than sharing one member stream, so they were never exposed to this
+  // particular fstream race.
   // Network thread suspends during co_await post(disk_executor()), not blocking other workers' socket I/O.
   boost::asio::any_io_executor disk_executor();
   boost::asio::io_context& context();
