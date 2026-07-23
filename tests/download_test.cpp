@@ -407,7 +407,10 @@ static asio::awaitable<void> serve_refuse_forever_peer(tcp::socket s, const File
 // OP_AICHANSWER(V2 恢复数据 = 兄弟 part-root + 该 part 全部叶, 带标识符)。数据损坏
 // (corrupt_block_n) 只影响 SENDINGPART —— proof 恒取自 clean full, 故 verify_block 对
 // 篡改数据失败而对干净数据通过。
-static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, bool corrupt_block_n = false, std::size_t corrupt_idx = 0){
+// aich_request_counts (审计 C8 TDD 用): 非空时按 part_index 统计收到的 AICHREQUEST 次数,供调用方
+// 断言 proof 是否按 part 缓存(而非逐块重新拉取)。默认 nullptr,不影响既有调用方。
+static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, bool corrupt_block_n = false, std::size_t corrupt_idx = 0,
+                                              std::array<int,2>* aich_request_counts = nullptr){
   using namespace ed2k::peer;
   (void)co_await read_frame(s);   // HELLO
   { HelloInfo h; h.nickname="peer"; h.user_hash=*UserHash::from_hex("00112233445566778899aabbccddeeff");
@@ -454,6 +457,7 @@ static asio::awaitable<void> serve_aich_peer(tcp::socket s, const MockFile& mf, 
       std::uint16_t part_index = r.u16();
       auto echoed_master = r.hash20();
       if(part_index >= rec_cache.size()){ co_await keep_alive(s); co_return; }
+      if(aich_request_counts && part_index < aich_request_counts->size()) ++(*aich_request_counts)[part_index];
       const auto& rec = rec_cache[part_index];
       codec::ByteWriter w; w.hash16(mf.fhash); w.u16(part_index); w.hash20(echoed_master);
       w.u16(static_cast<std::uint16_t>(rec.size()));
@@ -1284,6 +1288,41 @@ TEST(Download, AICHMasterMismatchDegrades){
     EXPECT_TRUE(pf.complete());
     co_return;
   });
+  std::filesystem::remove_all(dir);
+}
+
+// 审计 C8 TDD: pull_blocks_phase 的 AICH 分支曾对批次里每个块各自调用一次 request_aich_proof——
+// 一个满 part 最多 53 块, 同一 part 的 proof 因此被重复拉取多达 53 次(纯浪费的往返; AICH proof
+// 按定义是 part 级的, 同 part 内任意块的 proof 完全相同, eMule 语义是一 part 只拉一次)。本测试
+// 统计 mock peer 按 part_index 收到的 AICHREQUEST 次数, 断言每个 part 恰好 1 次(首块拉取并缓存,
+// 同 part 后续块复用缓存), 而不是块数次。单源、单 worker、无 QUEUERANKING 中断 —— pull_blocks_phase
+// 整个下载只被调用一次, 缓存的调用作用域生命周期覆盖全部 106 块(53×2 part)。
+TEST(Download, AICHProofCachedOncePerPart){
+  auto dir = std::filesystem::temp_directory_path()/"ed2k_dl_aich_cache"; std::filesystem::create_directories(dir);
+  auto path = dir/"out";
+  std::filesystem::remove(path);
+  auto mf = make_mock_file(0x11, 0x22);
+  std::vector<std::byte> full; full.insert(full.end(), mf.d0.begin(), mf.d0.end()); full.insert(full.end(), mf.d1.begin(), mf.d1.end());
+  AICHHash root = aich_hash_bytes(full);
+  std::array<int,2> aich_request_counts{0, 0};
+  IoRuntime rt; ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_aich_peer(std::move(s), mf, false, 0, &aich_request_counts); co_return; });
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    auto dl = download::MultiSourceDownload::Builder(rt.executor())
+                .out(path).hash(mf.fhash).size(PART*2).aich(std::optional<AICHHash>(root))
+                .sources(std::vector{SourceEndpoint{0x0100007Fu, peer.port()}}).build();
+    auto r = co_await dl.run(15s, 3);
+    EXPECT_TRUE(r.has_value()); if(!r) co_return;
+    download::PartFile pf(path, PART*2, mf.fhash, {mf.h0, mf.h1});
+    EXPECT_TRUE(pf.complete());
+    co_return;
+  });
+  // part0/part1 各 53 块(ceil(PART_SIZE/AICH_BLOCK_SIZE)); 修复前 = 53(逐块拉取), 修复后 = 1。
+  EXPECT_EQ(aich_request_counts[0], 1) << "part 0 AICH proof requested " << aich_request_counts[0]
+      << " times -- expected exactly 1 (per-part cache, not per-block)";
+  EXPECT_EQ(aich_request_counts[1], 1) << "part 1 AICH proof requested " << aich_request_counts[1]
+      << " times -- expected exactly 1 (per-part cache, not per-block)";
   std::filesystem::remove_all(dir);
 }
 

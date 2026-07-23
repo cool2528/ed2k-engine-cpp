@@ -13,6 +13,7 @@
 #include <cassert>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -740,6 +741,15 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
   auto block_of = [](const PendingBlock& p) { return std::get<1>(p); };
   auto start_of = [](const PendingBlock& p) { return std::get<2>(p); };
   auto end_of = [](const PendingBlock& p) { return std::get<3>(p); };
+  // 审计 C8: AICH proof 按 part 缓存 —— proof 按协议定义就是 part 级的(同 part 内任意块的恢复
+  // 数据完全相同, 见 aich_checker.hpp verify_block 注释), 一个满 part 最多 53 块, 逐块各自
+  // request_aich_proof 会把同一份数据重复拉取多达 53 次, 纯浪费往返(eMule 语义是一 part 一次)。
+  // 生命周期 = 本次 pull_blocks_phase 调用(单个 source session 尝试, 见函数头注释); 中途被源打回
+  // 排队(errc::upload_queued)后 run_source_session 会重新调用本函数, 缓存随局部变量一起重置——
+  // 至多让该 part 再多拉一次 proof, 不影响正确性, 属有意选择(任务要求"优先绑定调用作用域", 不进
+  // SharedState: 多源场景下不同 worker 从共享 BlockAllocator 分到同一 part 的块很少见, 且各 worker
+  // 独立缓存互不冲突, 无需跨 worker 共享/加锁)。
+  std::unordered_map<std::size_t, ed2k::peer::AICHRecoveryData> aich_proof_cache;
 
   while(!st.alloc.complete()){
     if(st.complete) break;
@@ -807,21 +817,38 @@ pull_blocks_phase(ed2k::peer::C2CConnection& conn,
       // C2 先验证后写入: AICH 启用时先拉 proof + verify_block, 通过才写盘;
       // 校验失败 requeue 同源重试, 超 max_retries 返回 block_corrupt 让该源退出 (块回队列, 他源可取)。
       if(aich_active){
-        auto rd = co_await conn.request_aich_proof(st.hash, *st.aich,
-                                                   static_cast<std::uint16_t>(part_of(pb)), timeout);
-        // 架构决策#4 (review 修复): 等 AICH proof 期间也可能中途收到 QUEUERANKING——
-        // request_aich_proof 内部走 pump_until, 对 QUEUERANKING 早已映射为 errc::upload_queued
-        // (c2c_connection.cpp pump_until)。与上方 request_blocks(_i64) 分支同款: 原样传播该错误
-        // 给 peer_worker 的循环回 queue_wait_phase 重新排队, 而不是落入下面"校验失败"分支当作
-        // 数据损坏计入 max_retries——否则会在重试耗尽后误判为 block_corrupt 放弃该源。批次里排在
-        // 后面、尚未处理到的块在下面统一 requeue(不丢失)。
-        if(!rd && rd.error() == make_error_code(errc::upload_queued)){
-          st.alloc.requeue_block(part_of(pb), block_of(pb));
-          early_ec = rd.error(); early_exit = true; next_unprocessed = i + 1; break;
+        std::size_t pidx = part_of(pb);
+        // 审计 C8: 先查 part 级缓存, 命中则跳过网络往返直接复用; 未命中 (本 part 首块) 才真正
+        // request_aich_proof, 成功后写入缓存供本 part 后续块复用。proof 取自 cache 条目地址, 生命
+        // 周期与 aich_proof_cache 一致(函数返回前不失效, unordered_map 的 emplace 不会使其它元素
+        // 的引用失效)。
+        const ed2k::peer::AICHRecoveryData* proof = nullptr;
+        if(auto cit = aich_proof_cache.find(pidx); cit != aich_proof_cache.end()){
+          proof = &cit->second;
+        } else {
+          auto rd = co_await conn.request_aich_proof(st.hash, *st.aich,
+                                                     static_cast<std::uint16_t>(pidx), timeout);
+          // 架构决策#4 (review 修复): 等 AICH proof 期间也可能中途收到 QUEUERANKING——
+          // request_aich_proof 内部走 pump_until, 对 QUEUERANKING 早已映射为 errc::upload_queued
+          // (c2c_connection.cpp pump_until)。与上方 request_blocks(_i64) 分支同款: 原样传播该错误
+          // 给 peer_worker 的循环回 queue_wait_phase 重新排队, 而不是落入下面"校验失败"分支当作
+          // 数据损坏计入 max_retries——否则会在重试耗尽后误判为 block_corrupt 放弃该源。批次里排在
+          // 后面、尚未处理到的块在下面统一 requeue(不丢失)。
+          if(!rd && rd.error() == make_error_code(errc::upload_queued)){
+            st.alloc.requeue_block(part_of(pb), block_of(pb));
+            early_ec = rd.error(); early_exit = true; next_unprocessed = i + 1; break;
+          }
+          // 只有拉取成功才写入缓存——失败(超时/连接错误/echoed master 不符等)不缓存坏条目,
+          // proof 保持 nullptr, 下面按现有"校验失败"语义 requeue+计入 max_retries, 下次重试
+          // (可能同源同块)会重新走一次真实 request_aich_proof, 而不是记住一个空/坏结果。
+          if(rd){
+            auto ins_it = aich_proof_cache.emplace(pidx, std::move(*rd)).first;
+            proof = &ins_it->second;
+          }
         }
         bool ok = false;
-        if(rd) ok = st.checker->verify_block(part_of(pb), block_of(pb), b.data,
-                                             std::span<const ed2k::peer::AICHProofHash>(rd->hashes));
+        if(proof) ok = st.checker->verify_block(part_of(pb), block_of(pb), b.data,
+                                                 std::span<const ed2k::peer::AICHProofHash>(proof->hashes));
         if(!ok){
           st.alloc.requeue_block(part_of(pb), block_of(pb));
           if(++retry > max_retries){
