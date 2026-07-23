@@ -25,6 +25,7 @@
 #include "ed2k/codec/byte_io.hpp"
 #include "ed2k/server/opcodes.hpp"
 #include "ed2k/server/messages.hpp"
+#include "ed2k/server/udp_connection.hpp"
 #include "ed2k/link/ed2k_link.hpp"
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/session/session.hpp"
@@ -32,6 +33,7 @@
 #include "crypto/md4.hpp"
 #include "mock_peer.hpp"
 #include "mock_server.hpp"
+#include "mock_udp_server.hpp"
 using namespace ed2k; using namespace ed2k::net; using namespace ed2k::app;
 using ed2k::server::SourceEndpoint;
 using ed2k::session::Session;
@@ -40,6 +42,7 @@ using ed2k::session::TaskState;
 using ed2k::session::TaskStateEvent;
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
+using udp = asio::ip::udp;
 using namespace std::chrono_literals;
 static constexpr std::uint64_t PART = 9728000;
 
@@ -188,6 +191,19 @@ static asio::awaitable<void> serve_login_and_one_source(tcp::socket s, const Moc
   (void)co_await read_frame(s);
   codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
   w.u32(0x0100007Fu); w.u16(peer_port);
+  co_await send_pkt(s, ed2k::server::op::FOUNDSOURCES, w.take());
+  co_await keep_alive(s);
+  co_return;
+}
+
+// B6: mock server 应答 LOGIN→IDCHANGE(HighID), GETSOURCES→FOUNDSOURCES(0 个源)——模拟"服务器
+// 对这个稀有文件查无结果", 用于驱动 B6a(链接源提示)/B6b(UDP 全局兜底)测试。
+static asio::awaitable<void> serve_login_zero_sources(tcp::socket s, const MockFile& mf){
+  (void)co_await read_frame(s);
+  { codec::ByteWriter w; w.u32(0x01000000u); w.u32(0x0119u);
+    co_await send_pkt(s, ed2k::server::op::IDCHANGE, w.take()); }
+  (void)co_await read_frame(s);
+  codec::ByteWriter w; w.hash16(mf.fhash); w.u8(0);          // count=0, 无条目
   co_await send_pkt(s, ed2k::server::op::FOUNDSOURCES, w.take());
   co_await keep_alive(s);
   co_return;
@@ -727,5 +743,124 @@ TEST(Session, PauseResumeCancelRemovesFiles){
     EXPECT_FALSE(std::filesystem::exists(met));
     co_return;
   });
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// B6a: 搜索服务器 GETSOURCES 查无结果(serve_login_zero_sources), 链接自带 "s=127.0.0.1:<peer_port>"
+// 源提示、且 self->servers 为空(不触发 B6b UDP 兜底)——下载能否完成只取决于 run_task 是否真的把
+// 链接内嵌的源提示并入了初始源集合并据此连了那个 peer。
+TEST(Session, LinkEmbeddedSourceHintUsedWhenServerReturnsNoSources){
+  auto mf = make_mock_file(0x77, 0x88);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_login_zero_sources(std::move(s), mf); co_return; });
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_link_hint";
+  std::filesystem::create_directories(tmp_dir);
+  auto out = tmp_dir / "t.bin";
+  std::filesystem::remove(out);
+  std::filesystem::remove(out.string() + ".part.met");
+
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 3000ms;
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session(rt, cfg);
+
+  Ed2kFileLink link; link.name="t.bin"; link.size=PART*2; link.hash=mf.fhash;
+  link.sources.push_back("127.0.0.1:" + std::to_string(peer.port()));   // B6a: 链接内嵌源提示
+  std::uint64_t task_id = 0;
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    task_id = session.add_download(link, tmp_dir);
+    EXPECT_NE(task_id, 0u);
+    asio::steady_timer timer(rt.context());
+    for(int i=0;i<600;++i){
+      auto snap = session.query(task_id);
+      EXPECT_TRUE(snap.has_value());
+      if(!snap) co_return;
+      if(snap->state == TaskState::completed || snap->state == TaskState::failed) break;
+      timer.expires_after(50ms);
+      co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(task_id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::completed)
+        << snap->error.message() << " (run_task must seed the link-embedded s= source hint)";
+    EXPECT_EQ(snap->bytes_done, PART*2);
+    EXPECT_EQ(snap->known_sources, 1u);   // 唯一已知源来自链接提示, 而非服务器(服务器回了 0 个)
+    co_return;
+  });
+  ASSERT_TRUE(std::filesystem::exists(out));
+  EXPECT_EQ(std::filesystem::file_size(out), PART*2);
+  std::filesystem::remove_all(tmp_dir);
+}
+
+// B6b: 搜索服务器 GETSOURCES 查无结果(serve_login_zero_sources), 链接不带任何 "s=" 提示(B6a 不
+// 参与), 但 self->servers 里有一台已知服务器(经 add_server 注册, 指向下面的 MockUdpServer)——
+// 下载能否完成只取决于 run_task 是否真的对该服务器发起了 UDP GLOBGETSOURCES2 并把结果并入源集合。
+TEST(Session, UdpGlobalSourcesFallbackUsedWhenServerReturnsNoSources){
+  auto mf = make_mock_file(0x99, 0xAA);
+  IoRuntime rt;
+  ed2k::test::MockPeer peer(rt.context());
+  peer.serve([&](tcp::socket s) -> asio::awaitable<void>{ co_await serve_full_peer(std::move(s), mf); co_return; });
+  ed2k::test::MockServer srv(rt.context());
+  srv.serve([&](tcp::socket s) -> asio::awaitable<void>{
+    co_await serve_login_zero_sources(std::move(s), mf); co_return; });
+
+  ed2k::test::MockUdpServer udp_srv(rt.context());
+  bool saw_glob_get_sources2 = false;
+  udp_srv.serve([&](udp::socket& s, const Packet& request, const udp::endpoint& from) -> asio::awaitable<void>{
+    saw_glob_get_sources2 = (request.opcode == ed2k::server::udpop::GLOBGETSOURCES2);
+    codec::ByteWriter w; w.hash16(mf.fhash); w.u8(1);
+    w.u32(0x0100007Fu); w.u16(peer.port());               // 唯一源: 127.0.0.1:<peer_port> HighID
+    co_await ed2k::test::send_packet_to(s, from, ed2k::server::udpop::GLOBFOUNDSOURCES2, w.take());
+    co_return;
+  });
+
+  auto tmp_dir = std::filesystem::temp_directory_path() / "ed2k_session_udp_global";
+  std::filesystem::create_directories(tmp_dir);
+  auto out = tmp_dir / "t.bin";
+  std::filesystem::remove(out);
+  std::filesystem::remove(out.string() + ".part.met");
+
+  SessionConfig cfg;
+  cfg.data_dir = tmp_dir;
+  cfg.per_server_timeout = 3000ms;
+  cfg.task_io_timeout = 20000ms;
+  cfg.server_override = ed2k::app::ServerTarget{IPv4::from_dotted("127.0.0.1").value(), srv.port()};
+  Session session(rt, cfg);
+  session.add_server(IPv4::from_dotted("127.0.0.1").value(), udp_srv.port(), "udp-fallback-test");
+
+  Ed2kFileLink link; link.name="t.bin"; link.size=PART*2; link.hash=mf.fhash;   // 无 s= 提示: 只测 B6b
+  std::uint64_t task_id = 0;
+  run_coro(rt, [&]() -> asio::awaitable<void>{
+    task_id = session.add_download(link, tmp_dir);
+    EXPECT_NE(task_id, 0u);
+    asio::steady_timer timer(rt.context());
+    for(int i=0;i<600;++i){
+      auto snap = session.query(task_id);
+      EXPECT_TRUE(snap.has_value());
+      if(!snap) co_return;
+      if(snap->state == TaskState::completed || snap->state == TaskState::failed) break;
+      timer.expires_after(50ms);
+      co_await timer.async_wait(asio::use_awaitable);
+    }
+    auto snap = session.query(task_id);
+    EXPECT_TRUE(snap.has_value());
+    if(!snap) co_return;
+    EXPECT_EQ(snap->state, TaskState::completed)
+        << snap->error.message() << " (run_task must fall back to UDP GLOBGETSOURCES2 when the server has zero sources)";
+    EXPECT_EQ(snap->bytes_done, PART*2);
+    EXPECT_EQ(snap->known_sources, 1u);   // 唯一已知源来自 UDP 全局兜底
+    EXPECT_TRUE(saw_glob_get_sources2);
+    co_return;
+  });
+  ASSERT_TRUE(std::filesystem::exists(out));
+  EXPECT_EQ(std::filesystem::file_size(out), PART*2);
   std::filesystem::remove_all(tmp_dir);
 }

@@ -1,10 +1,12 @@
 #include "ed2k/session/session.hpp"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <exception>
 #include <fstream>
 #include <map>
+#include <string_view>
 #include <unordered_set>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -21,6 +23,7 @@
 #include "ed2k/metfile/server_met.hpp"
 #include "ed2k/peer/inbound_listener.hpp"
 #include "ed2k/server/connection.hpp"
+#include "ed2k/server/udp_connection.hpp"
 #include "ed2k/share/client_credits.hpp"
 #include "ed2k/share/known_file.hpp"
 #include "ed2k/share/upload_queue.hpp"
@@ -44,6 +47,52 @@ std::vector<std::byte> read_file_bytes(const std::filesystem::path& p){
 // persist_server_met 临时文件名的进程内自增序号(M1: 避免同目录多 Session 实例并发落盘时
 // 固定文件名互相覆盖; 结合 tcp_port 进一步降低跨进程碰撞概率)。
 std::atomic<std::uint64_t> g_persist_seq{0};
+
+// B6: eD2k 链接内嵌 "s=IP:port" 源提示 + 服务器零源时的 UDP GLOBGETSOURCES2 全局兜底, 详见
+// run_task 内对应注释。下面 ipv4_to_wire/same_source 与 download.cpp 匿名命名空间里的同名
+// 函数语义完全一致——那两个是 TU-local(内部链接), 无法跨翻译单元复用, 这里镜像一份而非为了
+// 两处 4 行代码新增公共 API、扩大 download 模块的对外接口。
+std::uint32_t ipv4_to_wire(IPv4 ip) noexcept {
+  const auto host = ip.host();
+  return ((host & 0x000000ffu) << 24) |
+         ((host & 0x0000ff00u) << 8) |
+         ((host & 0x00ff0000u) >> 8) |
+         ((host & 0xff000000u) >> 24);
+}
+bool same_source(const server::SourceEndpoint& lhs, const server::SourceEndpoint& rhs) noexcept {
+  return lhs.id == rhs.id && lhs.port == rhs.port;
+}
+// 按 same_source(id+port) 去重后并入; 已存在则跳过。B6a(链接源提示)/B6b(UDP 全局源)共用同一份
+// 去重逻辑, 与 download.cpp 里合并 Kad 源时用的判定同构。
+void merge_source(std::vector<server::SourceEndpoint>& into, const server::SourceEndpoint& ep){
+  const bool known = std::any_of(into.begin(), into.end(),
+                                 [&](const server::SourceEndpoint& s){ return same_source(s, ep); });
+  if(!known) into.push_back(ep);
+}
+// 把链接 "s=" 段的原始字符串解析成 (IP,port), 只接受最简单的 "a.b.c.d:port" 格式(与
+// ed2k_link.cpp::to_string 写回时用的格式一致)。解析失败(缺冒号/IP 非法/端口非数字或越界/
+// 端口为 0)一律返回 nullopt, 由调用方静默跳过该条——单条源提示格式有问题不该拖累链接里的
+// 其它源, 更不该让整个下载任务失败。直连源天然是 HighID(提示里就是真实 IP), 故 id 用
+// ipv4_to_wire 编成协议 wire 序, 与服务器 GETSOURCES/GLOBGETSOURCES2 应答里的 HighID 同构
+// (见 download.cpp/c2c_connection.cpp 里 IPv4::from_wire(endpoint.id) 的反向转换)。
+std::optional<server::SourceEndpoint> parse_link_source_hint(std::string_view hint){
+  const auto colon = hint.find(':');
+  if(colon == std::string_view::npos) return std::nullopt;
+  auto ip = IPv4::from_dotted(hint.substr(0, colon));
+  if(!ip) return std::nullopt;
+  const auto port_sv = hint.substr(colon + 1);
+  std::uint16_t port = 0;
+  auto res = std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), port);
+  if(res.ec != std::errc{} || res.ptr != port_sv.data() + port_sv.size() || port == 0) return std::nullopt;
+  server::SourceEndpoint ep;
+  ep.id = ipv4_to_wire(*ip);
+  ep.port = port;
+  return ep;
+}
+// B6b 兜底路径逐台顺序询问的服务器数量上限, 限定"服务器零源"时到失败为止的最坏等待时间
+// (至多 kMaxUdpGlobalSourceServers * cfg.per_server_timeout); 一旦拿到任意源立即停止, 不会真的
+// 问满这么多台。
+constexpr std::size_t kMaxUdpGlobalSourceServers = 3;
 }
 
 struct TaskEntry {
@@ -377,6 +426,49 @@ struct Session::Impl : std::enable_shared_from_this<Session::Impl> {
     if(!t){ self->on_task_coroutine_exit(id); co_return; }
     if(stop && *stop){ self->on_task_coroutine_exit(id); co_return; }
     if(!gs){ self->set_state(*t, TaskState::failed, gs.error()); self->on_task_coroutine_exit(id); co_return; }
+
+    // B6a: 链接内嵌 "s=IP:port" 源提示直接并入初始源集合。冷门/稀有文件的链接常常自带一个已知
+    // 可直连的源, 而这类文件搜索服务器的 GETSOURCES 往往查无结果(见下方 B6b)——链接提示是不花
+    // 任何额外网络往返就能拿到的已知信息, 不论服务器源多寡都无条件叠加(与 B6b 仅在服务器零源
+    // 时才触发不同)。ed2k_link.cpp 只把 "s=" 段原样保留为字符串(不做协议语义转换), 这里按
+    // "ip:port" 做最小解析, 格式不符/IP 非法/端口越界的条目静默跳过(不影响其它源或整体下载)。
+    for(const auto& hint : link.sources){
+      if(auto ep = parse_link_source_hint(hint)) merge_source(gs->sources, *ep);
+    }
+
+    // B6b: 服务器零源时的 UDP GLOBGETSOURCES2 全局兜底。上面只问了当前登录/轮换到的这一台服务器
+    // (TCP GETSOURCES); 冷门文件很可能"这台服务器没有, 但网络里其它服务器有"。GLOBGETSOURCES2
+    // 走 UDP、不需要登录握手, 可以廉价地依次问过 self->servers(已知服务器列表, server.met/
+    // add_server 维护)中的其它服务器。每台服务器各自用一个临时 UdpServerConnection(各自独立
+    // socket), 与下面 B4 ephemeral Kad 节点同一思路——不复用/不共享任何既有单读者 socket, 因此
+    // 天然满足单读者约束; kMaxUdpGlobalSourceServers 控制这条兜底路径的最坏延迟上限(逐台顺序
+    // 询问, 拿到源即提前停止)。仅在服务器一无所获时才触发, 避免对"服务器已有源"的常见情形
+    // 徒增延迟。当前只走明文 UDP(不套用服务器的 UDP 混淆 tags); 已知服务器若强制要求混淆 UDP,
+    // 这条兜底会静默拿不到结果(不影响其它服务器/整体流程), 留作后续按需补齐。
+    if(gs->sources.empty() && !self->servers.servers.empty()){
+      // 先快照(拷贝)再遍历, 不直接对 self->servers.servers 这个活表 range-for: 循环体里每次 UDP
+      // 查询都会 co_await 挂起, 挂起期间 add_server/remove_server/update_server_met(均要求在同一
+      // 网络线程调用, 但可在本协程挂起时被交替调度到)可能改动这个 vector(push_back 可能触发扩容
+      // 重分配), 若直接遍历活表, 恢复后再解引用迭代器就是悬垂访问。做法与下方 B4 快照 Kad 路由表
+      // peers(隔离主表后续被 kad_run 修改的影响)完全同构。
+      const auto servers_snapshot = self->servers.servers;
+      std::size_t queried = 0;
+      for(const auto& srv_entry : servers_snapshot){
+        if(queried >= kMaxUdpGlobalSourceServers) break;
+        ++queried;
+        server::UdpServerConnection udp_conn(ex, srv_entry.ip, srv_entry.port);
+        auto ur = co_await udp_conn.get_sources(link.hash, link.size, self->cfg.per_server_timeout);
+        udp_conn.close();
+        self = weak.lock(); if(!self) co_return;
+        t = self->find_alive(id, gen);
+        if(!t){ self->on_task_coroutine_exit(id); co_return; }
+        if(stop && *stop){ self->on_task_coroutine_exit(id); co_return; }
+        if(!ur) continue;                  // 单台服务器超时/协议错误不致命, 继续问下一台
+        for(const auto& src : ur->sources) merge_source(gs->sources, src);
+        if(!gs->sources.empty()) break;    // 已经拿到源, 不必再问剩下的服务器
+      }
+    }
+
     t->known_sources = gs->sources.size();
     if(gs->sources.empty()){
       self->set_state(*t, TaskState::failed, make_error_code(errc::file_not_found));
