@@ -1,7 +1,5 @@
 #include "ed2k/core/hash.hpp"
 #include <cstdio>
-#include <format>
-#include <iterator>
 namespace ed2k {
 namespace {
 int hexval(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10;
@@ -15,9 +13,12 @@ tl::expected<MD4Hash,std::error_code> MD4Hash::from_hex(std::string_view s){
     out[i]=std::byte((hi<<4)|lo); }
   return MD4Hash::from_bytes(out);
 }
+// 不使用 std::format:libc++ 的 formatter 会实例化浮点分支,依赖 to_chars(float),
+// 在 macOS 部署目标 < 13.3 时因 availability 检查无法编译
 std::string MD4Hash::to_hex() const {
+  static constexpr char H[]="0123456789abcdef";
   std::string s; s.reserve(32);
-  for(auto b:b_) std::format_to(std::back_inserter(s), "{:02x}", std::to_integer<unsigned>(b));
+  for(auto b:b_){ auto v=std::to_integer<unsigned>(b); s+=H[v>>4]; s+=H[v&0xf]; }
   return s;
 }
 namespace {
@@ -48,6 +49,8 @@ tl::expected<IPv4,std::error_code> IPv4::from_dotted(std::string_view s){
   return IPv4::from_host((a<<24)|(b<<16)|(c<<8)|d);
 }
 std::string IPv4::to_dotted() const {
-  return std::format("{}.{}.{}.{}", (value_>>24)&0xff, (value_>>16)&0xff, (value_>>8)&0xff, value_&0xff);
+  char buf[16];
+  std::snprintf(buf,sizeof(buf),"%u.%u.%u.%u",(value_>>24)&0xff,(value_>>16)&0xff,(value_>>8)&0xff,value_&0xff);
+  return buf;
 }
 }
