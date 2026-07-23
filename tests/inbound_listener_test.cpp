@@ -193,6 +193,17 @@ TEST(InboundListener, RoutesConcurrentLowIdCallbacksByExpectedIp) {
   const auto alice_ip = *IPv4::from_dotted("127.0.0.21");
   const auto bob_ip = *IPv4::from_dotted("127.0.0.22");
 
+  // 本测试依赖按"源 IP"路由,需要 127.0.0.0/8 的多个 loopback 地址:Linux 整段默认可用,
+  // macOS 默认只配置 127.0.0.1(bind 其余地址 EADDRNOTAVAIL),未配置别名时跳过而非挂死。
+  {
+    asio::io_context probe_ctx;
+    tcp::socket probe(probe_ctx);
+    boost::system::error_code pec;
+    probe.open(tcp::v4(), pec);
+    if (!pec) probe.bind(tcp::endpoint(asio::ip::make_address_v4(alice_ip.host()), 0), pec);
+    if (pec) GTEST_SKIP() << "loopback alias 127.0.0.21 unavailable: " << pec.message();
+  }
+
   struct Outcome { bool ok = false; std::string nickname; };
   using ResultCh = asio::experimental::channel<void(boost::system::error_code, Outcome)>;
   using ConnectedCh = asio::experimental::channel<void(boost::system::error_code)>;
@@ -206,7 +217,10 @@ TEST(InboundListener, RoutesConcurrentLowIdCallbacksByExpectedIp) {
                          std::shared_ptr<ConnectedCh> connected) -> asio::awaitable<void> {
       tcp::socket client(rt.executor());
       client.open(tcp::v4());
-      client.bind(tcp::endpoint(asio::ip::make_address_v4(from_ip.host()), 0));
+      // bind 失败必须走 channel 通知:异常会被 detached 吞掉,主协程将永远等不到信号而挂死
+      boost::system::error_code bec;
+      client.bind(tcp::endpoint(asio::ip::make_address_v4(from_ip.host()), 0), bec);
+      if (bec) { connected->try_send(bec); co_return; }
       auto [cec] = co_await client.async_connect(
           tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), listener.local_port()),
           asio::as_tuple(asio::use_awaitable));

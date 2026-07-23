@@ -422,7 +422,9 @@ TEST(Session, ConcurrentLowIdDownloadsDoNotCrossOverSharedPort){
           c.open(tcp::v4());
           // bind 到独立于 InboundListener 的本地地址只为了两条连接在日志/抓包里可辨识, 不参与
           // 路由(LowID 回调协议层面拿不到源真实 IP, accept_peer 的 expected_ip 恒为 nullopt)。
-          c.bind(tcp::endpoint(asio::ip::make_address_v4(is_a ? "127.0.0.41" : "127.0.0.42"), 0));
+          // macOS 默认无 127.0.0.0/8 别名(EADDRNOTAVAIL): 辨识性 bind 失败就跳过, 直连即可。
+          boost::system::error_code bind_ec;
+          c.bind(tcp::endpoint(asio::ip::make_address_v4(is_a ? "127.0.0.41" : "127.0.0.42"), 0), bind_ec);
           tcp::endpoint ep(asio::ip::make_address_v4("127.0.0.1"), kTestPort);
           auto [ec] = co_await c.async_connect(ep, asio::as_tuple(asio::use_awaitable));
           if(ec) co_return;
